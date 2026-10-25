@@ -21,21 +21,42 @@ data class EmuxRom(
 
 fun parseEmuxGames(rootGamesDir: DocumentFile): List<EmuxRom> {
     val gamesList = mutableListOf<EmuxRom>()
-
-    // Scorre tutte le sottocartelle dentro la directory root (es. /games/NeedForSpeed/)
     val files = rootGamesDir.listFiles()
-    for (gameFolder in files) {
-        if (gameFolder.isDirectory) {
-            val title = gameFolder.name ?: "Sconosciuto"
+
+    // 1. Ricerca APK posizionati direttamente nella cartella root selezionata (es. /Emux32/BloodAndGlory.apk)
+    for (file in files) {
+        val fileName = file.name?.lowercase() ?: ""
+        if (file.isFile && fileName.endsWith(".apk")) {
+            val title = file.name?.substringBeforeLast(".") ?: "Sconosciuto"
+            gamesList.add(
+                EmuxRom(
+                    title = title,
+                    coverUri = null,
+                    apkUri = file.uri,
+                    obbDirUri = null,
+                    category = XmbCategory.GAMES,
+                    isArm32 = true
+                )
+            )
+        }
+    }
+
+    // 2. Ricerca in sottocartelle dedicate (es. /Emux32/BloodAndGlory/game.apk)
+    for (folder in files) {
+        if (folder.isDirectory) {
+            val title = folder.name ?: "Sconosciuto"
             var coverUri: Uri? = null
             var apkUri: Uri? = null
+            var obbUri: Uri? = null
 
-            for (file in gameFolder.listFiles()) {
-                val fileName = file.name?.lowercase() ?: ""
-                if (fileName.endsWith(".apk")) {
-                    apkUri = file.uri
-                } else if (fileName == "cover.jpg" || fileName == "cover.png" || fileName == "icon.png") {
-                    coverUri = file.uri
+            for (subFile in folder.listFiles()) {
+                val subName = subFile.name?.lowercase() ?: ""
+                if (subName.endsWith(".apk")) {
+                    apkUri = subFile.uri
+                } else if (subName == "cover.jpg" || subName == "cover.png" || subName == "icon.png") {
+                    coverUri = subFile.uri
+                } else if (subName.endsWith(".obb") || (subFile.isDirectory && subName.contains("obb"))) {
+                    obbUri = subFile.uri
                 }
             }
 
@@ -45,7 +66,7 @@ fun parseEmuxGames(rootGamesDir: DocumentFile): List<EmuxRom> {
                         title = title,
                         coverUri = coverUri,
                         apkUri = apkUri,
-                        obbDirUri = gameFolder.uri,
+                        obbDirUri = obbUri ?: folder.uri,
                         category = XmbCategory.GAMES,
                         isArm32 = true
                     )
@@ -53,5 +74,6 @@ fun parseEmuxGames(rootGamesDir: DocumentFile): List<EmuxRom> {
             }
         }
     }
+
     return gamesList
 }
