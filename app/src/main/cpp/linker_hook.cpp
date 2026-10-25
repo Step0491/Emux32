@@ -5,10 +5,12 @@
 #include <unistd.h>
 #include <sys/syscall.h>
 #include <sys/time.h>
+#include <sys/ioctl.h>
 #include <time.h>
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <cstring>
+#include <cerrno>
 #include <mutex>
 
 #define TAG "EmuxLinkerHook"
@@ -69,7 +71,6 @@ jmethodID JniHandleTable::getMethod(jptr32_t handle) {
     return nullptr;
 }
 
-// Numeri di syscall Linux per architettura ARM (EABI a 32-bit)
 constexpr uint32_t ARM_NR_exit            = 1;
 constexpr uint32_t ARM_NR_read            = 3;
 constexpr uint32_t ARM_NR_write           = 4;
@@ -92,7 +93,6 @@ int32_t SyscallDispatcher::handleSyscall(
     uint32_t r5,
     uintptr_t guestMemoryBase
 ) {
-    // Funzione di utilità per convertire puntatori a 32-bit guest in puntatori host
     auto translateGuestPtr = [guestMemoryBase](uint32_t guestPtr) -> void* {
         if (guestPtr == 0) return nullptr;
         return reinterpret_cast<void*>(guestMemoryBase + guestPtr);
@@ -134,19 +134,18 @@ int32_t SyscallDispatcher::handleSyscall(
 
         case ARM_NR_ioctl: {
             int fd = static_cast<int>(r0);
-            unsigned long request = static_cast<unsigned long>(r1);
+            int request = static_cast<int>(r1);
             void* argp = translateGuestPtr(r2);
             return ioctl(fd, request, argp);
         }
 
         case ARM_NR_mmap2: {
-            // mmap2(addr, length, prot, flags, fd, pgoffset)
             uint32_t guestAddr = r0;
             size_t length = static_cast<size_t>(r1);
             int prot = static_cast<int>(r2);
             int flags = static_cast<int>(r3);
             int fd = static_cast<int>(r4);
-            off_t pgoff = static_cast<off_t>(r5); // Unità di 4096 byte
+            off_t pgoff = static_cast<off_t>(r5);
 
             void* hostHint = (guestAddr != 0) ? translateGuestPtr(guestAddr) : nullptr;
             void* result = mmap(hostHint, length, prot, flags, fd, pgoff * 4096);
@@ -193,11 +192,10 @@ int32_t SyscallDispatcher::handleSyscall(
         default:
             LOGW("Syscall ARM32 non implementata intercettata: NR=%u (r0=0x%x, r1=0x%x)",
                  syscallNum, r0, r1);
-            return -38; // -ENOSYS
+            return -38;
     }
 }
 
-// Forwarding verso librerie grafiche native host (OpenGL ES 2/3)
 static void* sGlesHandle = nullptr;
 
 void* SymbolResolver::resolveHostSymbol(const char* symbolName) {
@@ -217,7 +215,6 @@ void* SymbolResolver::resolveHostSymbol(const char* symbolName) {
         }
     }
 
-    // Risoluzione simboli standard della libc host
     return dlsym(RTLD_DEFAULT, symbolName);
 }
 

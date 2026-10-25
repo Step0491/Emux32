@@ -5,6 +5,7 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <cstring>
+#include <cerrno>
 #include <algorithm>
 #include <stdexcept>
 
@@ -45,7 +46,6 @@ uintptr_t Elf32Loader::alignUp(uintptr_t addr, size_t pageSize) const {
 }
 
 bool Elf32Loader::validateHeader(const Elf32_Ehdr& header) const {
-    // 1. Verifica Magic Number (0x7F, 'E', 'L', 'F')
     if (header.e_ident[EI_MAG0] != ELFMAG0 ||
         header.e_ident[EI_MAG1] != ELFMAG1 ||
         header.e_ident[EI_MAG2] != ELFMAG2 ||
@@ -54,31 +54,26 @@ bool Elf32Loader::validateHeader(const Elf32_Ehdr& header) const {
         return false;
     }
 
-    // 2. Verifica Classe binario: Deve essere ELF a 32-bit (ELFCLASS32 = 1)
     if (header.e_ident[EI_CLASS] != ELFCLASS32) {
         LOGE("Target ELF non a 32-bit (trovato EI_CLASS=%d)", header.e_ident[EI_CLASS]);
         return false;
     }
 
-    // 3. Verifica Endianness: Little Endian (ELFDATA2LSB = 1) per ARM Android
     if (header.e_ident[EI_DATA] != ELFDATA2LSB) {
         LOGE("Endianness non supportata (trovato EI_DATA=%d)", header.e_ident[EI_DATA]);
         return false;
     }
 
-    // 4. Verifica Versione ELF
     if (header.e_ident[EI_VERSION] != EV_CURRENT) {
         LOGE("Versione ELF non valida (trovato EI_VERSION=%d)", header.e_ident[EI_VERSION]);
         return false;
     }
 
-    // 5. Verifica Architettura target: ARM 32-bit (EM_ARM = 40)
     if (header.e_machine != EM_ARM) {
         LOGE("Architettura target errata: atteso EM_ARM (40), trovato %d", header.e_machine);
         return false;
     }
 
-    // 6. Verifica Tipo binario: Shared Object (ET_DYN) o Eseguibile (ET_EXEC)
     if (header.e_type != ET_DYN && header.e_type != ET_EXEC) {
         LOGE("Tipo file ELF non supportato: e_type=%d", header.e_type);
         return false;
@@ -151,7 +146,6 @@ std::shared_ptr<LoadedLibrary> Elf32Loader::loadFromMemory(
 
     const auto* phdrTable = reinterpret_cast<const Elf32_Phdr*>(buffer + ehdr->e_phoff);
 
-    // 1. Individua i limiti di memoria virtuale (vaddr min e max) per i segmenti PT_LOAD
     uint32_t minVaddr = 0xFFFFFFFF;
     uint32_t maxVaddr = 0x00000000;
     std::vector<ElfSegment> loadSegments;
@@ -195,8 +189,6 @@ std::shared_ptr<LoadedLibrary> Elf32Loader::loadFromMemory(
     LOGI("ELF Analysis [%s]: minVaddr=0x%x, maxVaddr=0x%x, totalSize=%zu (0x%zx)",
          name.c_str(), minVaddr, maxVaddr, totalMemorySize, totalMemorySize);
 
-    // 2. Allocazione preliminare contigua dello spazio di memoria virtuale
-    // Usiamo PROT_NONE per riservare la finestra di indirizzi senza permessi attivi
     void* reservedAddress = mmap(
         nullptr,
         totalMemorySize,
@@ -225,20 +217,17 @@ std::shared_ptr<LoadedLibrary> Elf32Loader::loadFromMemory(
     LOGI("Base Address allocato: 0x%lx (Load Bias: 0x%x, Entry: 0x%x)",
          (unsigned long)loadedLib->base_address, loadedLib->load_bias, loadedLib->entry_point);
 
-    // 3. Caricamento dei segmenti e gestione W^X (Write XOR Execute)
     for (const auto& seg : loadSegments) {
         uintptr_t segTargetAddr = loadedLib->base_address + (seg.vaddr - alignedMinVaddr);
         uintptr_t pageStart = alignDown(segTargetAddr, pageSize_);
         uintptr_t pageEnd = alignUp(segTargetAddr + seg.memsz, pageSize_);
         size_t pageLen = pageEnd - pageStart;
 
-        // FASE SCRITTURA: Abilitiamo PROT_READ | PROT_WRITE per copiare dati e azzerare BSS
         if (mprotect(reinterpret_cast<void*>(pageStart), pageLen, PROT_READ | PROT_WRITE) != 0) {
             LOGE("mprotect RW fallita per segmento a 0x%lx: %s", (unsigned long)pageStart, strerror(errno));
             return nullptr;
         }
 
-        // Copia il contenuto del file se filesz > 0
         if (seg.filesz > 0) {
             if (seg.offset + seg.filesz > bufferSize) {
                 LOGE("Offset segmento fuori dai limiti del buffer file!");
@@ -251,7 +240,6 @@ std::shared_ptr<LoadedLibrary> Elf32Loader::loadFromMemory(
             );
         }
 
-        // Gestione sezione BSS: se memsz > filesz, azzera la parte eccedente
         if (seg.memsz > seg.filesz) {
             size_t bssSize = seg.memsz - seg.filesz;
             std::memset(
@@ -261,12 +249,9 @@ std::shared_ptr<LoadedLibrary> Elf32Loader::loadFromMemory(
             );
         }
 
-        // FASE PROTEZIONE FINALE RIGOROSA (W^X):
-        // Se il segmento contiene codice eseguibile (PF_X), PROT_WRITE DEVE essere revocato!
-        // In Android moderno con SELinux e W^X, non è permessa l'esistenza contemporanea di W e X.
         int finalProt = seg.prot;
         if (finalProt & PROT_EXEC) {
-            finalProt &= ~PROT_WRITE; // Disabilita scrittura per sezioni di codice
+            finalProt &= ~PROT_WRITE;
         }
 
         if (mprotect(reinterpret_cast<void*>(pageStart), pageLen, finalProt) != 0) {

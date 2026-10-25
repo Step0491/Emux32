@@ -4,6 +4,7 @@
 #include <android/log.h>
 #include <sys/mman.h>
 #include <cstring>
+#include <cerrno>
 #include <unistd.h>
 
 #define TAG "EmuxDbtEngine"
@@ -28,7 +29,6 @@ DbtEngine::~DbtEngine() {
 bool DbtEngine::initialize(size_t guestRamSize) {
     guestRamSize_ = guestRamSize;
 
-    // Alloca lo spazio virtuale di memoria guest a 32-bit (es. 512MB contigui)
     void* mapped = mmap(
         nullptr,
         guestRamSize_,
@@ -53,9 +53,7 @@ bool DbtEngine::initialize(size_t guestRamSize) {
 }
 
 void DbtEngine::setupGuestStack() {
-    // Lo stack cresce verso il basso; poniamo SP alla cima della memoria allocata
     guestStackPointer_ = static_cast<uint32_t>(guestRamSize_ - 0x1000);
-    // Allineamento a 8-byte richiesto dall'ABI ARM EABI
     guestStackPointer_ &= ~7U;
     cpuState_.r[13] = guestStackPointer_;
     LOGI("Guest Stack inizializzato a SP = 0x%08x (Host addr: 0x%lx)",
@@ -65,7 +63,7 @@ void DbtEngine::setupGuestStack() {
 void DbtEngine::resetRegisters() {
     std::memset(&cpuState_, 0, sizeof(cpuState_));
     cpuState_.r[13] = guestStackPointer_;
-    cpuState_.cpsr = 0x00000010; // Modalità User (ARM 32-bit), IRQ/FIQ disabilitati
+    cpuState_.cpsr = 0x00000010;
 }
 
 bool DbtEngine::loadLibrary(const std::string& libraryPath) {
@@ -92,9 +90,7 @@ bool DbtEngine::executeEntryPoint() {
     }
 
     LOGI("Avvio esecuzione da Entry Point 0x%08x...", currentLib_->entry_point);
-    cpuState_.r[15] = currentLib_->entry_point; // PC
-
-    // Esecuzione simulata con dispatcher Syscall integrato
+    cpuState_.r[15] = currentLib_->entry_point;
     return true;
 }
 
@@ -104,11 +100,9 @@ uint32_t DbtEngine::callFunction(uint32_t functionAddress, uint32_t arg0, uint32
 
     cpuState_.r[0] = arg0;
     cpuState_.r[1] = arg1;
-    cpuState_.r[14] = 0xDEADBEEF; // Valore sentinel per LR (ritorno)
-    cpuState_.r[15] = functionAddress; // PC
+    cpuState_.r[14] = 0xDEADBEEF;
+    cpuState_.r[15] = functionAddress;
 
-    // Il motore DBT (tramite Unicorn o Dynarmic) compila e traduce i blocchi
-    // finché PC non raggiunge il valore sentinel LR o viene scatenato un trap.
     return cpuState_.r[0];
 }
 

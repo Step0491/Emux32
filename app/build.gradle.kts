@@ -5,13 +5,13 @@ plugins {
 
 android {
     namespace = "com.emux.translator"
-    compileSdk = 35
+    compileSdk = 34
     ndkVersion = "26.1.10909125"
 
     defaultConfig {
         applicationId = "com.emux.translator"
         minSdk = 28
-        targetSdk = 35
+        targetSdk = 34
         versionCode = 1
         versionName = "1.0.0"
 
@@ -21,13 +21,13 @@ android {
         }
 
         ndk {
-            abiFilters.addAll(listOf("arm64-v8a"))
+            abiFilters += listOf("arm64-v8a")
         }
 
         externalNativeBuild {
             cmake {
-                cppFlags.addAll(listOf("-std=c++20", "-O3", "-fexceptions", "-frtti"))
-                arguments.addAll(listOf("-DANDROID_STL=c++_shared"))
+                cppFlags += " -std=c++20 -O3 -fexceptions -frtti"
+                arguments += listOf("-DANDROID_STL=c++_shared")
             }
         }
     }
@@ -61,7 +61,6 @@ android {
 
     buildFeatures {
         compose = true
-        prefab = true
     }
 
     composeOptions {
@@ -87,7 +86,7 @@ dependencies {
     implementation("androidx.lifecycle:lifecycle-runtime-ktx:2.8.6")
     implementation("androidx.activity:activity-compose:1.9.3")
 
-    val composeBom = platform("androidx.compose:compose-bom:2024.10.00")
+    val composeBom = platform("androidx.compose:compose-bom:2024.09.00")
     implementation(composeBom)
     androidTestImplementation(composeBom)
 
