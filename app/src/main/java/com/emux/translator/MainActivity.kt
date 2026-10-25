@@ -31,10 +31,8 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
-        // All'avvio dell'app blocca l'orientamento in Verticale (Portrait) per il selettore
         requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
 
-        // Inizializza l'Engine Dynamic Binary Translator ARM32
         val initialized = NativeEngine.nativeInitEngine(512)
         if (!initialized) {
             Toast.makeText(this, "Inizializzazione Engine ARM32 fallita", Toast.LENGTH_LONG).show()
@@ -47,13 +45,10 @@ class MainActivity : ComponentActivity() {
                 var activeGame by remember { mutableStateOf<EmuxRom?>(null) }
                 val scope = rememberCoroutineScope()
 
-                // Gestione dinamica dell'orientamento dello schermo
                 LaunchedEffect(activeGame) {
                     if (activeGame != null) {
-                        // In-Game: si adatta automaticamente all'orientamento del dispositivo tramite sensore
                         requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_SENSOR
                     } else {
-                        // Nel selettore/menu: forzato rigidamente in Verticale (Portrait)
                         requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
                     }
                 }
@@ -69,7 +64,7 @@ class MainActivity : ComponentActivity() {
                         val rootDoc = DocumentFile.fromTreeUri(this, uri)
                         if (rootDoc != null && rootDoc.isDirectory) {
                             scope.launch(Dispatchers.IO) {
-                                val parsed = parseEmuxGames(rootDoc)
+                                val parsed = parseEmuxGames(this@MainActivity, rootDoc)
                                 withContext(Dispatchers.Main) {
                                     games = parsed
                                     Toast.makeText(
@@ -91,13 +86,11 @@ class MainActivity : ComponentActivity() {
                 }
 
                 if (activeGame != null) {
-                    // Modalità In-Game: schermo adattivo con SurfaceView nativa
                     GamePlayerScreen(
                         game = activeGame!!,
                         onExitGame = { activeGame = null }
                     )
                 } else {
-                    // Modalità Selettore: rigorosamente in Verticale (Portrait)
                     when (displayMode) {
                         DisplayMode.XMB -> {
                             XmbScreen(

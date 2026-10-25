@@ -63,7 +63,6 @@ fun XmbScreen(
         )
     }
 
-    // Navigazione Orizzontale Categorie
     val horizontalState = rememberLazyListState(initialFirstVisibleItemIndex = 1)
     val horizontalSnap = rememberSnapFlingBehavior(lazyListState = horizontalState)
 
@@ -88,7 +87,6 @@ fun XmbScreen(
         }
     }
 
-    // Navigazione Verticale Giochi
     val verticalState = rememberLazyListState()
     val verticalSnap = rememberSnapFlingBehavior(lazyListState = verticalState)
 
@@ -112,7 +110,6 @@ fun XmbScreen(
                 )
             )
     ) {
-        // TOP APP BAR CON LOGO PERSONALIZZATO
         Row(
             modifier = Modifier
                 .fillMaxWidth()
@@ -165,7 +162,6 @@ fun XmbScreen(
             }
         }
 
-        // ASSE ORIZZONTALE CATEGORIE (OTTIMIZZATO IN VERTICALE)
         Box(
             modifier = Modifier
                 .fillMaxWidth()
@@ -228,7 +224,6 @@ fun XmbScreen(
             }
         }
 
-        // ASSE VERTICALE TITOLI (RESPONSIVE IN PORTRAIT)
         Box(
             modifier = Modifier
                 .fillMaxSize()
@@ -256,7 +251,7 @@ fun XmbScreen(
                     )
                     Spacer(modifier = Modifier.height(4.dp))
                     Text(
-                        text = "Tocca l'icona della cartella in alto per selezionare la cartella contenente i tuoi file APK a 32-bit",
+                        text = "Tocca l'icona della cartella in alto per selezionare la cartella con i tuoi file APK a 32-bit",
                         color = Color.Gray,
                         fontSize = 13.sp,
                         lineHeight = 18.sp
@@ -397,11 +392,27 @@ fun XmbVerticalGameCard(
                             modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
                         )
                     }
-                    Text(
-                        text = "DBT Engine",
-                        color = Color.Gray,
-                        fontSize = 11.sp
-                    )
+
+                    if (game.hasObb) {
+                        Surface(
+                            color = Color(0xFF10B981).copy(alpha = 0.25f),
+                            shape = RoundedCornerShape(4.dp)
+                        ) {
+                            Text(
+                                text = "OBB Ready",
+                                color = Color(0xFF34D399),
+                                fontSize = 10.sp,
+                                fontWeight = FontWeight.Bold,
+                                modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
+                            )
+                        }
+                    } else {
+                        Text(
+                            text = "DBT Engine",
+                            color = Color.Gray,
+                            fontSize = 11.sp
+                        )
+                    }
                 }
             }
 
