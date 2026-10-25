@@ -22,21 +22,13 @@ jobs:
         distribution: 'temurin'
         cache: gradle
 
-    - name: Set up Android SDK and NDK
-      uses: android-actions/setup-android@v3
-      with:
-        cmdline-tools-version: 11076708
-
-    - name: Install NDK and CMake
+    - name: Accept Android SDK licenses & Install NDK/CMake
       run: |
-        sdkmanager --install "ndk;26.1.10909125" "cmake;3.22.1" "platforms;android-35" "build-tools;35.0.0"
+        yes | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager --licenses || true
+        $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager --install "ndk;26.1.10909125" "cmake;3.22.1" "platforms;android-35" "build-tools;35.0.0"
 
-    - name: Make Gradle wrapper executable
-      run: |
-        if [ ! -f gradlew ]; then
-          gradle wrapper
-        fi
-        chmod +x gradlew
+    - name: Ensure gradlew is executable
+      run: chmod +x gradlew
 
     - name: Build Debug APK
       run: ./gradlew assembleDebug --stacktrace
@@ -46,4 +38,4 @@ jobs:
       with:
         name: Emux32-ARM64-Debug-APK
         path: app/build/outputs/apk/debug/app-debug.apk
-        retention-days: 14
+        retention-days: 30
