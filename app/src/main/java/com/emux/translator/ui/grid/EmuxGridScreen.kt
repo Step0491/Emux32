@@ -11,7 +11,6 @@ import androidx.compose.material.icons.filled.Folder
 import androidx.compose.material.icons.filled.List
 import androidx.compose.material.icons.filled.Menu
 import androidx.compose.material.icons.filled.Search
-import androidx.compose.material.icons.filled.ViewCarousel
 import androidx.compose.material3.*
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Modifier
@@ -30,23 +29,22 @@ fun EmuxGridScreen(
     onFolderSelectClick: () -> Unit,
     onToggleLayoutClick: () -> Unit
 ) {
-    // Tema scuro forzato come da reference NetherSX2
     MaterialTheme(colorScheme = darkColorScheme(background = Color(0xFF121212))) {
         Scaffold(
             topBar = {
                 TopAppBar(
                     title = { Text("Tutti i giochi (x32)") },
                     navigationIcon = {
-                        IconButton(onClick = { /* Apri Drawer */ }) {
+                        IconButton(onClick = { }) {
                             Icon(Icons.Default.Menu, contentDescription = "Menu")
                         }
                     },
                     actions = {
-                        IconButton(onClick = { /* Logica di ricerca */ }) {
+                        IconButton(onClick = { }) {
                             Icon(Icons.Default.Search, contentDescription = "Cerca")
                         }
                         IconButton(onClick = onToggleLayoutClick) {
-                            Icon(Icons.Default.ViewCarousel, contentDescription = "Passa a XMB")
+                            Icon(Icons.Default.List, contentDescription = "Passa a XMB")
                         }
                     },
                     colors = TopAppBarDefaults.topAppBarColors(
@@ -69,7 +67,7 @@ fun EmuxGridScreen(
             containerColor = MaterialTheme.colorScheme.background
         ) { paddingValues ->
             LazyVerticalGrid(
-                columns = GridCells.Fixed(2), // Griglia a 2 colonne esatta
+                columns = GridCells.Fixed(2),
                 modifier = Modifier
                     .fillMaxSize()
                     .padding(paddingValues)
@@ -91,7 +89,7 @@ fun GameCoverCard(game: EmuxRom, onClick: () -> Unit) {
     Card(
         modifier = Modifier
             .fillMaxWidth()
-            .aspectRatio(0.7f) // Aspect ratio 3:4 tipico delle custodie DVD/PS2
+            .aspectRatio(0.7f)
             .clickable { onClick() },
         elevation = CardDefaults.cardElevation(defaultElevation = 4.dp),
         colors = CardDefaults.cardColors(containerColor = Color(0xFF252525))
@@ -104,7 +102,6 @@ fun GameCoverCard(game: EmuxRom, onClick: () -> Unit) {
                 modifier = Modifier.fillMaxSize()
             )
         } else {
-            // Fallback se l'utente non ha inserito il file cover.jpg
             Box(
                 modifier = Modifier
                     .fillMaxSize()

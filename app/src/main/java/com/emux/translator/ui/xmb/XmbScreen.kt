@@ -26,11 +26,9 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.scale
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.text.font.FontWeight
-import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -61,11 +59,9 @@ fun XmbScreen(
         )
     }
 
-    // Stato orizzontale per le categorie
     val horizontalState = rememberLazyListState(initialFirstVisibleItemIndex = 1)
     val horizontalSnap = rememberSnapFlingBehavior(lazyListState = horizontalState)
 
-    // Indice della categoria attualmente al centro
     val centeredCategoryIndex by remember {
         derivedStateOf {
             val visible = horizontalState.layoutInfo.visibleItemsInfo
@@ -78,8 +74,6 @@ fun XmbScreen(
     }
 
     val selectedCategory = categories.getOrElse(centeredCategoryIndex) { XmbCategory.GAMES }
-
-    // Filtra i titoli per categoria attiva
     val itemsForCategory = remember(selectedCategory, games) {
         when (selectedCategory) {
             XmbCategory.GAMES -> games
@@ -89,11 +83,9 @@ fun XmbScreen(
         }
     }
 
-    // Stato verticale per gli elementi della categoria attiva
     val verticalState = rememberLazyListState()
     val verticalSnap = rememberSnapFlingBehavior(lazyListState = verticalState)
 
-    // Indice dell'elemento verticale attualmente al centro
     val centeredVerticalIndex by remember {
         derivedStateOf {
             val visible = verticalState.layoutInfo.visibleItemsInfo
@@ -105,21 +97,15 @@ fun XmbScreen(
         }
     }
 
-    // Sfondo gradiente stile XMB con toni scuri e accenti blu/viola
     Box(
         modifier = Modifier
             .fillMaxSize()
             .background(
                 Brush.verticalGradient(
-                    colors = listOf(
-                        Color(0xFF0A0F1D),
-                        Color(0xFF0F172A),
-                        Color(0xFF060913)
-                    )
+                    colors = listOf(Color(0xFF0A0F1D), Color(0xFF0F172A), Color(0xFF060913))
                 )
             )
     ) {
-        // TOP BAR CON AZIONI DI SISTEMA E LAYOUT TOGGLE
         Row(
             modifier = Modifier
                 .fillMaxWidth()
@@ -146,13 +132,11 @@ fun XmbScreen(
                     onClick = onToggleLayoutClick,
                     modifier = Modifier.background(Color.White.copy(alpha = 0.1f), RoundedCornerShape(8.dp))
                 ) {
-                    Icon(Icons.Default.GridView, contentDescription = "Passa a Griglia", tint = Color.White)
+                    Icon(Icons.Default.Apps, contentDescription = "Passa a Griglia", tint = Color.White)
                 }
             }
         }
 
-        // ASSE ORIZZONTALE (CATEGORIE XMB)
-        // Posizionato orizzontalmente nel terzo superiore dello schermo
         Box(
             modifier = Modifier
                 .fillMaxWidth()
@@ -181,7 +165,7 @@ fun XmbScreen(
 
                     val icon = when (category) {
                         XmbCategory.SETTINGS -> Icons.Default.Settings
-                        XmbCategory.GAMES -> Icons.Default.SportsEsports
+                        XmbCategory.GAMES -> Icons.Default.PlayArrow
                         XmbCategory.FAVORITES -> Icons.Default.Star
                         XmbCategory.SYSTEM -> Icons.Default.Info
                     }
@@ -215,8 +199,6 @@ fun XmbScreen(
             }
         }
 
-        // ASSE VERTICALE (LISTA TITOLI GUEST / GIOCHI)
-        // Posizionato al centro, si estende verso il basso intersecando l'asse orizzontale
         Box(
             modifier = Modifier
                 .fillMaxWidth()
@@ -230,15 +212,9 @@ fun XmbScreen(
                     modifier = Modifier.fillMaxSize()
                 ) {
                     Text(
-                        text = "Nessun elemento in questa categoria",
+                        text = "Nessun binario x32 in questa cartella",
                         color = Color.Gray,
                         fontSize = 14.sp
-                    )
-                    Spacer(modifier = Modifier.height(8.dp))
-                    Text(
-                        text = "Usa l'icona della cartella in alto a destra per caricare gli APK a 32-bit",
-                        color = Color.DarkGray,
-                        fontSize = 12.sp
                     )
                 }
             } else {
@@ -252,7 +228,6 @@ fun XmbScreen(
                 ) {
                     itemsIndexed(itemsForCategory) { index, game ->
                         val isSelected = (index == centeredVerticalIndex)
-
                         val scale by animateFloatAsState(
                             targetValue = if (isSelected) 1.08f else 0.88f,
                             animationSpec = spring(dampingRatio = Spring.DampingRatioMediumBouncy),
@@ -281,28 +256,6 @@ fun XmbScreen(
                     }
                 }
             }
-        }
-
-        // HINT COMANDI IN BASSO
-        Row(
-            modifier = Modifier
-                .align(Alignment.BottomStart)
-                .padding(24.dp),
-            horizontalArrangement = Arrangement.spacedBy(16.dp),
-            verticalAlignment = Alignment.CenterVertically
-        ) {
-            Text(
-                text = "✕ AVVIA GIOCO",
-                color = Color.White.copy(alpha = 0.6f),
-                fontSize = 12.sp,
-                fontWeight = FontWeight.Bold
-            )
-            Text(
-                text = "◯ INDIETRO",
-                color = Color.White.copy(alpha = 0.6f),
-                fontSize = 12.sp,
-                fontWeight = FontWeight.Bold
-            )
         }
     }
 }
@@ -342,7 +295,6 @@ fun XmbVerticalGameCard(
                 .padding(12.dp),
             verticalAlignment = Alignment.CenterVertically
         ) {
-            // Immagine Copertina o Icona APK
             Box(
                 modifier = Modifier
                     .width(64.dp)
@@ -360,7 +312,7 @@ fun XmbVerticalGameCard(
                     )
                 } else {
                     Icon(
-                        imageVector = Icons.Default.SportsEsports,
+                        imageVector = Icons.Default.PlayArrow,
                         contentDescription = "Cover fallback",
                         tint = Color.Gray,
                         modifier = Modifier.size(32.dp)
@@ -412,9 +364,7 @@ fun XmbVerticalGameCard(
                     imageVector = Icons.Default.PlayArrow,
                     contentDescription = "Play",
                     tint = Color(0xFF38BDF8),
-                    modifier = Modifier
-                        .size(36.dp)
-                        .padding(end = 8.dp)
+                    modifier = Modifier.size(36.dp).padding(end = 8.dp)
                 )
             }
         }
