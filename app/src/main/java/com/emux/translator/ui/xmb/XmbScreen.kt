@@ -5,6 +5,7 @@ import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.spring
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.ExperimentalFoundationApi
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -14,6 +15,7 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.lazy.rememberLazyListState
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.*
@@ -28,11 +30,13 @@ import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalConfiguration
+import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import coil.compose.AsyncImage
+import com.emux.translator.R
 import com.emux.translator.model.EmuxRom
 import com.emux.translator.model.XmbCategory
 import kotlinx.coroutines.launch
@@ -59,6 +63,7 @@ fun XmbScreen(
         )
     }
 
+    // Navigazione Orizzontale Categorie
     val horizontalState = rememberLazyListState(initialFirstVisibleItemIndex = 1)
     val horizontalSnap = rememberSnapFlingBehavior(lazyListState = horizontalState)
 
@@ -83,6 +88,7 @@ fun XmbScreen(
         }
     }
 
+    // Navigazione Verticale Giochi
     val verticalState = rememberLazyListState()
     val verticalSnap = rememberSnapFlingBehavior(lazyListState = verticalState)
 
@@ -102,59 +108,82 @@ fun XmbScreen(
             .fillMaxSize()
             .background(
                 Brush.verticalGradient(
-                    colors = listOf(Color(0xFF0A0F1D), Color(0xFF0F172A), Color(0xFF060913))
+                    colors = listOf(Color(0xFF090D16), Color(0xFF0F172A), Color(0xFF060911))
                 )
             )
     ) {
+        // TOP APP BAR CON LOGO PERSONALIZZATO
         Row(
             modifier = Modifier
                 .fillMaxWidth()
-                .padding(horizontal = 24.dp, vertical = 16.dp),
+                .statusBarsPadding()
+                .padding(horizontal = 20.dp, vertical = 12.dp),
             horizontalArrangement = Arrangement.SpaceBetween,
             verticalAlignment = Alignment.CenterVertically
         ) {
-            Text(
-                text = "EMUX 32-BIT RUNNER",
-                color = Color.White.copy(alpha = 0.85f),
-                fontSize = 18.sp,
-                fontWeight = FontWeight.Bold,
-                letterSpacing = 2.sp
-            )
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(10.dp)
+            ) {
+                Image(
+                    painter = painterResource(id = R.drawable.app_logo),
+                    contentDescription = "Emux32 Logo",
+                    modifier = Modifier
+                        .size(38.dp)
+                        .clip(RoundedCornerShape(8.dp))
+                )
+                Column {
+                    Text(
+                        text = "EMUX 32",
+                        color = Color.White,
+                        fontSize = 17.sp,
+                        fontWeight = FontWeight.Bold,
+                        letterSpacing = 1.sp
+                    )
+                    Text(
+                        text = "ARM64 DBT Frontend",
+                        color = Color(0xFF38BDF8),
+                        fontSize = 11.sp,
+                        fontWeight = FontWeight.Medium
+                    )
+                }
+            }
 
-            Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+            Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
                 IconButton(
                     onClick = onFolderSelectClick,
-                    modifier = Modifier.background(Color.White.copy(alpha = 0.1f), RoundedCornerShape(8.dp))
+                    modifier = Modifier.background(Color.White.copy(alpha = 0.08f), CircleShape)
                 ) {
                     Icon(Icons.Default.Folder, contentDescription = "Seleziona Cartella", tint = Color.White)
                 }
                 IconButton(
                     onClick = onToggleLayoutClick,
-                    modifier = Modifier.background(Color.White.copy(alpha = 0.1f), RoundedCornerShape(8.dp))
+                    modifier = Modifier.background(Color.White.copy(alpha = 0.08f), CircleShape)
                 ) {
                     Icon(Icons.Default.Apps, contentDescription = "Passa a Griglia", tint = Color.White)
                 }
             }
         }
 
+        // ASSE ORIZZONTALE CATEGORIE (OTTIMIZZATO IN VERTICALE)
         Box(
             modifier = Modifier
                 .fillMaxWidth()
-                .padding(top = 90.dp),
+                .padding(top = 95.dp),
             contentAlignment = Alignment.Center
         ) {
             LazyRow(
                 state = horizontalState,
                 flingBehavior = horizontalSnap,
-                contentPadding = PaddingValues(horizontal = screenWidth / 2 - 50.dp),
-                horizontalArrangement = Arrangement.spacedBy(40.dp),
+                contentPadding = PaddingValues(horizontal = screenWidth / 2 - 32.dp),
+                horizontalArrangement = Arrangement.spacedBy(32.dp),
                 verticalAlignment = Alignment.CenterVertically,
                 modifier = Modifier.fillMaxWidth()
             ) {
                 itemsIndexed(categories) { index, category ->
                     val isSelected = (index == centeredCategoryIndex)
                     val scale by animateFloatAsState(
-                        targetValue = if (isSelected) 1.25f else 0.85f,
+                        targetValue = if (isSelected) 1.22f else 0.85f,
                         animationSpec = spring(dampingRatio = Spring.DampingRatioMediumBouncy),
                         label = "CategoryScale"
                     )
@@ -185,13 +214,13 @@ fun XmbScreen(
                             imageVector = icon,
                             contentDescription = category.title,
                             tint = if (isSelected) Color(0xFF38BDF8) else Color.White,
-                            modifier = Modifier.size(42.dp)
+                            modifier = Modifier.size(36.dp)
                         )
                         Spacer(modifier = Modifier.height(4.dp))
                         Text(
                             text = category.title,
                             color = if (isSelected) Color.White else Color.Gray,
-                            fontSize = 12.sp,
+                            fontSize = 11.sp,
                             fontWeight = if (isSelected) FontWeight.SemiBold else FontWeight.Normal
                         )
                     }
@@ -199,22 +228,38 @@ fun XmbScreen(
             }
         }
 
+        // ASSE VERTICALE TITOLI (RESPONSIVE IN PORTRAIT)
         Box(
             modifier = Modifier
-                .fillMaxWidth()
-                .padding(top = 180.dp, bottom = 24.dp),
+                .fillMaxSize()
+                .padding(top = 185.dp, bottom = 16.dp),
             contentAlignment = Alignment.Center
         ) {
             if (itemsForCategory.isEmpty()) {
                 Column(
                     horizontalAlignment = Alignment.CenterHorizontally,
                     verticalArrangement = Arrangement.Center,
-                    modifier = Modifier.fillMaxSize()
+                    modifier = Modifier.fillMaxSize().padding(horizontal = 24.dp)
                 ) {
+                    Icon(
+                        imageVector = Icons.Default.Folder,
+                        contentDescription = null,
+                        tint = Color.DarkGray,
+                        modifier = Modifier.size(64.dp)
+                    )
+                    Spacer(modifier = Modifier.height(12.dp))
                     Text(
-                        text = "Nessun binario x32 in questa cartella",
+                        text = "Nessun gioco trovato",
+                        color = Color.White,
+                        fontSize = 16.sp,
+                        fontWeight = FontWeight.Bold
+                    )
+                    Spacer(modifier = Modifier.height(4.dp))
+                    Text(
+                        text = "Tocca l'icona della cartella in alto per selezionare la cartella contenente i tuoi file APK a 32-bit",
                         color = Color.Gray,
-                        fontSize = 14.sp
+                        fontSize = 13.sp,
+                        lineHeight = 18.sp
                     )
                 }
             } else {
@@ -222,19 +267,19 @@ fun XmbScreen(
                     state = verticalState,
                     flingBehavior = verticalSnap,
                     contentPadding = PaddingValues(vertical = screenHeight / 3),
-                    verticalArrangement = Arrangement.spacedBy(20.dp),
+                    verticalArrangement = Arrangement.spacedBy(16.dp),
                     horizontalAlignment = Alignment.CenterHorizontally,
                     modifier = Modifier.fillMaxSize()
                 ) {
                     itemsIndexed(itemsForCategory) { index, game ->
                         val isSelected = (index == centeredVerticalIndex)
                         val scale by animateFloatAsState(
-                            targetValue = if (isSelected) 1.08f else 0.88f,
+                            targetValue = if (isSelected) 1.04f else 0.92f,
                             animationSpec = spring(dampingRatio = Spring.DampingRatioMediumBouncy),
                             label = "ItemScale"
                         )
                         val alpha by animateFloatAsState(
-                            targetValue = if (isSelected) 1.0f else 0.40f,
+                            targetValue = if (isSelected) 1.0f else 0.45f,
                             label = "ItemAlpha"
                         )
 
@@ -270,8 +315,9 @@ fun XmbVerticalGameCard(
 ) {
     Card(
         modifier = Modifier
-            .width(420.dp)
-            .height(110.dp)
+            .fillMaxWidth()
+            .padding(horizontal = 20.dp)
+            .height(105.dp)
             .scale(scale)
             .alpha(alpha)
             .clickable { onClick() }
@@ -287,7 +333,7 @@ fun XmbVerticalGameCard(
         colors = CardDefaults.cardColors(
             containerColor = if (isSelected) Color(0xFF1E293B) else Color(0xFF111827)
         ),
-        elevation = CardDefaults.cardElevation(defaultElevation = if (isSelected) 12.dp else 2.dp)
+        elevation = CardDefaults.cardElevation(defaultElevation = if (isSelected) 10.dp else 2.dp)
     ) {
         Row(
             modifier = Modifier
@@ -297,8 +343,8 @@ fun XmbVerticalGameCard(
         ) {
             Box(
                 modifier = Modifier
-                    .width(64.dp)
-                    .height(86.dp)
+                    .width(62.dp)
+                    .height(81.dp)
                     .clip(RoundedCornerShape(8.dp))
                     .background(Color(0xFF0F172A)),
                 contentAlignment = Alignment.Center
@@ -320,7 +366,7 @@ fun XmbVerticalGameCard(
                 }
             }
 
-            Spacer(modifier = Modifier.width(16.dp))
+            Spacer(modifier = Modifier.width(14.dp))
 
             Column(
                 modifier = Modifier.weight(1f),
@@ -329,14 +375,14 @@ fun XmbVerticalGameCard(
                 Text(
                     text = game.title,
                     color = Color.White,
-                    fontSize = 16.sp,
+                    fontSize = 15.sp,
                     fontWeight = FontWeight.Bold,
                     maxLines = 1,
                     overflow = TextOverflow.Ellipsis
                 )
                 Spacer(modifier = Modifier.height(4.dp))
                 Row(
-                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    horizontalArrangement = Arrangement.spacedBy(6.dp),
                     verticalAlignment = Alignment.CenterVertically
                 ) {
                     Surface(
@@ -352,7 +398,7 @@ fun XmbVerticalGameCard(
                         )
                     }
                     Text(
-                        text = "Native DBT Ready",
+                        text = "DBT Engine",
                         color = Color.Gray,
                         fontSize = 11.sp
                     )
@@ -364,7 +410,7 @@ fun XmbVerticalGameCard(
                     imageVector = Icons.Default.PlayArrow,
                     contentDescription = "Play",
                     tint = Color(0xFF38BDF8),
-                    modifier = Modifier.size(36.dp).padding(end = 8.dp)
+                    modifier = Modifier.size(32.dp).padding(end = 4.dp)
                 )
             }
         }

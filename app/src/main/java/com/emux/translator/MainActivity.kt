@@ -1,5 +1,6 @@
 package com.emux.translator
 
+import android.content.pm.ActivityInfo
 import android.net.Uri
 import android.os.Bundle
 import android.widget.Toast
@@ -12,6 +13,7 @@ import androidx.documentfile.provider.DocumentFile
 import com.emux.translator.model.EmuxRom
 import com.emux.translator.model.parseEmuxGames
 import com.emux.translator.nativebridge.NativeEngine
+import com.emux.translator.ui.game.GamePlayerScreen
 import com.emux.translator.ui.grid.EmuxGridScreen
 import com.emux.translator.ui.theme.EmuxTranslatorTheme
 import com.emux.translator.ui.xmb.XmbScreen
@@ -29,7 +31,10 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
-        // Inizializza l'Engine Dynamic Binary Translator ARM32 con 512MB di memoria virtuale guest
+        // All'avvio dell'app blocca l'orientamento in Verticale (Portrait) per il selettore
+        requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
+
+        // Inizializza l'Engine Dynamic Binary Translator ARM32
         val initialized = NativeEngine.nativeInitEngine(512)
         if (!initialized) {
             Toast.makeText(this, "Inizializzazione Engine ARM32 fallita", Toast.LENGTH_LONG).show()
@@ -39,9 +44,20 @@ class MainActivity : ComponentActivity() {
             EmuxTranslatorTheme {
                 var games by remember { mutableStateOf<List<EmuxRom>>(emptyList()) }
                 var displayMode by remember { mutableStateOf(DisplayMode.XMB) }
+                var activeGame by remember { mutableStateOf<EmuxRom?>(null) }
                 val scope = rememberCoroutineScope()
 
-                // Launcher Storage Access Framework (SAF) per selezione cartella giochi
+                // Gestione dinamica dell'orientamento dello schermo
+                LaunchedEffect(activeGame) {
+                    if (activeGame != null) {
+                        // In-Game: si adatta automaticamente all'orientamento del dispositivo tramite sensore
+                        requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_SENSOR
+                    } else {
+                        // Nel selettore/menu: forzato rigidamente in Verticale (Portrait)
+                        requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
+                    }
+                }
+
                 val folderPickerLauncher = rememberLauncherForActivityResult(
                     contract = ActivityResultContracts.OpenDocumentTree()
                 ) { uri: Uri? ->
@@ -68,29 +84,37 @@ class MainActivity : ComponentActivity() {
                 }
 
                 val onGameSelected: (EmuxRom) -> Unit = { rom ->
-                    Toast.makeText(this, "Avvio DBT x32: ${rom.title}", Toast.LENGTH_SHORT).show()
-                    // Dispatch asincrono del caricamento ed esecuzione ELF 32-bit
+                    activeGame = rom
                     scope.launch(Dispatchers.Default) {
                         launchGame(rom)
                     }
                 }
 
-                when (displayMode) {
-                    DisplayMode.XMB -> {
-                        XmbScreen(
-                            games = games,
-                            onGameClick = onGameSelected,
-                            onFolderSelectClick = { folderPickerLauncher.launch(null) },
-                            onToggleLayoutClick = { displayMode = DisplayMode.GRID }
-                        )
-                    }
-                    DisplayMode.GRID -> {
-                        EmuxGridScreen(
-                            games = games,
-                            onGameClick = onGameSelected,
-                            onFolderSelectClick = { folderPickerLauncher.launch(null) },
-                            onToggleLayoutClick = { displayMode = DisplayMode.XMB }
-                        )
+                if (activeGame != null) {
+                    // Modalità In-Game: schermo adattivo con SurfaceView nativa
+                    GamePlayerScreen(
+                        game = activeGame!!,
+                        onExitGame = { activeGame = null }
+                    )
+                } else {
+                    // Modalità Selettore: rigorosamente in Verticale (Portrait)
+                    when (displayMode) {
+                        DisplayMode.XMB -> {
+                            XmbScreen(
+                                games = games,
+                                onGameClick = onGameSelected,
+                                onFolderSelectClick = { folderPickerLauncher.launch(null) },
+                                onToggleLayoutClick = { displayMode = DisplayMode.GRID }
+                            )
+                        }
+                        DisplayMode.GRID -> {
+                            EmuxGridScreen(
+                                games = games,
+                                onGameClick = onGameSelected,
+                                onFolderSelectClick = { folderPickerLauncher.launch(null) },
+                                onToggleLayoutClick = { displayMode = DisplayMode.XMB }
+                            )
+                        }
                     }
                 }
             }
@@ -98,7 +122,6 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun launchGame(rom: EmuxRom) {
-        // Logica di estrazione .so da APK e avvio nel Dynamic Binary Translation Engine
         if (rom.apkUri == null) return
 
         try {
@@ -106,7 +129,6 @@ class MainActivity : ComponentActivity() {
                 val tempApk = java.io.File(cacheDir, "temp_guest.apk")
                 tempApk.outputStream().use { output -> input.copyTo(output) }
 
-                // Esempio: estrazione libgame.so da lib/armeabi-v7a/ dentro il file zip/apk
                 val zip = java.util.zip.ZipFile(tempApk)
                 val entries = zip.entries()
                 var extractedSo: java.io.File? = null
