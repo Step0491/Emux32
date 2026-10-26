@@ -1,4 +1,5 @@
 #include "elf_loader.h"
+#include "unicorn/unicorn.h"
 #include <iostream>
 #include <cassert>
 #include <cstring>
@@ -80,10 +81,18 @@ void testElfHeaderValidation() {
     );
 
     assert(libArm != nullptr);
-    assert(libArm->base_address != 0);
     assert(libArm->total_memory_size > 0);
     assert(libArm->segments.size() == 2);
-    std::cout << "  ✓ Caricamento e allineamento memoria ELF ARM32 verificato con successo!" << std::endl;
+
+    // Test Unicorn mapping
+    uc_engine* uc = nullptr;
+    uc_err err = uc_open(UC_ARCH_ARM, UC_MODE_ARM, &uc);
+    assert(err == UC_ERR_OK);
+    bool mapped = libArm->mapToUnicorn(uc);
+    assert(mapped == true);
+    uc_close(uc);
+
+    std::cout << "  ✓ Caricamento e allineamento memoria ELF ARM32 verificato con successo in Unicorn!" << std::endl;
 }
 
 int main() {

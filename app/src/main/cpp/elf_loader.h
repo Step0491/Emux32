@@ -6,6 +6,15 @@
 #include <vector>
 #include <memory>
 #include <elf.h>
+#include "unicorn/unicorn.h"
+
+#ifndef PAGE_SIZE
+#define PAGE_SIZE 0x1000
+#endif
+
+// Macro obbligatorie per l'allineamento dei blocchi alla pagina di sistema (4096 / 0x1000 byte)
+#define PAGE_ALIGN_DOWN(addr) ((addr) & ~(PAGE_SIZE - 1))
+#define PAGE_ALIGN_UP(addr) (((addr) + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1))
 
 namespace emux {
 
@@ -18,18 +27,23 @@ struct ElfSegment {
     uint32_t memsz;
     uint32_t align;
     int prot;
+    uint32_t uc_prot;
 };
 
 struct LoadedLibrary {
     std::string path;
-    uintptr_t base_address;       // Indirizzo base virtuale nell'host
-    size_t total_memory_size;     // Dimensione totale contigua allocata
-    uint32_t entry_point;         // Entry point ARM32
-    uint32_t load_bias;           // Offset rilocazione base (base_address - min_vaddr)
+    uintptr_t base_address{0};    // Indirizzo base virtuale nell'host
+    size_t total_memory_size{0};  // Dimensione totale contigua allocata
+    uint32_t entry_point{0};      // Entry point ARM32
+    uint32_t load_bias{0};        // Offset rilocazione base
     std::vector<ElfSegment> segments;
-    bool is_pie;
+    std::vector<uint8_t> raw_binary; // Buffer binario per mapping JIT / Unicorn
+    bool is_pie{false};
 
     ~LoadedLibrary();
+
+    // Mappa tutti i segmenti PT_LOAD all'interno dell'istanza Unicorn applicando strict page alignment
+    bool mapToUnicorn(uc_engine* uc) const;
 };
 
 class Elf32Loader {
@@ -37,20 +51,13 @@ public:
     Elf32Loader();
     ~Elf32Loader();
 
-    // Carica ed esegue il parsing completo di una libreria ELF 32-bit da disco
     std::shared_ptr<LoadedLibrary> loadFromFile(const std::string& filePath);
-
-    // Carica direttamente da buffer di memoria (es. estratto in RAM da un file APK)
     std::shared_ptr<LoadedLibrary> loadFromMemory(const uint8_t* buffer, size_t bufferSize, const std::string& name);
 
 private:
     bool validateHeader(const Elf32_Ehdr& header) const;
     int convertElfFlagsToMmapProt(uint32_t p_flags) const;
-    size_t getSystemPageSize() const;
-    uintptr_t alignDown(uintptr_t addr, size_t pageSize) const;
-    uintptr_t alignUp(uintptr_t addr, size_t pageSize) const;
-
-    size_t pageSize_;
+    uint32_t convertElfFlagsToUcProt(uint32_t p_flags) const;
 };
 
 } // namespace emux

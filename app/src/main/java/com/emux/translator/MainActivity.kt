@@ -19,9 +19,6 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.CreateNewFolder
-import androidx.compose.material.icons.filled.FolderOpen
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
@@ -168,8 +165,9 @@ class MainActivity : ComponentActivity() {
                         currentPathLabel = currentEmuxDir.absolutePath,
                         onGameClick = { rom ->
                             activeGame = rom
-                            scope.launch(Dispatchers.Default) {
-                                launchGame(rom)
+                            // GESTIONE DELLA CONCORRENZA: Invocazione asincrona isolata su Dispatchers.IO
+                            scope.launch(Dispatchers.IO) {
+                                launchGameAsync(rom)
                             }
                         },
                         onChangePathClick = {
@@ -261,12 +259,18 @@ class MainActivity : ComponentActivity() {
 
     /**
      * Collega tutti i file OBB associati nel sandbox Android target (/sdcard/Android/obb/<packageName>/)
-     * e avvia la libreria guest ARM32 nel Dynarmic JIT
+     * ed esegue startEmulationNative in modo completamente asincrono su Dispatchers.IO senza bloccare
+     * il Main Thread di Compose.
      */
-    private fun launchGame(rom: EmuxRom) {
+    private suspend fun launchGameAsync(rom: EmuxRom) = withContext(Dispatchers.IO) {
         try {
             val apkFile = rom.apkFile
-            if (!apkFile.exists()) return
+            if (!apkFile.exists()) {
+                withContext(Dispatchers.Main) {
+                    Toast.makeText(this@MainActivity, "File APK non trovato: ${apkFile.name}", Toast.LENGTH_SHORT).show()
+                }
+                return@withContext
+            }
 
             val pkg = rom.packageName
             val obbList = rom.obbFiles
@@ -300,7 +304,7 @@ class MainActivity : ComponentActivity() {
                 }
             }
 
-            // 2. ESTRAZIONE Esecuzione .so ARM32 nel motore Dynarmic JIT
+            // 2. ESTRAZIONE Esecuzione .so ARM32 nel motore Unicorn DBT
             val zip = java.util.zip.ZipFile(apkFile)
             val entries = zip.entries()
             var extractedSo: File? = null
@@ -319,13 +323,29 @@ class MainActivity : ComponentActivity() {
             zip.close()
 
             if (extractedSo != null && extractedSo.exists()) {
+                Log.i("Emux32", "Caricamento libreria nativa ELF: ${extractedSo.absolutePath}")
                 val loaded = NativeEngine.nativeLoadElfLibrary(extractedSo.absolutePath)
                 if (loaded) {
-                    NativeEngine.nativeExecuteEntryPoint()
+                    Log.i("Emux32", "Avvio asincrono startEmulationNative su Dispatchers.IO...")
+                    val success = NativeEngine.startEmulationNative()
+                    if (!success) {
+                        Log.w("Emux32", "startEmulationNative ha completato l'esecuzione.")
+                    }
+                } else {
+                    withContext(Dispatchers.Main) {
+                        Toast.makeText(this@MainActivity, "Caricamento ELF fallito per ${extractedSo.name}", Toast.LENGTH_SHORT).show()
+                    }
+                }
+            } else {
+                withContext(Dispatchers.Main) {
+                    Toast.makeText(this@MainActivity, "Nessuna libreria ARM32 (armeabi-v7a) trovata nell'APK", Toast.LENGTH_LONG).show()
                 }
             }
-        } catch (e: Exception) {
-            e.printStackTrace()
+        } catch (e: Throwable) {
+            Log.e("Emux32", "Eccezione durante il lancio dell'emulazione: ${e.message}", e)
+            withContext(Dispatchers.Main) {
+                Toast.makeText(this@MainActivity, "Errore avvio gioco: ${e.localizedMessage}", Toast.LENGTH_LONG).show()
+            }
         }
     }
 

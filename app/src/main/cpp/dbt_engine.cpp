@@ -2,12 +2,8 @@
 #include "linker_hook.h"
 
 #include <android/log.h>
-#include <sys/mman.h>
 #include <cstring>
-#include <cerrno>
-#include <unistd.h>
 #include <chrono>
-#include <thread>
 
 #define TAG "EmuxDbtEngine"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, TAG, __VA_ARGS__)
@@ -16,247 +12,181 @@
 
 namespace emux {
 
-constexpr size_t GUEST_STACK_SIZE = 8 * 1024 * 1024; // 8MB Stack per thread
-
 DbtEngine::DbtEngine() {
     governor_.configure(60, true);
 }
 
 DbtEngine::~DbtEngine() {
     governor_.isRunning.store(false);
-    if (jit_) {
-        jit_->HaltExecution();
-        jit_.reset();
-    }
-    if (guestRamBase_ != 0 && guestRamSize_ > 0) {
-        munmap(reinterpret_cast<void*>(guestRamBase_), guestRamSize_);
-        guestRamBase_ = 0;
-        guestRamSize_ = 0;
+    if (uc_) {
+        uc_emu_stop(uc_);
+        if (intrHook_ != 0) {
+            uc_hook_del(uc_, intrHook_);
+            intrHook_ = 0;
+        }
+        uc_close(uc_);
+        uc_ = nullptr;
     }
 }
 
 void DbtEngine::configurePerformance(uint32_t targetFps, bool enableFhd, bool throttleGuard) {
     governor_.configure(targetFps, throttleGuard);
-    LOGI("DbtEngine Performance Governor: Target %u FPS, Throttle Guard %s",
-         targetFps, throttleGuard ? "ABILITATO" : "DISABILITATO");
+    LOGI("DbtEngine Performance Governor: Target %u FPS, FHD: %s, Throttle Guard: %s",
+         targetFps, enableFhd ? "ON" : "OFF", throttleGuard ? "ON" : "OFF");
 }
 
-bool DbtEngine::initialize(size_t guestRamSize) {
-    guestRamSize_ = guestRamSize;
+bool DbtEngine::initialize(size_t /* guestRamSize */) {
+    LOGI("Inizializzazione Unicorn Engine per architettura ARMv7-A...");
 
-    // Fastmem mapping virtuale
-    void* mapped = mmap(
-        nullptr,
-        guestRamSize_,
-        PROT_READ | PROT_WRITE,
-        MAP_PRIVATE | MAP_ANONYMOUS,
-        -1,
+    uc_err err = uc_open(UC_ARCH_ARM, UC_MODE_ARM, &uc_);
+    if (err != UC_ERR_OK) {
+        LOGE("uc_open fallito: %s (codice: %d)", uc_strerror(err), err);
+        return false;
+    }
+
+    // REGISTRAZIONE HOOK INTERRUPT/SYSCALL:
+    // I binari compilati con la libc Bionic invocheranno syscall tramite SVC #0.
+    // Registriamo un hook UC_HOOK_INTR prima dell'avvio per intercettare l'interrupt ed evitare SIGSEGV/SIGABRT.
+    err = uc_hook_add(
+        uc_,
+        &intrHook_,
+        UC_HOOK_INTR,
+        reinterpret_cast<void*>(hookInterruptCallback),
+        this,
+        1,
         0
     );
 
-    if (mapped == MAP_FAILED) {
-        LOGE("Allocazione spazio RAM virtuale guest fallita: %s", strerror(errno));
+    if (err != UC_ERR_OK) {
+        LOGE("uc_hook_add UC_HOOK_INTR fallito: %s", uc_strerror(err));
+        uc_close(uc_);
+        uc_ = nullptr;
         return false;
     }
 
-    guestRamBase_ = reinterpret_cast<uintptr_t>(mapped);
-    LOGI("DbtEngine inizializzato. Spazio RAM Guest mappato a 0x%lx (dimensione %zu MB)",
-         (unsigned long)guestRamBase_, guestRamSize_ / (1024 * 1024));
-
-    setupGuestStack();
-    resetRegisters();
-
-    // Configurazione e creazione istanza Dynarmic JIT
-    Dynarmic::A32::UserConfig config;
-    config.callbacks = this;
-    config.arch_version = Dynarmic::A32::ArchVersion::v8; // ARMv8-A32 mode compatibile ARMv7
-    config.optimizations = Dynarmic::all_safe_optimizations;
-    config.unsafe_optimizations = false;
-
-    try {
-        jit_ = std::make_unique<Dynarmic::A32::Jit>(config);
-        LOGI("Dynarmic A32 JIT Recompiler istanziato con successo!");
-    } catch (const std::exception& ex) {
-        LOGE("Errore istanziazione Dynarmic JIT: %s", ex.what());
-        return false;
-    } catch (...) {
-        LOGE("Errore sconosciuto istanziazione Dynarmic JIT");
-        return false;
-    }
-
+    isInitialized_ = true;
+    LOGI("Unicorn Engine inizializzato con successo e hook UC_HOOK_INTR registrato (id=%zu).", intrHook_);
     return true;
 }
 
 void DbtEngine::setupGuestStack() {
-    guestStackPointer_ = static_cast<uint32_t>(guestRamSize_ - 0x1000);
-    guestStackPointer_ &= ~7U;
-    cpuState_.r[13] = guestStackPointer_;
-    LOGI("Guest Stack inizializzato a SP = 0x%08x (Host addr: 0x%lx)",
-         guestStackPointer_, (unsigned long)(guestRamBase_ + guestStackPointer_));
-}
+    if (!uc_) return;
 
-void DbtEngine::resetRegisters() {
-    std::memset(&cpuState_, 0, sizeof(cpuState_));
-    cpuState_.r[13] = guestStackPointer_;
-    cpuState_.cpsr = 0x00000010; // User mode ARMv7
+    // SETUP DEL CONTESTO CPU - AREA STACK 2MB DEDICATA:
+    // Mappa un'area di 2MB allineata rigorosamente alla pagina 0x1000 byte
+    uint32_t alignedStackBase = PAGE_ALIGN_DOWN(guestStackBase_);
+    uint32_t alignedStackSize = PAGE_ALIGN_UP(guestStackSize_); // 2MB esatti (0x200000)
+
+    LOGI("Setup Stack Guest dedicato (2MB): Base=0x%08x, Dimensione=0x%08x (%u byte)",
+         alignedStackBase, alignedStackSize, alignedStackSize);
+
+    uc_err err = uc_mem_map(uc_, alignedStackBase, alignedStackSize, UC_PROT_READ | UC_PROT_WRITE);
+    if (err != UC_ERR_OK && err != UC_ERR_MAP) {
+        LOGE("uc_mem_map dello Stack guest fallita: %s", uc_strerror(err));
+        return;
+    }
+
+    // Stack Pointer posizionato al limite superiore dell'area allineata (decrescente, 8-byte aligned)
+    guestStackPointer_ = (alignedStackBase + alignedStackSize - 0x1000) & ~7U;
+    uc_reg_write(uc_, UC_ARM_REG_SP, &guestStackPointer_);
+
+    LOGI("Registro UC_ARM_REG_SP inizializzato a: 0x%08x", guestStackPointer_);
 }
 
 bool DbtEngine::loadLibrary(const std::string& libraryPath) {
-    currentLib_ = loader_.loadFromFile(libraryPath);
-    if (!currentLib_) {
-        LOGE("Caricamento della libreria fallito: %s", libraryPath.c_str());
+    if (!uc_) {
+        LOGE("Engine non inizializzato prima del caricamento ELF!");
         return false;
     }
 
-    LOGI("Libreria caricata con successo: %s (Entry Point: 0x%08x)",
+    currentLib_ = loader_.loadFromFile(libraryPath);
+    if (!currentLib_) {
+        LOGE("Caricamento della libreria ELF fallito da: %s", libraryPath.c_str());
+        return false;
+    }
+
+    // Mappatura automatica di tutti i segmenti PT_LOAD in Unicorn Engine con strict page alignment
+    bool mapped = currentLib_->mapToUnicorn(uc_);
+    if (!mapped) {
+        LOGE("Mappatura dei segmenti ELF in memoria Unicorn fallita!");
+        return false;
+    }
+
+    LOGI("Libreria ELF caricata e mappata con successo: %s (Entry Point: 0x%08x)",
          libraryPath.c_str(), currentLib_->entry_point);
     return true;
 }
 
-bool DbtEngine::executeEntryPoint() {
-    if (!currentLib_ || !jit_) {
-        LOGE("Libreria o JIT non inizializzati per l'avvio");
+bool DbtEngine::startEmulation() {
+    if (!uc_ || !currentLib_) {
+        LOGE("Engine o libreria ELF non pronta per startEmulation");
         return false;
     }
 
     if (currentLib_->entry_point == 0) {
-        LOGW("Libreria JNI senza ELF Entry Point diretto (.so dinamica)");
+        LOGW("Libreria ELF dinamica (.so) senza Entry Point statico, pronta per JNI_OnLoad");
         return true;
     }
 
-    LOGI("Avvio ricompilazione Dynarmic JIT da Entry Point 0x%08x...", currentLib_->entry_point);
-    jit_->Regs()[15] = currentLib_->entry_point;
-    jit_->Regs()[13] = guestStackPointer_;
-    jit_->SetCpsr(0x00000010);
+    // 1. SETUP DELLO STACK GUEST
+    setupGuestStack();
 
-    ticksRemaining_ = 1000000;
+    // 2. SETUP DEI REGISTRI CPU
+    uint32_t pc = currentLib_->entry_point;
+    uint32_t lr = 0xDEADBEEF; // Return address trap per fermare l'emulazione al return dell'entry point
+    uint32_t cpsr = 0x00000010; // ARM User Mode (32-bit)
+
+    uc_reg_write(uc_, UC_ARM_REG_PC, &pc);
+    uc_reg_write(uc_, UC_ARM_REG_LR, &lr);
+    uc_reg_write(uc_, UC_ARM_REG_CPSR, &cpsr);
+
+    LOGI("Avvio uc_emu_start: PC=0x%08x, SP=0x%08x, LR=0x%08x...", pc, guestStackPointer_, lr);
+
     governor_.isRunning.store(true);
-
     auto frameStart = std::chrono::steady_clock::now();
-    jit_->Run();
-    governor_.syncFrame(frameStart);
 
+    // Invocazione emulazione Unicorn
+    uc_err emuErr = uc_emu_start(uc_, pc, 0, 0, 0);
+
+    governor_.syncFrame(frameStart);
+    governor_.isRunning.store(false);
+
+    if (emuErr != UC_ERR_OK) {
+        LOGE("uc_emu_start terminata con codice: %d (%s)", emuErr, uc_strerror(emuErr));
+        return false;
+    }
+
+    LOGI("uc_emu_start completata con successo.");
     return true;
 }
 
-uint32_t DbtEngine::callFunction(uint32_t functionAddress, uint32_t arg0, uint32_t arg1) {
-    if (!jit_) {
-        LOGE("Dynarmic JIT non pronto per callFunction");
-        return 0;
-    }
-
-    LOGI("Dynarmic JIT invoke func 0x%08x (arg0=0x%x, arg1=0x%x)", functionAddress, arg0, arg1);
-
-    auto frameStart = std::chrono::steady_clock::now();
-
-    jit_->Regs()[0] = arg0;
-    jit_->Regs()[1] = arg1;
-    jit_->Regs()[14] = 0xDEADBEEF; // Return address trap
-    jit_->Regs()[15] = functionAddress;
-    jit_->Regs()[13] = guestStackPointer_;
-    jit_->SetCpsr(0x00000010);
-
-    ticksRemaining_ = 5000000;
-    jit_->Run();
-
-    governor_.syncFrame(frameStart);
-
-    uint32_t retVal = jit_->Regs()[0];
-    return retVal;
+void DbtEngine::hookInterruptCallback(uc_engine* /* uc */, uint32_t intno, void* userData) {
+    if (!userData) return;
+    auto* engine = static_cast<DbtEngine*>(userData);
+    engine->onInterrupt(intno);
 }
 
-void* DbtEngine::getHostAddress(uint32_t guestAddr) const {
-    if (guestAddr == 0) return nullptr;
-    if (guestAddr < guestRamSize_) {
-        return reinterpret_cast<void*>(guestRamBase_ + guestAddr);
-    }
-    if (currentLib_ && guestAddr >= currentLib_->base_address) {
-        uint32_t offset = guestAddr - currentLib_->base_address;
-        if (offset < currentLib_->total_memory_size) {
-            return reinterpret_cast<void*>(currentLib_->base_address + offset);
-        }
-    }
-    return reinterpret_cast<void*>(guestRamBase_ + (guestAddr % guestRamSize_));
-}
+void DbtEngine::onInterrupt(uint32_t intno) {
+    if (!uc_) return;
 
-// Memory Callbacks per Dynarmic
-std::uint8_t DbtEngine::MemoryRead8(Dynarmic::A32::VAddr vaddr) {
-    void* host = getHostAddress(vaddr);
-    return host ? *reinterpret_cast<uint8_t*>(host) : 0;
-}
+    // In ARM, intno == 2 corrisponde all'istruzione SVC #0 (Supervisor Call / SWI)
+    uint32_t r7 = 0;
+    uc_reg_read(uc_, UC_ARM_REG_R7, &r7);
 
-std::uint16_t DbtEngine::MemoryRead16(Dynarmic::A32::VAddr vaddr) {
-    void* host = getHostAddress(vaddr);
-    return host ? *reinterpret_cast<uint16_t*>(host) : 0;
-}
+    uint32_t r0 = 0, r1 = 0, r2 = 0, r3 = 0, r4 = 0, r5 = 0;
+    uc_reg_read(uc_, UC_ARM_REG_R0, &r0);
+    uc_reg_read(uc_, UC_ARM_REG_R1, &r1);
+    uc_reg_read(uc_, UC_ARM_REG_R2, &r2);
+    uc_reg_read(uc_, UC_ARM_REG_R3, &r3);
+    uc_reg_read(uc_, UC_ARM_REG_R4, &r4);
+    uc_reg_read(uc_, UC_ARM_REG_R5, &r5);
 
-std::uint32_t DbtEngine::MemoryRead32(Dynarmic::A32::VAddr vaddr) {
-    void* host = getHostAddress(vaddr);
-    return host ? *reinterpret_cast<uint32_t*>(host) : 0;
-}
+    // Inoltro alla classe SyscallDispatcher
+    int32_t ret = SyscallDispatcher::handleSyscall(r7, r0, r1, r2, r3, r4, r5, 0);
 
-std::uint64_t DbtEngine::MemoryRead64(Dynarmic::A32::VAddr vaddr) {
-    void* host = getHostAddress(vaddr);
-    return host ? *reinterpret_cast<uint64_t*>(host) : 0;
-}
-
-void DbtEngine::MemoryWrite8(Dynarmic::A32::VAddr vaddr, std::uint8_t value) {
-    void* host = getHostAddress(vaddr);
-    if (host) *reinterpret_cast<uint8_t*>(host) = value;
-}
-
-void DbtEngine::MemoryWrite16(Dynarmic::A32::VAddr vaddr, std::uint16_t value) {
-    void* host = getHostAddress(vaddr);
-    if (host) *reinterpret_cast<uint16_t*>(host) = value;
-}
-
-void DbtEngine::MemoryWrite32(Dynarmic::A32::VAddr vaddr, std::uint32_t value) {
-    void* host = getHostAddress(vaddr);
-    if (host) *reinterpret_cast<uint32_t*>(host) = value;
-}
-
-void DbtEngine::MemoryWrite64(Dynarmic::A32::VAddr vaddr, std::uint64_t value) {
-    void* host = getHostAddress(vaddr);
-    if (host) *reinterpret_cast<uint64_t*>(host) = value;
-}
-
-void DbtEngine::InterpreterFallback(Dynarmic::A32::VAddr pc, size_t num_instructions) {
-    LOGW("Dynarmic fallback a PC 0x%08x (%zu istruzioni)", pc, num_instructions);
-}
-
-void DbtEngine::CallSVC(std::uint32_t swi) {
-    if (!jit_) return;
-    uint32_t syscallNum = jit_->Regs()[7];
-    int32_t result = SyscallDispatcher::handleSyscall(
-        syscallNum,
-        jit_->Regs()[0],
-        jit_->Regs()[1],
-        jit_->Regs()[2],
-        jit_->Regs()[3],
-        jit_->Regs()[4],
-        jit_->Regs()[5],
-        guestRamBase_
-    );
-    jit_->Regs()[0] = static_cast<uint32_t>(result);
-}
-
-void DbtEngine::ExceptionRaised(Dynarmic::A32::VAddr pc, Dynarmic::A32::Exception exception) {
-    LOGE("Dynarmic Exception at PC 0x%08x: enum %d", pc, static_cast<int>(exception));
-}
-
-void DbtEngine::AddTicks(std::uint64_t ticks) {
-    if (ticksRemaining_ > ticks) {
-        ticksRemaining_ -= ticks;
-    } else {
-        ticksRemaining_ = 0;
-        if (jit_) {
-            jit_->HaltExecution();
-        }
-    }
-}
-
-std::uint64_t DbtEngine::GetTicksRemaining() {
-    return ticksRemaining_;
+    // Scrittura valore di ritorno nel registro r0 (UC_ARM_REG_R0) conforme alle convenzioni AAPCS
+    uint32_t retVal = static_cast<uint32_t>(ret);
+    uc_reg_write(uc_, UC_ARM_REG_R0, &retVal);
 }
 
 } // namespace emux

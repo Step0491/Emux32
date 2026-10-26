@@ -18,12 +18,12 @@ extern "C" {
 
 JNIEXPORT jboolean JNICALL
 Java_com_emux_translator_nativebridge_NativeEngine_nativeInitEngine(
-    JNIEnv* env,
+    JNIEnv* /* env */,
     jobject /* thiz */,
     jlong guestRamMb
 ) {
     std::lock_guard<std::mutex> lock(gEngineMutex);
-    LOGI("Inizializzazione Engine Nativo Dynarmic con %ld MB di RAM...", (long)guestRamMb);
+    LOGI("Inizializzazione Engine Nativo Unicorn DBT con %ld MB di RAM...", (long)guestRamMb);
 
     gEngine = std::make_unique<emux::DbtEngine>();
     size_t ramBytes = static_cast<size_t>(guestRamMb) * 1024 * 1024;
@@ -41,7 +41,7 @@ Java_com_emux_translator_nativebridge_NativeEngine_nativeInitEngine(
 
 JNIEXPORT jboolean JNICALL
 Java_com_emux_translator_nativebridge_NativeEngine_nativeConfigurePerformance(
-    JNIEnv* env,
+    JNIEnv* /* env */,
     jobject /* thiz */,
     jint targetFps,
     jboolean enableFhd,
@@ -85,23 +85,32 @@ Java_com_emux_translator_nativebridge_NativeEngine_nativeLoadElfLibrary(
 }
 
 JNIEXPORT jboolean JNICALL
-Java_com_emux_translator_nativebridge_NativeEngine_nativeExecuteEntryPoint(
-    JNIEnv* env,
+Java_com_emux_translator_nativebridge_NativeEngine_startEmulationNative(
+    JNIEnv* /* env */,
     jobject /* thiz */
 ) {
     std::lock_guard<std::mutex> lock(gEngineMutex);
     if (!gEngine) {
-        LOGE("Engine non inizializzato");
+        LOGE("Engine non inizializzato prima di startEmulationNative");
         return JNI_FALSE;
     }
 
-    bool started = gEngine->executeEntryPoint();
+    LOGI("Invocazione startEmulationNative su Unicorn Engine...");
+    bool started = gEngine->startEmulation();
     return started ? JNI_TRUE : JNI_FALSE;
+}
+
+JNIEXPORT jboolean JNICALL
+Java_com_emux_translator_nativebridge_NativeEngine_nativeExecuteEntryPoint(
+    JNIEnv* env,
+    jobject thiz
+) {
+    return Java_com_emux_translator_nativebridge_NativeEngine_startEmulationNative(env, thiz);
 }
 
 JNIEXPORT void JNICALL
 Java_com_emux_translator_nativebridge_NativeEngine_nativeReleaseEngine(
-    JNIEnv* env,
+    JNIEnv* /* env */,
     jobject /* thiz */
 ) {
     std::lock_guard<std::mutex> lock(gEngineMutex);

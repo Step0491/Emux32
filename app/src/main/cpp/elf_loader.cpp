@@ -19,31 +19,73 @@ namespace emux {
 LoadedLibrary::~LoadedLibrary() {
     if (base_address != 0 && total_memory_size > 0) {
         munmap(reinterpret_cast<void*>(base_address), total_memory_size);
-        LOGI("Rilasciata memoria ELF: base 0x%lx, size %zu byte", (unsigned long)base_address, total_memory_size);
+        LOGI("Rilasciata memoria ELF host: base 0x%lx, size %zu byte", (unsigned long)base_address, total_memory_size);
         base_address = 0;
         total_memory_size = 0;
     }
 }
 
+bool LoadedLibrary::mapToUnicorn(uc_engine* uc) const {
+    if (!uc) {
+        LOGE("mapToUnicorn: Istanza uc_engine nulla!");
+        return false;
+    }
+
+    LOGI("Avvio mapping dei segmenti ELF in Unicorn Engine (Totale segmenti: %zu)...", segments.size());
+
+    for (const auto& seg : segments) {
+        if (seg.type != PT_LOAD || seg.memsz == 0) {
+            continue;
+        }
+
+        // Applicazione rigorosa delle macro di allineamento alla pagina di 0x1000 byte
+        uint64_t alignedBase = PAGE_ALIGN_DOWN(seg.vaddr);
+        uint64_t alignedEnd = PAGE_ALIGN_UP(seg.vaddr + seg.memsz);
+        size_t alignedSize = static_cast<size_t>(alignedEnd - alignedBase);
+
+        LOGI("Mapping PT_LOAD -> Aligned Guest Addr: 0x%08llx, Size: 0x%zx (%zu byte), Perms: 0x%x",
+             (unsigned long long)alignedBase, alignedSize, alignedSize, seg.uc_prot);
+
+        uc_err mapErr = uc_mem_map(uc, alignedBase, alignedSize, seg.uc_prot);
+        if (mapErr != UC_ERR_OK && mapErr != UC_ERR_MAP) {
+            LOGE("uc_mem_map fallita per segmento a 0x%llx: %s (codice: %d)",
+                 (unsigned long long)alignedBase, uc_strerror(mapErr), mapErr);
+            return false;
+        }
+
+        // Scrittura dei byte del segmento dall'immagine binaria
+        if (seg.filesz > 0 && !raw_binary.empty()) {
+            if (seg.offset + seg.filesz <= raw_binary.size()) {
+                uc_err writeErr = uc_mem_write(uc, seg.vaddr, raw_binary.data() + seg.offset, seg.filesz);
+                if (writeErr != UC_ERR_OK) {
+                    LOGE("uc_mem_write fallita per segmento a 0x%x: %s", seg.vaddr, uc_strerror(writeErr));
+                    return false;
+                }
+            } else {
+                LOGE("Offset segmento (0x%x + 0x%x) supera la dimensione del binario (%zu)",
+                     seg.offset, seg.filesz, raw_binary.size());
+                return false;
+            }
+        }
+
+        // Inizializzazione a zero della sezione BSS (.bss: memsz > filesz)
+        if (seg.memsz > seg.filesz) {
+            size_t bssSize = seg.memsz - seg.filesz;
+            uint32_t bssVaddr = seg.vaddr + seg.filesz;
+            std::vector<uint8_t> zeroes(bssSize, 0);
+            uc_mem_write(uc, bssVaddr, zeroes.data(), bssSize);
+        }
+    }
+
+    LOGI("Tutti i segmenti ELF sono stati mappati con successo in Unicorn Engine con allineamento 0x1000.");
+    return true;
+}
+
 Elf32Loader::Elf32Loader() {
-    pageSize_ = getSystemPageSize();
-    LOGI("Elf32Loader inizializzato. Page size di sistema: %zu byte", pageSize_);
+    LOGI("Elf32Loader inizializzato con PAGE_SIZE=0x%x (%d byte)", PAGE_SIZE, PAGE_SIZE);
 }
 
 Elf32Loader::~Elf32Loader() = default;
-
-size_t Elf32Loader::getSystemPageSize() const {
-    long sz = sysconf(_SC_PAGESIZE);
-    return (sz > 0) ? static_cast<size_t>(sz) : 4096;
-}
-
-uintptr_t Elf32Loader::alignDown(uintptr_t addr, size_t pageSize) const {
-    return addr & ~(static_cast<uintptr_t>(pageSize) - 1);
-}
-
-uintptr_t Elf32Loader::alignUp(uintptr_t addr, size_t pageSize) const {
-    return (addr + pageSize - 1) & ~(static_cast<uintptr_t>(pageSize) - 1);
-}
 
 bool Elf32Loader::validateHeader(const Elf32_Ehdr& header) const {
     if (header.e_ident[EI_MAG0] != ELFMAG0 ||
@@ -87,6 +129,15 @@ int Elf32Loader::convertElfFlagsToMmapProt(uint32_t p_flags) const {
     if (p_flags & PF_R) prot |= PROT_READ;
     if (p_flags & PF_W) prot |= PROT_WRITE;
     if (p_flags & PF_X) prot |= PROT_EXEC;
+    return prot;
+}
+
+uint32_t Elf32Loader::convertElfFlagsToUcProt(uint32_t p_flags) const {
+    uint32_t prot = UC_PROT_NONE;
+    if (p_flags & PF_R) prot |= UC_PROT_READ;
+    if (p_flags & PF_W) prot |= UC_PROT_WRITE;
+    if (p_flags & PF_X) prot |= UC_PROT_EXEC;
+    if (prot == UC_PROT_NONE) prot = UC_PROT_READ | UC_PROT_WRITE;
     return prot;
 }
 
@@ -173,6 +224,7 @@ std::shared_ptr<LoadedLibrary> Elf32Loader::loadFromMemory(
             seg.memsz = ph.p_memsz;
             seg.align = ph.p_align;
             seg.prot = convertElfFlagsToMmapProt(ph.p_flags);
+            seg.uc_prot = convertElfFlagsToUcProt(ph.p_flags);
             loadSegments.push_back(seg);
         }
     }
@@ -182,89 +234,25 @@ std::shared_ptr<LoadedLibrary> Elf32Loader::loadFromMemory(
         return nullptr;
     }
 
-    uintptr_t alignedMinVaddr = alignDown(minVaddr, pageSize_);
-    uintptr_t alignedMaxVaddr = alignUp(maxVaddr, pageSize_);
+    // Calcolo allineamento memoria conforme a PAGE_ALIGN_DOWN / PAGE_ALIGN_UP (0x1000)
+    uintptr_t alignedMinVaddr = PAGE_ALIGN_DOWN(minVaddr);
+    uintptr_t alignedMaxVaddr = PAGE_ALIGN_UP(maxVaddr);
     size_t totalMemorySize = alignedMaxVaddr - alignedMinVaddr;
 
     LOGI("ELF Analysis [%s]: minVaddr=0x%x, maxVaddr=0x%x, totalSize=%zu (0x%zx)",
          name.c_str(), minVaddr, maxVaddr, totalMemorySize, totalMemorySize);
 
-    void* reservedAddress = mmap(
-        nullptr,
-        totalMemorySize,
-        PROT_NONE,
-        MAP_PRIVATE | MAP_ANONYMOUS,
-        -1,
-        0
-    );
-
-    if (reservedAddress == MAP_FAILED) {
-        LOGE("Fallita mmap della regione contigua: %s", strerror(errno));
-        return nullptr;
-    }
-
     auto loadedLib = std::make_shared<LoadedLibrary>();
     loadedLib->path = name;
-    loadedLib->base_address = reinterpret_cast<uintptr_t>(reservedAddress);
     loadedLib->total_memory_size = totalMemorySize;
     loadedLib->is_pie = (ehdr->e_type == ET_DYN);
-    loadedLib->load_bias = loadedLib->is_pie
-        ? static_cast<uint32_t>(loadedLib->base_address - alignedMinVaddr)
-        : 0;
-    loadedLib->entry_point = ehdr->e_entry + (loadedLib->is_pie ? loadedLib->load_bias : 0);
+    loadedLib->load_bias = 0;
+    loadedLib->entry_point = ehdr->e_entry;
     loadedLib->segments = loadSegments;
+    loadedLib->raw_binary.assign(buffer, buffer + bufferSize);
 
-    LOGI("Base Address allocato: 0x%lx (Load Bias: 0x%x, Entry: 0x%x)",
-         (unsigned long)loadedLib->base_address, loadedLib->load_bias, loadedLib->entry_point);
-
-    for (const auto& seg : loadSegments) {
-        uintptr_t segTargetAddr = loadedLib->base_address + (seg.vaddr - alignedMinVaddr);
-        uintptr_t pageStart = alignDown(segTargetAddr, pageSize_);
-        uintptr_t pageEnd = alignUp(segTargetAddr + seg.memsz, pageSize_);
-        size_t pageLen = pageEnd - pageStart;
-
-        if (mprotect(reinterpret_cast<void*>(pageStart), pageLen, PROT_READ | PROT_WRITE) != 0) {
-            LOGE("mprotect RW fallita per segmento a 0x%lx: %s", (unsigned long)pageStart, strerror(errno));
-            return nullptr;
-        }
-
-        if (seg.filesz > 0) {
-            if (seg.offset + seg.filesz > bufferSize) {
-                LOGE("Offset segmento fuori dai limiti del buffer file!");
-                return nullptr;
-            }
-            std::memcpy(
-                reinterpret_cast<void*>(segTargetAddr),
-                buffer + seg.offset,
-                seg.filesz
-            );
-        }
-
-        if (seg.memsz > seg.filesz) {
-            size_t bssSize = seg.memsz - seg.filesz;
-            std::memset(
-                reinterpret_cast<void*>(segTargetAddr + seg.filesz),
-                0,
-                bssSize
-            );
-        }
-
-        int finalProt = seg.prot;
-        if (finalProt & PROT_EXEC) {
-            finalProt &= ~PROT_WRITE;
-        }
-
-        if (mprotect(reinterpret_cast<void*>(pageStart), pageLen, finalProt) != 0) {
-            LOGE("mprotect finale fallita per segmento [prot=0x%x] a 0x%lx: %s",
-                 finalProt, (unsigned long)pageStart, strerror(errno));
-            return nullptr;
-        }
-
-        LOGI("Segmento PT_LOAD caricato: vaddr=0x%x, memsz=%u, prot=0x%x (W^X enforced)",
-             seg.vaddr, seg.memsz, finalProt);
-    }
-
-    LOGI("Caricamento ELF 32-bit completato con successo per: %s", name.c_str());
+    LOGI("Caricamento ELF completato: %s (Entry Point: 0x%08x, Segmenti: %zu)",
+         name.c_str(), loadedLib->entry_point, loadSegments.size());
     return loadedLib;
 }
 
