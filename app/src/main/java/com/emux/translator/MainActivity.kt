@@ -189,7 +189,7 @@ class MainActivity : ComponentActivity() {
         val resolvedDir: File = if (path.contains("primary:")) {
             val relative = path.substringAfter("primary:")
             val target = File(Environment.getExternalStorageDirectory(), relative)
-            if (target.name.equals("Emux", ignoreCase = true)) target else File(target, "Emux")
+            if (target.name.equals("Emux32", ignoreCase = true)) target else File(target, "Emux32")
         } else {
             getDefaultEmuxDirectory()
         }
@@ -199,7 +199,7 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun getDefaultEmuxDirectory(): File {
-        return File(Environment.getExternalStorageDirectory(), "Emux")
+        return File(Environment.getExternalStorageDirectory(), "Emux32")
     }
 
     private fun resolveEmuxDirectory(): File {
@@ -308,12 +308,12 @@ fun SetupStorageDialog(
         titleContentColor = Color.White,
         textContentColor = Color.LightGray,
         title = {
-            Text("Configurazione Cartella Emux", fontWeight = FontWeight.Bold)
+            Text("Configurazione Cartella Emux32", fontWeight = FontWeight.Bold)
         },
         text = {
             Column {
                 Text(
-                    text = "Vuoi configurare la cartella Emux e le sottocartelle (apk e obb) nel percorso predefinito:\n",
+                    text = "Vuoi configurare la cartella Emux32 e le sottocartelle (apk e obb) nel percorso predefinito:\n",
                     fontSize = 14.sp
                 )
                 Surface(

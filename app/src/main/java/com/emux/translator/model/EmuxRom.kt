@@ -23,7 +23,7 @@ data class EmuxRom(
 )
 
 /**
- * Scansiona la cartella Emux/apk ed Emux/obb.
+ * Scansiona la cartella Emux32/apk ed Emux32/obb.
  * Controlla se le cartelle esistono e crea SOLO ciò che manca senza cancellare o sovrascrivere nulla.
  */
 fun scanEmuxStorage(context: Context, apkDir: File, obbDir: File): List<EmuxRom> {
@@ -51,7 +51,7 @@ fun scanEmuxStorage(context: Context, apkDir: File, obbDir: File): List<EmuxRom>
 
         val (pkgName, rawIconFile, orientation) = extractApkMetadata(context, apkFile)
 
-        // Cerca eventuale OBB associato in Emux/obb/ o Emux/obb/<packageName>/
+        // Cerca eventuale OBB associato in Emux32/obb/ o Emux32/obb/<packageName>/
         var matchedObbFile: File? = null
         if (obbDir.exists()) {
             if (pkgName != null) {

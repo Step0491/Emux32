@@ -16,14 +16,15 @@ Applicazione Android nativa a 64-bit (ARM64-v8a) che funge da **Frontend + Dynam
 All'avvio e installazione, Emux32 crea e monitora automaticamente la seguente cartella nella memoria principale del dispositivo:
 
 ```text
-/sdcard/Emux/
+/sdcard/Emux32/
    ├── apk/   <-- Inserisci qui i file .apk a 32 bit (ed eventuali cover .jpg/.png con lo stesso nome)
    └── obb/   <-- Inserisci qui i file di espansione .obb (o cartelle package con .obb)
 ```
 
 - **Lista immediata**: L'app si apre direttamente mostrando la griglia di giochi (2 per riga in verticale).
-- **Icone quadrate**: Copertina quadrata (1:1) estratta automaticamente dall'APK o dal file immagine omonimo.
+- **Icone quadrate con Upscale 4x**: Copertina quadrata (1:1) ad alta definizione elaborata da algoritmo adattivo offline.
 - **Lancio diretto al tocco**: Nessun selettore a scorrimento, nessun menu superiore, basta toccare l'icona del gioco per avviarlo.
+- **Orientamento dinamico adattivo**: Riconosce automaticamente se il titolo è nativo Portrait o Landscape.
 
 ---
 
@@ -33,7 +34,7 @@ All'avvio e installazione, Emux32 crea e monitora automaticamente la seguente ca
                   ┌──────────────────────────────────────────────┐
                   │       FRONTEND (Kotlin + Compose)            │
                   │  - Griglia touch 2 colonne con icone quadrate │
-                  │  - Cartelle automatiche Emux/apk ed Emux/obb │
+                  │  - Cartelle automatiche Emux32/apk e obb     │
                   │  - Continuous Auto-Release Pipeline (CI/CD)  │
                   └──────────────────────┬───────────────────────┘
                                          │ JNI Bridge
