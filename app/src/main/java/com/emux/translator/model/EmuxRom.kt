@@ -16,7 +16,7 @@ data class EmuxRom(
     val title: String,
     val coverUri: Uri?,
     val apkFile: File,
-    val obbFile: File? = null,
+    val obbFiles: List<File> = emptyList(), // Supporta sia singolo file che più OBB (main + patch) o cartella
     val packageName: String? = null,
     val hasObb: Boolean = false,
     val preferredOrientation: Int = ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
@@ -24,7 +24,7 @@ data class EmuxRom(
 
 /**
  * Scansiona la cartella Emux32/apk ed Emux32/obb.
- * Controlla se le cartelle esistono e crea SOLO ciò che manca senza cancellare o sovrascrivere nulla.
+ * Riconosce automaticamente sia file .obb sciolti che cartelle package estratte (es. com.turner.cardwars).
  */
 fun scanEmuxStorage(context: Context, apkDir: File, obbDir: File): List<EmuxRom> {
     val gamesList = mutableListOf<EmuxRom>()
@@ -51,24 +51,41 @@ fun scanEmuxStorage(context: Context, apkDir: File, obbDir: File): List<EmuxRom>
 
         val (pkgName, rawIconFile, orientation) = extractApkMetadata(context, apkFile)
 
-        // Cerca eventuale OBB associato in Emux32/obb/ o Emux32/obb/<packageName>/
-        var matchedObbFile: File? = null
+        // Cerca i file OBB associati:
+        // Caso A: Cartella estratta con il package name (es. Emux32/obb/com.turner.cardwars/main.xxx.obb)
+        // Caso B: Cartella estratta con nome simile (es. Emux32/obb/BloodAndGlory/)
+        // Caso C: File .obb diretto (es. Emux32/obb/main.xxx.com.turner.cardwars.obb)
+        val matchedObbList = mutableListOf<File>()
+
         if (obbDir.exists()) {
-            if (pkgName != null) {
-                val pkgFolder = File(obbDir, pkgName)
-                if (pkgFolder.isDirectory) {
-                    val obbInside = pkgFolder.listFiles { f -> f.isFile && f.name.endsWith(".obb") }
-                    if (!obbInside.isNullOrEmpty()) {
-                        matchedObbFile = obbInside.first()
+            val allEntries = obbDir.listFiles() ?: emptyArray()
+
+            // 1. Cerca dentro cartelle
+            for (entry in allEntries) {
+                if (entry.isDirectory) {
+                    val folderName = entry.name.lowercase()
+                    val matchPackage = (pkgName != null && folderName.contains(pkgName.lowercase()))
+                    val matchBase = folderName.contains(baseName.lowercase()) || baseName.lowercase().contains(folderName)
+
+                    if (matchPackage || matchBase) {
+                        val obbs = entry.listFiles { f -> f.isFile && f.name.endsWith(".obb") }
+                        if (!obbs.isNullOrEmpty()) {
+                            matchedObbList.addAll(obbs)
+                        }
                     }
                 }
             }
-            if (matchedObbFile == null) {
-                val directObb = obbDir.listFiles { f ->
-                    f.isFile && f.name.endsWith(".obb") && (f.name.contains(baseName, ignoreCase = true) || (pkgName != null && f.name.contains(pkgName, ignoreCase = true)))
+
+            // 2. Se non ancora trovato, cerca file .obb sciolti direttamente nella root di obb/
+            if (matchedObbList.isEmpty()) {
+                val directObbs = obbDir.listFiles { f ->
+                    f.isFile && f.name.endsWith(".obb") && (
+                        (pkgName != null && f.name.lowercase().contains(pkgName.lowercase())) ||
+                        f.name.lowercase().contains(baseName.lowercase())
+                    )
                 }
-                if (!directObb.isNullOrEmpty()) {
-                    matchedObbFile = directObb.first()
+                if (!directObbs.isNullOrEmpty()) {
+                    matchedObbList.addAll(directObbs)
                 }
             }
         }
@@ -93,7 +110,7 @@ fun scanEmuxStorage(context: Context, apkDir: File, obbDir: File): List<EmuxRom>
             sourceCoverFile = rawIconFile
         }
 
-        // Esegue l'upscaling rapido 4x offline e salva il risultato permanente
+        // Upscale rapido 4x offline e cache
         val finalCoverUri: Uri? = if (sourceCoverFile != null && sourceCoverFile.exists()) {
             val upscaledTarget = File(upscaledCoversDir, "${baseName}_upscaled.png")
             val readyCover = ImageUpscaler.getOrUpscaleImage(sourceCoverFile, upscaledTarget, 512)
@@ -107,9 +124,9 @@ fun scanEmuxStorage(context: Context, apkDir: File, obbDir: File): List<EmuxRom>
                 title = title,
                 coverUri = finalCoverUri,
                 apkFile = apkFile,
-                obbFile = matchedObbFile,
+                obbFiles = matchedObbList,
                 packageName = pkgName,
-                hasObb = (matchedObbFile != null),
+                hasObb = matchedObbList.isNotEmpty(),
                 preferredOrientation = orientation
             )
         )
