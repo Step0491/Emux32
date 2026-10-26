@@ -23,7 +23,7 @@ Java_com_emux_translator_nativebridge_NativeEngine_nativeInitEngine(
     jlong guestRamMb
 ) {
     std::lock_guard<std::mutex> lock(gEngineMutex);
-    LOGI("Inizializzazione Engine Nativo con %ld MB di RAM...", (long)guestRamMb);
+    LOGI("Inizializzazione Engine Nativo Dynarmic con %ld MB di RAM...", (long)guestRamMb);
 
     gEngine = std::make_unique<emux::DbtEngine>();
     size_t ramBytes = static_cast<size_t>(guestRamMb) * 1024 * 1024;
@@ -47,9 +47,15 @@ Java_com_emux_translator_nativebridge_NativeEngine_nativeConfigurePerformance(
     jboolean enableFhd,
     jboolean throttleGuard
 ) {
-    LOGI("Configurazione Performance: Target FPS=%d, FHD=%d, ThrottleGuard=%d",
-         targetFps, enableFhd, throttleGuard);
-    // Configura i timing frame limiter e bilanciamento carichi cpu/gpu
+    std::lock_guard<std::mutex> lock(gEngineMutex);
+    if (!gEngine) {
+        return JNI_FALSE;
+    }
+    gEngine->configurePerformance(
+        static_cast<uint32_t>(targetFps),
+        enableFhd == JNI_TRUE,
+        throttleGuard == JNI_TRUE
+    );
     return JNI_TRUE;
 }
 
