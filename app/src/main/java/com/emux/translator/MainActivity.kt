@@ -11,6 +11,7 @@ import android.os.Build
 import android.os.Bundle
 import android.os.Environment
 import android.provider.Settings
+import android.util.Log
 import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
@@ -40,6 +41,8 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.File
+import java.io.FileInputStream
+import java.io.FileOutputStream
 
 class MainActivity : ComponentActivity() {
 
@@ -256,11 +259,48 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    /**
+     * Collega i dati OBB nel sandbox Android target (/sdcard/Android/obb/<packageName>/)
+     * e avvia la libreria guest ARM32 nel Dynarmic JIT
+     */
     private fun launchGame(rom: EmuxRom) {
         try {
             val apkFile = rom.apkFile
             if (!apkFile.exists()) return
 
+            val pkg = rom.packageName
+            val obbFile = rom.obbFile
+
+            // 1. LINKING AUTOMATICO OBB:
+            // I giochi Android cercano i loro OBB in /sdcard/Android/obb/<packageName>/
+            if (pkg != null && obbFile != null && obbFile.exists()) {
+                try {
+                    val systemAndroidObbDir = File(Environment.getExternalStorageDirectory(), "Android/obb/$pkg")
+                    if (!systemAndroidObbDir.exists()) {
+                        systemAndroidObbDir.mkdirs()
+                    }
+                    val targetObb = File(systemAndroidObbDir, obbFile.name)
+                    // Se non esiste già nella cartella di sistema del gioco, crea link simbolico o copia leggera
+                    if (!targetObb.exists()) {
+                        try {
+                            android.system.Os.symlink(obbFile.absolutePath, targetObb.absolutePath)
+                            Log.i("Emux32", "Symlink OBB creato con successo: ${targetObb.absolutePath}")
+                        } catch (e: Exception) {
+                            // Se il filesystem non supporta symlink, copia il file
+                            FileInputStream(obbFile).use { input ->
+                                FileOutputStream(targetObb).use { output ->
+                                    input.copyTo(output)
+                                }
+                            }
+                            Log.i("Emux32", "OBB collegato via replica: ${targetObb.absolutePath}")
+                        }
+                    }
+                } catch (e: Exception) {
+                    Log.w("Emux32", "Attenzione durante il linking OBB: ${e.message}")
+                }
+            }
+
+            // 2. ESTRAZIONE Esecuzione .so ARM32 nel motore Dynarmic JIT
             val zip = java.util.zip.ZipFile(apkFile)
             val entries = zip.entries()
             var extractedSo: File? = null
