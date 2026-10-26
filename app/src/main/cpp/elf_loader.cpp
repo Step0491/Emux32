@@ -1,4 +1,5 @@
 #include "elf_loader.h"
+#include "linker_hook.h"
 
 #include <android/log.h>
 #include <sys/mman.h>
@@ -87,6 +88,92 @@ bool LoadedLibrary::mapToUnicorn(uc_engine* uc) const {
     }
 
     LOGI("Tutti i segmenti ELF sono stati mappati e scritti con successo in Unicorn Engine.");
+    return true;
+}
+
+bool LoadedLibrary::applyRelocations(uc_engine* uc) const {
+    if (!uc || raw_binary.size() < sizeof(Elf32_Ehdr)) {
+        return false;
+    }
+
+    const auto* ehdr = reinterpret_cast<const Elf32_Ehdr*>(raw_binary.data());
+    if (ehdr->e_shoff == 0 || ehdr->e_shnum == 0) {
+        LOGI("applyRelocations: Nessuna tabella sezioni presente, rilocazioni statiche");
+        return true;
+    }
+
+    size_t shTableEnd = ehdr->e_shoff + (ehdr->e_shnum * sizeof(Elf32_Shdr));
+    if (shTableEnd > raw_binary.size() || ehdr->e_shstrndx >= ehdr->e_shnum) {
+        return false;
+    }
+
+    const auto* shdrs = reinterpret_cast<const Elf32_Shdr*>(raw_binary.data() + ehdr->e_shoff);
+
+    // Tabella delle stringhe dinamiche (.dynstr)
+    const Elf32_Shdr* dynstrShdr = nullptr;
+    for (uint16_t s = 0; s < ehdr->e_shnum; ++s) {
+        if (shdrs[s].sh_type == SHT_STRTAB && s != ehdr->e_shstrndx) {
+            dynstrShdr = &shdrs[s];
+            break;
+        }
+    }
+
+    const char* dynstr = dynstrShdr ? reinterpret_cast<const char*>(raw_binary.data() + dynstrShdr->sh_offset) : nullptr;
+    size_t dynstrSize = dynstrShdr ? dynstrShdr->sh_size : 0;
+
+    size_t totalRelocsApplied = 0;
+
+    for (uint16_t s = 0; s < ehdr->e_shnum; ++s) {
+        const auto& sh = shdrs[s];
+        if (sh.sh_type == SHT_REL) {
+            if (sh.sh_offset + sh.sh_size > raw_binary.size() || sh.sh_entsize < sizeof(Elf32_Rel)) {
+                continue;
+            }
+
+            const auto* rels = reinterpret_cast<const Elf32_Rel*>(raw_binary.data() + sh.sh_offset);
+            size_t numRels = sh.sh_size / sizeof(Elf32_Rel);
+
+            const Elf32_Sym* symtab = nullptr;
+            size_t numSyms = 0;
+            if (sh.sh_link < ehdr->e_shnum) {
+                const auto& symSh = shdrs[sh.sh_link];
+                if (symSh.sh_offset + symSh.sh_size <= raw_binary.size() && symSh.sh_entsize >= sizeof(Elf32_Sym)) {
+                    symtab = reinterpret_cast<const Elf32_Sym*>(raw_binary.data() + symSh.sh_offset);
+                    numSyms = symSh.sh_size / sizeof(Elf32_Sym);
+                }
+            }
+
+            for (size_t r = 0; r < numRels; ++r) {
+                const auto& rel = rels[r];
+                uint32_t type = ELF32_R_TYPE(rel.r_info);
+                uint32_t symIdx = ELF32_R_SYM(rel.r_info);
+                uint64_t targetAddr = load_bias + rel.r_offset;
+
+                if (type == 23) { // R_ARM_RELATIVE
+                    uint32_t addend = 0;
+                    uc_mem_read(uc, targetAddr, &addend, sizeof(addend));
+                    uint32_t relocated = load_bias + addend;
+                    uc_mem_write(uc, targetAddr, &relocated, sizeof(relocated));
+                    totalRelocsApplied++;
+                } else if (type == 21 || type == 22 || type == 2) { // R_ARM_GLOB_DAT, R_ARM_JUMP_SLOT, R_ARM_ABS32
+                    if (symtab && symIdx < numSyms && dynstr) {
+                        const auto& sym = symtab[symIdx];
+                        if (sym.st_name < dynstrSize) {
+                            const char* symName = dynstr + sym.st_name;
+                            if (symName && symName[0] != '\0') {
+                                uint32_t tramp = GuestRuntimeEnvironment::getInstance().registerSymbolTrampoline(symName, uc);
+                                uc_mem_write(uc, targetAddr, &tramp, sizeof(tramp));
+                                totalRelocsApplied++;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    LOGI("Rilocazioni dinamiche applicate con successo per [%s]: %zu simboli rilocati.",
+         path.c_str(), totalRelocsApplied);
     return true;
 }
 

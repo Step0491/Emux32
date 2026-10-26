@@ -2,6 +2,7 @@
 #include "linker_hook.h"
 
 #include <android/log.h>
+#include <android/native_window.h>
 #include <cstring>
 #include <chrono>
 
@@ -27,12 +28,30 @@ DbtEngine::~DbtEngine() {
         uc_close(uc_);
         uc_ = nullptr;
     }
+    if (nativeWindow_) {
+        ANativeWindow_release(nativeWindow_);
+        nativeWindow_ = nullptr;
+    }
 }
 
 void DbtEngine::configurePerformance(uint32_t targetFps, bool enableFhd, bool throttleGuard) {
     governor_.configure(targetFps, throttleGuard);
     LOGI("DbtEngine Performance Governor: Target %u FPS, FHD: %s, Throttle Guard: %s",
          targetFps, enableFhd ? "ON" : "OFF", throttleGuard ? "ON" : "OFF");
+}
+
+void DbtEngine::setNativeSurface(ANativeWindow* window) {
+    if (nativeWindow_) {
+        ANativeWindow_release(nativeWindow_);
+    }
+    nativeWindow_ = window;
+    if (nativeWindow_) {
+        ANativeWindow_acquire(nativeWindow_);
+        ANativeWindow_setBuffersGeometry(nativeWindow_, 1920, 1080, WINDOW_FORMAT_RGBA_8888);
+        LOGI("ANativeWindow collegata con successo all'engine DBT (Full HD 1080p).");
+    } else {
+        LOGI("ANativeWindow scollegata dall'engine DBT.");
+    }
 }
 
 bool DbtEngine::initialize(size_t /* guestRamSize */) {
@@ -44,9 +63,10 @@ bool DbtEngine::initialize(size_t /* guestRamSize */) {
         return false;
     }
 
-    // REGISTRAZIONE HOOK INTERRUPT/SYSCALL:
-    // I binari compilati con la libc Bionic invocheranno syscall tramite SVC #0.
-    // Registriamo un hook UC_HOOK_INTR prima dell'avvio per intercettare l'interrupt ed evitare SIGSEGV/SIGABRT.
+    // Inizializza l'ambiente JNI a 32-bit (JavaVM32 e JNIEnv32) e la regione dei Trampoline
+    GuestRuntimeEnvironment::getInstance().initialize(uc_);
+
+    // Registra hook UC_HOOK_INTR per intercettare sia syscall (SVC #0) sia chiamate a funzioni host (Trampoline)
     err = uc_hook_add(
         uc_,
         &intrHook_,
@@ -105,14 +125,20 @@ bool DbtEngine::loadLibrary(const std::string& libraryPath) {
         return false;
     }
 
-    // Mappatura automatica di tutti i segmenti PT_LOAD in Unicorn Engine con strict page alignment
+    // 1. Mappatura automatica di tutti i segmenti PT_LOAD in Unicorn Engine con strict page alignment
     bool mapped = currentLib_->mapToUnicorn(uc_);
     if (!mapped) {
         LOGE("Mappatura dei segmenti ELF in memoria Unicorn fallita!");
         return false;
     }
 
-    LOGI("Libreria ELF caricata e mappata con successo: %s (Entry Point: 0x%08x)",
+    // 2. Risoluzione e applicazione delle rilocazioni dinamiche (R_ARM_RELATIVE, R_ARM_GLOB_DAT, R_ARM_JUMP_SLOT)
+    bool relocated = currentLib_->applyRelocations(uc_);
+    if (!relocated) {
+        LOGW("Attenzione durante l'applicazione delle rilocazioni dinamiche");
+    }
+
+    LOGI("Libreria ELF caricata e rilocata con successo: %s (Entry Point: 0x%08x)",
          libraryPath.c_str(), currentLib_->entry_point);
     return true;
 }
@@ -123,24 +149,26 @@ bool DbtEngine::startEmulation() {
         return false;
     }
 
-    if (currentLib_->entry_point == 0) {
-        LOGW("Libreria ELF dinamica (.so) senza Entry Point statico, pronta per JNI_OnLoad");
-        return true;
-    }
-
     // 1. SETUP DELLO STACK GUEST
     setupGuestStack();
 
-    // 2. SETUP DEI REGISTRI CPU
+    // 2. SETUP DEI REGISTRI CPU E PARAMETRI JNI_OnLoad
     uint32_t pc = currentLib_->entry_point;
-    uint32_t lr = 0xDEADBEEF; // Return address trap per fermare l'emulazione al return dell'entry point
+    uint32_t lr = 0xDEADBEEF; // Return address trap
     uint32_t cpsr = 0x00000010; // ARM User Mode (32-bit)
 
+    // Argomento 0 (r0): Puntatore a JavaVM guest
+    uint32_t javaVMPtr = GuestRuntimeEnvironment::getInstance().getJavaVMPointer();
+    // Argomento 1 (r1): Riservato (NULL)
+    uint32_t reserved = 0;
+
+    uc_reg_write(uc_, UC_ARM_REG_R0, &javaVMPtr);
+    uc_reg_write(uc_, UC_ARM_REG_R1, &reserved);
     uc_reg_write(uc_, UC_ARM_REG_PC, &pc);
     uc_reg_write(uc_, UC_ARM_REG_LR, &lr);
     uc_reg_write(uc_, UC_ARM_REG_CPSR, &cpsr);
 
-    LOGI("Avvio uc_emu_start: PC=0x%08x, SP=0x%08x, LR=0x%08x...", pc, guestStackPointer_, lr);
+    LOGI("Avvio uc_emu_start: PC=0x%08x, SP=0x%08x, JavaVM=0x%08x...", pc, guestStackPointer_, javaVMPtr);
 
     governor_.isRunning.store(true);
     auto frameStart = std::chrono::steady_clock::now();
@@ -169,7 +197,14 @@ void DbtEngine::hookInterruptCallback(uc_engine* /* uc */, uint32_t intno, void*
 void DbtEngine::onInterrupt(uint32_t intno) {
     if (!uc_) return;
 
-    // In ARM, intno == 2 corrisponde all'istruzione SVC #0 (Supervisor Call / SWI)
+    // Se l'interrupt include il flag 0x80000000, si tratta di una chiamata a un Trampoline registrato
+    if (intno & 0x80000000U) {
+        uint32_t svcComment = intno & 0x00FFFFFFU;
+        GuestRuntimeEnvironment::getInstance().handleTrampolineCall(svcComment, uc_);
+        return;
+    }
+
+    // Altrimenti è una Supervisor Call standard Linux/Bionic (SVC #0)
     uint32_t r7 = 0;
     uc_reg_read(uc_, UC_ARM_REG_R7, &r7);
 
@@ -182,7 +217,7 @@ void DbtEngine::onInterrupt(uint32_t intno) {
     uc_reg_read(uc_, UC_ARM_REG_R5, &r5);
 
     // Inoltro alla classe SyscallDispatcher
-    int32_t ret = SyscallDispatcher::handleSyscall(r7, r0, r1, r2, r3, r4, r5, 0);
+    int32_t ret = SyscallDispatcher::handleSyscall(r7, r0, r1, r2, r3, r4, r5, uc_);
 
     // Scrittura valore di ritorno nel registro r0 (UC_ARM_REG_R0) conforme alle convenzioni AAPCS
     uint32_t retVal = static_cast<uint32_t>(ret);

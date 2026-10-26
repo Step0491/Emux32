@@ -4,16 +4,17 @@
 #include <unordered_map>
 #include <string>
 #include <vector>
+#include <memory>
 #include <jni.h>
+#include "unicorn/unicorn.h"
 
 namespace emux {
 
-// Rappresentazione a 32-bit dei tipi opachi JNI per il guest ARM32
 using jint32_t = int32_t;
 using jlong32_t = int64_t;
 using jptr32_t = uint32_t;
 
-// Tabella di mapping per Handle 32-bit <-> Puntatori Host 64-bit (jobject, jclass, jstring, jmethodID)
+// Tabella di mapping per Handle 32-bit <-> Puntatori Host 64-bit
 class JniHandleTable {
 public:
     static JniHandleTable& getInstance();
@@ -30,6 +31,22 @@ private:
     jptr32_t nextHandle_{0x1000};
     std::unordered_map<jptr32_t, jobject> objectMap_;
     std::unordered_map<jptr32_t, jmethodID> methodMap_;
+};
+
+// Simulazione dell'interfaccia JavaVM a 32-bit
+struct JNIInvokeInterface32 {
+    jptr32_t reserved0;
+    jptr32_t reserved1;
+    jptr32_t reserved2;
+    jptr32_t DestroyJavaVM;
+    jptr32_t AttachCurrentThread;
+    jptr32_t DetachCurrentThread;
+    jptr32_t GetEnv;
+    jptr32_t AttachCurrentThreadAsDaemon;
+};
+
+struct JavaVM32 {
+    jptr32_t functions;
 };
 
 // Simulazione della vtable JNINativeInterface conforme all'ABI a 32-bit
@@ -105,7 +122,7 @@ struct JNINativeInterface32 {
 };
 
 struct JNIEnv32 {
-    jptr32_t functions; // Punta a una istanza allocata di JNINativeInterface32
+    jptr32_t functions;
 };
 
 // Dispatcher Syscall Linux ARM32 -> Host Android 64-bit
@@ -119,7 +136,7 @@ public:
         uint32_t r3,
         uint32_t r4,
         uint32_t r5,
-        uintptr_t guestMemoryBase
+        uc_engine* uc
     );
 };
 
@@ -127,6 +144,32 @@ public:
 class SymbolResolver {
 public:
     static void* resolveHostSymbol(const char* symbolName);
+};
+
+// Gestore Runtime JNI e Trampoline Bridge per Unicorn Engine
+class GuestRuntimeEnvironment {
+public:
+    static GuestRuntimeEnvironment& getInstance();
+
+    bool initialize(uc_engine* uc);
+    uint32_t getJavaVMPointer() const { return guestJavaVMAddr_; }
+    uint32_t getJNIEnvPointer() const { return guestJNIEnvAddr_; }
+
+    uint32_t registerSymbolTrampoline(const std::string& symbolName, uc_engine* uc);
+    void handleTrampolineCall(uint32_t trampolineId, uc_engine* uc);
+
+private:
+    GuestRuntimeEnvironment();
+
+    uint32_t guestJniBase_{0x7D000000};
+    uint32_t guestJavaVMAddr_{0x7D000000};
+    uint32_t guestJNIEnvAddr_{0x7D000200};
+
+    uint32_t guestTrampolineBase_{0x70000000};
+    uint32_t nextTrampolineId_{1};
+
+    std::unordered_map<std::string, uint32_t> symbolToTrampolineMap_;
+    std::unordered_map<uint32_t, std::string> trampolineToSymbolMap_;
 };
 
 } // namespace emux

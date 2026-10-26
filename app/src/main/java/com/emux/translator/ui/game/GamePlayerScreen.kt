@@ -61,13 +61,15 @@ fun GamePlayerScreen(
                     holder.setFixedSize(1920, 1080)
                     holder.addCallback(object : SurfaceHolder.Callback {
                         override fun surfaceCreated(holder: SurfaceHolder) {
-                            // EGL Surface Window collegata
+                            NativeEngine.nativeSetSurface(holder.surface)
                         }
 
                         override fun surfaceChanged(holder: SurfaceHolder, format: Int, width: Int, height: Int) {
+                            NativeEngine.nativeSetSurface(holder.surface)
                         }
 
                         override fun surfaceDestroyed(holder: SurfaceHolder) {
+                            NativeEngine.nativeSetSurface(null)
                         }
                     })
                 }

@@ -46,6 +46,9 @@ struct LoadedLibrary {
 
     // Mappa tutti i segmenti PT_LOAD all'interno dell'istanza Unicorn applicando strict page alignment
     bool mapToUnicorn(uc_engine* uc) const;
+
+    // Applica le rilocazioni ELF (R_ARM_RELATIVE, R_ARM_GLOB_DAT, R_ARM_JUMP_SLOT)
+    bool applyRelocations(uc_engine* uc) const;
 };
 
 class Elf32Loader {

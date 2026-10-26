@@ -430,8 +430,9 @@ uc_err uc_emu_start(uc_engine *uc, uint64_t begin, uint64_t until, uint64_t time
 
             for (const auto& h : intrHooks) {
                 auto cb = reinterpret_cast<uc_cb_hookintr_t>(h.callback);
-                // In Unicorn ARM, intno per SVC/SWI è 2 (EXCP_SWI)
-                cb(uc, 2, h.user_data);
+                // In Unicorn ARM, intno per SVC/SWI è 2 (EXCP_SWI) oppure flag 0x80000000 + svcComment
+                uint32_t intnoToSend = (svcComment != 0) ? (0x80000000U | svcComment) : 2U;
+                cb(uc, intnoToSend, h.user_data);
             }
 
             inst->regs[15] += 4;

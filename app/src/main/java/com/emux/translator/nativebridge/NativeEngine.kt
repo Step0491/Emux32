@@ -19,5 +19,6 @@ object NativeEngine {
     external fun nativeLoadElfLibrary(libraryPath: String): Boolean
     external fun startEmulationNative(): Boolean
     external fun nativeExecuteEntryPoint(): Boolean
+    external fun nativeSetSurface(surface: Any?)
     external fun nativeReleaseEngine()
 }

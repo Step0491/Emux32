@@ -3,6 +3,7 @@
 
 #include <jni.h>
 #include <android/log.h>
+#include <android/native_window_jni.h>
 #include <string>
 #include <memory>
 #include <mutex>
@@ -106,6 +107,23 @@ Java_com_emux_translator_nativebridge_NativeEngine_nativeExecuteEntryPoint(
     jobject thiz
 ) {
     return Java_com_emux_translator_nativebridge_NativeEngine_startEmulationNative(env, thiz);
+}
+
+JNIEXPORT void JNICALL
+Java_com_emux_translator_nativebridge_NativeEngine_nativeSetSurface(
+    JNIEnv* env,
+    jobject /* thiz */,
+    jobject surface
+) {
+    std::lock_guard<std::mutex> lock(gEngineMutex);
+    if (!gEngine) return;
+
+    if (surface) {
+        ANativeWindow* window = ANativeWindow_fromSurface(env, surface);
+        gEngine->setNativeSurface(window);
+    } else {
+        gEngine->setNativeSurface(nullptr);
+    }
 }
 
 JNIEXPORT void JNICALL

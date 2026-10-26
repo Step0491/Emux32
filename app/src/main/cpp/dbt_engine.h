@@ -10,6 +10,8 @@
 #include <atomic>
 #include <chrono>
 
+struct ANativeWindow;
+
 namespace emux {
 
 struct PerformanceGovernor {
@@ -50,6 +52,7 @@ public:
     bool executeEntryPoint() { return startEmulation(); }
 
     void onInterrupt(uint32_t intno);
+    void setNativeSurface(ANativeWindow* window);
 
     PerformanceGovernor& getGovernor() { return governor_; }
     uc_engine* getUnicorn() const { return uc_; }
@@ -63,6 +66,7 @@ private:
     std::shared_ptr<LoadedLibrary> currentLib_{nullptr};
     Elf32Loader loader_;
     PerformanceGovernor governor_;
+    ANativeWindow* nativeWindow_{nullptr};
 
     uint32_t guestStackBase_{0x7E000000};
     uint32_t guestStackSize_{2 * 1024 * 1024}; // 2MB Stack dedicato al processo ospite

@@ -90,6 +90,8 @@ void testElfHeaderValidation() {
     assert(err == UC_ERR_OK);
     bool mapped = libArm->mapToUnicorn(uc);
     assert(mapped == true);
+    bool relocated = libArm->applyRelocations(uc);
+    assert(relocated == true);
     uc_close(uc);
 
     std::cout << "  ✓ Caricamento e allineamento memoria ELF ARM32 verificato con successo in Unicorn!" << std::endl;
