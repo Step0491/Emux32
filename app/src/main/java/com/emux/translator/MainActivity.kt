@@ -412,11 +412,19 @@ class MainActivity : ComponentActivity() {
 
             // Selezione della libreria principale del gioco:
             // 1) Blood & Glory e titoli Glu Mobile usano 'libg.so'
-            // 2) Titoli Unreal/Unity usano libgame.so, libmain.so, libunity.so
+            // 2) Titoli Unity/Unreal Engine: 'libunity.so' contiene il motore primario di gioco e rendering.
+            //    libmain.so è solo il bridge JNI (spesso di pochi KB); preferiamo sempre il core pesante.
             var mainSo: File? = extractedSos.firstOrNull { file ->
                 val name = file.name.lowercase()
-                name == "libg.so" || name == "libgame.so" || name == "libmain.so" || name == "libunity.so" ||
+                name == "libg.so" || name == "libunity.so" || name == "libgame.so" ||
                 name.contains("blood") || name.contains("glory")
+            }
+
+            if (mainSo == null) {
+                mainSo = extractedSos.firstOrNull { file ->
+                    val name = file.name.lowercase()
+                    name == "libmain.so"
+                }
             }
 
             if (mainSo == null) {

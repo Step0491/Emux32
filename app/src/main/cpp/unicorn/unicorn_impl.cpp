@@ -506,6 +506,12 @@ uc_err uc_emu_start(uc_engine *uc, uint64_t begin, uint64_t until, uint64_t time
             if ((insn & 0x0FFFFFF0) == 0x012FFF10) { // BX Rm
                 uint32_t rm = insn & 0xF;
                 uint32_t target = inst->regs[rm];
+                if (target == 0xDEADBEEF || target == 0) {
+                    LOGI("uc_emu_start [ARM]: Raggiunto return/trap address 0x%08x (Return Value in r0: 0x%08x)",
+                         target, inst->regs[0]);
+                    instructionsExecuted++;
+                    break;
+                }
                 if (target & 1) {
                     inst->cpsr |= FLAG_T;
                     inst->regs[15] = target & ~1U;
@@ -514,7 +520,6 @@ uc_err uc_emu_start(uc_engine *uc, uint64_t begin, uint64_t until, uint64_t time
                     inst->regs[15] = target & ~3U;
                 }
                 instructionsExecuted++;
-                if (target == 0xDEADBEEF || target == 0) break;
                 continue;
             }
 
@@ -729,6 +734,12 @@ uc_err uc_emu_start(uc_engine *uc, uint64_t begin, uint64_t until, uint64_t time
 
                 if (hasPc) {
                     uint32_t newPc = inst->regs[15];
+                    if (newPc == 0xDEADBEEF || newPc == 0) {
+                        LOGI("uc_emu_start [Thumb]: Raggiunto return/trap address 0x%08x (Return Value in r0: 0x%08x)",
+                             newPc, inst->regs[0]);
+                        instructionsExecuted++;
+                        break;
+                    }
                     if (newPc & 1) {
                         inst->cpsr |= FLAG_T;
                         inst->regs[15] = newPc & ~1U;
@@ -737,7 +748,6 @@ uc_err uc_emu_start(uc_engine *uc, uint64_t begin, uint64_t until, uint64_t time
                         inst->regs[15] = newPc & ~3U;
                     }
                     instructionsExecuted++;
-                    if (newPc == 0xDEADBEEF || newPc == 0) break;
                     continue;
                 }
 
@@ -750,6 +760,12 @@ uc_err uc_emu_start(uc_engine *uc, uint64_t begin, uint64_t until, uint64_t time
             if ((tInsn & 0xFF87) == 0x4700) { // BX Rm
                 uint32_t rm = (tInsn >> 3) & 0xF;
                 uint32_t target = inst->regs[rm];
+                if (target == 0xDEADBEEF || target == 0) {
+                    LOGI("uc_emu_start [Thumb BX]: Raggiunto return/trap address 0x%08x (Return Value in r0: 0x%08x)",
+                         target, inst->regs[0]);
+                    instructionsExecuted++;
+                    break;
+                }
                 if (target & 1) {
                     inst->cpsr |= FLAG_T;
                     inst->regs[15] = target & ~1U;
@@ -758,7 +774,6 @@ uc_err uc_emu_start(uc_engine *uc, uint64_t begin, uint64_t until, uint64_t time
                     inst->regs[15] = target & ~3U;
                 }
                 instructionsExecuted++;
-                if (target == 0xDEADBEEF || target == 0) break;
                 continue;
             }
 

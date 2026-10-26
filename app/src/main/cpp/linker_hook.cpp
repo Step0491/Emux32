@@ -674,9 +674,29 @@ void GuestRuntimeEnvironment::handleTrampolineCall(uint32_t trampolineId, uc_eng
     }
 
     if (trampolineId == 0x3006) { // RegisterNatives(env, class, methods, nMethods)
+        uint32_t methodsAddr = 0;
+        uint32_t nMethods = 0;
+        uc_reg_read(uc, UC_ARM_REG_R2, &methodsAddr);
+        uc_reg_read(uc, UC_ARM_REG_R3, &nMethods);
+        LOGI("JNI: RegisterNatives invocato per %u metodi nativi (methodsAddr=0x%08x)", nMethods, methodsAddr);
+
+        // Struttura JNINativeMethod su ARM32: const char* name (4B), const char* signature (4B), void* fnPtr (4B)
+        for (uint32_t i = 0; i < nMethods && i < 32; ++i) {
+            uint32_t entryAddr = methodsAddr + (i * 12);
+            uint32_t namePtr = 0, sigPtr = 0, fnPtr = 0;
+            uc_mem_read(uc, entryAddr, &namePtr, 4);
+            uc_mem_read(uc, entryAddr + 4, &sigPtr, 4);
+            uc_mem_read(uc, entryAddr + 8, &fnPtr, 4);
+
+            char mName[128] = {0};
+            char mSig[128] = {0};
+            if (namePtr) uc_mem_read(uc, namePtr, mName, sizeof(mName) - 1);
+            if (sigPtr) uc_mem_read(uc, sigPtr, mSig, sizeof(mSig) - 1);
+            LOGI("   -> Registrato JNINativeMethod[%u]: '%s' (%s) -> Entry Point: 0x%08x", i, mName, mSig, fnPtr);
+        }
+
         uint32_t ret = 0; // JNI_OK
         uc_reg_write(uc, UC_ARM_REG_R0, &ret);
-        LOGI("JNI: Metodi nativi registrati con successo (RegisterNatives).");
         return;
     }
 
