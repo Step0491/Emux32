@@ -208,7 +208,17 @@ uc_err uc_mem_map(uc_engine *uc, uint64_t address, size_t size, uint32_t perms) 
     auto* inst = reinterpret_cast<UnicornInstance*>(uc);
     std::lock_guard<std::mutex> lock(inst->mem_mutex);
 
-    // Verifica sovrapposizioni
+    // Se l'intervallo richiesto è già interamente compreso in una regione esistente, aggiorna i permessi e ritorna UC_ERR_OK
+    for (auto& r : inst->regions) {
+        if (address >= r.address && (address + size) <= (r.address + r.size)) {
+            r.perms |= perms;
+            LOGI("uc_mem_map: Range 0x%llx (size 0x%zx) già coperto da regione a 0x%llx (size 0x%zx)",
+                 (unsigned long long)address, size, (unsigned long long)r.address, r.size);
+            return UC_ERR_OK;
+        }
+    }
+
+    // Verifica sovrapposizioni parziali
     for (const auto& r : inst->regions) {
         if (!(address + size <= r.address || address >= r.address + r.size)) {
             LOGW("uc_mem_map: Regione 0x%llx (size 0x%zx) si sovrappone con 0x%llx (size 0x%zx)",

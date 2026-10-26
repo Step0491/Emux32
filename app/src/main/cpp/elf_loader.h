@@ -32,12 +32,14 @@ struct ElfSegment {
 
 struct LoadedLibrary {
     std::string path;
-    uintptr_t base_address{0};    // Indirizzo base virtuale nell'host
-    size_t total_memory_size{0};  // Dimensione totale contigua allocata
-    uint32_t entry_point{0};      // Entry point ARM32
-    uint32_t load_bias{0};        // Offset rilocazione base
+    uintptr_t base_address{0};
+    size_t total_memory_size{0};
+    uint32_t aligned_min_vaddr{0};
+    uint32_t aligned_max_vaddr{0};
+    uint32_t entry_point{0};
+    uint32_t load_bias{0};
     std::vector<ElfSegment> segments;
-    std::vector<uint8_t> raw_binary; // Buffer binario per mapping JIT / Unicorn
+    std::vector<uint8_t> raw_binary;
     bool is_pie{false};
 
     ~LoadedLibrary();
@@ -58,6 +60,7 @@ private:
     bool validateHeader(const Elf32_Ehdr& header) const;
     int convertElfFlagsToMmapProt(uint32_t p_flags) const;
     uint32_t convertElfFlagsToUcProt(uint32_t p_flags) const;
+    uint32_t findJniOnLoadSymbol(const uint8_t* buffer, size_t bufferSize, const Elf32_Ehdr& ehdr) const;
 };
 
 } // namespace emux

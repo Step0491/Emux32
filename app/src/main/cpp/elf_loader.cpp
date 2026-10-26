@@ -31,34 +31,43 @@ bool LoadedLibrary::mapToUnicorn(uc_engine* uc) const {
         return false;
     }
 
-    LOGI("Avvio mapping dei segmenti ELF in Unicorn Engine (Totale segmenti: %zu)...", segments.size());
+    if (total_memory_size == 0) {
+        LOGE("mapToUnicorn: Dimensione memoria totale ELF pari a 0!");
+        return false;
+    }
 
+    // Calcolo della regione contigua complessiva con allineamento rigoroso alla pagina di 0x1000 byte
+    uint64_t fullLibraryBase = load_bias + aligned_min_vaddr;
+    uint64_t fullLibrarySize = PAGE_ALIGN_UP(total_memory_size);
+
+    LOGI("Mappatura contigua Unicorn ELF [%s]: Base=0x%08llx, Size=0x%llx (%zu byte)",
+         path.c_str(), (unsigned long long)fullLibraryBase, (unsigned long long)fullLibrarySize, (size_t)fullLibrarySize);
+
+    // Mappatura primaria dell'intero spazio virtuale della libreria in Unicorn
+    uc_err mapErr = uc_mem_map(uc, fullLibraryBase, static_cast<size_t>(fullLibrarySize), UC_PROT_ALL);
+    if (mapErr != UC_ERR_OK && mapErr != UC_ERR_MAP) {
+        LOGE("uc_mem_map fallita per l'intera libreria a 0x%llx: %s (codice: %d)",
+             (unsigned long long)fullLibraryBase, uc_strerror(mapErr), mapErr);
+        return false;
+    }
+
+    // Scrittura dei singoli segmenti PT_LOAD all'interno dello spazio virtuale garantito
     for (const auto& seg : segments) {
         if (seg.type != PT_LOAD || seg.memsz == 0) {
             continue;
         }
 
-        // Applicazione rigorosa delle macro di allineamento alla pagina di 0x1000 byte
-        uint64_t alignedBase = PAGE_ALIGN_DOWN(seg.vaddr);
-        uint64_t alignedEnd = PAGE_ALIGN_UP(seg.vaddr + seg.memsz);
-        size_t alignedSize = static_cast<size_t>(alignedEnd - alignedBase);
+        uint64_t targetAddr = load_bias + seg.vaddr;
 
-        LOGI("Mapping PT_LOAD -> Aligned Guest Addr: 0x%08llx, Size: 0x%zx (%zu byte), Perms: 0x%x",
-             (unsigned long long)alignedBase, alignedSize, alignedSize, seg.uc_prot);
+        LOGI("Scrittura segmento PT_LOAD: Target=0x%08llx, FileSz=%u, MemSz=%u",
+             (unsigned long long)targetAddr, seg.filesz, seg.memsz);
 
-        uc_err mapErr = uc_mem_map(uc, alignedBase, alignedSize, seg.uc_prot);
-        if (mapErr != UC_ERR_OK && mapErr != UC_ERR_MAP) {
-            LOGE("uc_mem_map fallita per segmento a 0x%llx: %s (codice: %d)",
-                 (unsigned long long)alignedBase, uc_strerror(mapErr), mapErr);
-            return false;
-        }
-
-        // Scrittura dei byte del segmento dall'immagine binaria
         if (seg.filesz > 0 && !raw_binary.empty()) {
             if (seg.offset + seg.filesz <= raw_binary.size()) {
-                uc_err writeErr = uc_mem_write(uc, seg.vaddr, raw_binary.data() + seg.offset, seg.filesz);
+                uc_err writeErr = uc_mem_write(uc, targetAddr, raw_binary.data() + seg.offset, seg.filesz);
                 if (writeErr != UC_ERR_OK) {
-                    LOGE("uc_mem_write fallita per segmento a 0x%x: %s", seg.vaddr, uc_strerror(writeErr));
+                    LOGE("uc_mem_write fallita per segmento a 0x%llx: %s",
+                         (unsigned long long)targetAddr, uc_strerror(writeErr));
                     return false;
                 }
             } else {
@@ -71,13 +80,13 @@ bool LoadedLibrary::mapToUnicorn(uc_engine* uc) const {
         // Inizializzazione a zero della sezione BSS (.bss: memsz > filesz)
         if (seg.memsz > seg.filesz) {
             size_t bssSize = seg.memsz - seg.filesz;
-            uint32_t bssVaddr = seg.vaddr + seg.filesz;
+            uint64_t bssVaddr = targetAddr + seg.filesz;
             std::vector<uint8_t> zeroes(bssSize, 0);
             uc_mem_write(uc, bssVaddr, zeroes.data(), bssSize);
         }
     }
 
-    LOGI("Tutti i segmenti ELF sono stati mappati con successo in Unicorn Engine con allineamento 0x1000.");
+    LOGI("Tutti i segmenti ELF sono stati mappati e scritti con successo in Unicorn Engine.");
     return true;
 }
 
@@ -103,11 +112,6 @@ bool Elf32Loader::validateHeader(const Elf32_Ehdr& header) const {
 
     if (header.e_ident[EI_DATA] != ELFDATA2LSB) {
         LOGE("Endianness non supportata (trovato EI_DATA=%d)", header.e_ident[EI_DATA]);
-        return false;
-    }
-
-    if (header.e_ident[EI_VERSION] != EV_CURRENT) {
-        LOGE("Versione ELF non valida (trovato EI_VERSION=%d)", header.e_ident[EI_VERSION]);
         return false;
     }
 
@@ -141,10 +145,67 @@ uint32_t Elf32Loader::convertElfFlagsToUcProt(uint32_t p_flags) const {
     return prot;
 }
 
+uint32_t Elf32Loader::findJniOnLoadSymbol(const uint8_t* buffer, size_t bufferSize, const Elf32_Ehdr& ehdr) const {
+    if (!buffer || bufferSize == 0 || ehdr.e_shoff == 0 || ehdr.e_shnum == 0) {
+        return 0;
+    }
+
+    size_t shTableEnd = ehdr.e_shoff + (ehdr.e_shnum * sizeof(Elf32_Shdr));
+    if (shTableEnd > bufferSize || ehdr.e_shstrndx >= ehdr.e_shnum) {
+        return 0;
+    }
+
+    const auto* shdrs = reinterpret_cast<const Elf32_Shdr*>(buffer + ehdr.e_shoff);
+    const auto& strSection = shdrs[ehdr.e_shstrndx];
+    if (strSection.sh_offset + strSection.sh_size > bufferSize) {
+        return 0;
+    }
+
+    const char* shstrtab = reinterpret_cast<const char*>(buffer + strSection.sh_offset);
+
+    const Elf32_Shdr* dynsymShdr = nullptr;
+    const Elf32_Shdr* dynstrShdr = nullptr;
+
+    for (uint16_t s = 0; s < ehdr.e_shnum; ++s) {
+        const auto& sh = shdrs[s];
+        if (sh.sh_name < strSection.sh_size) {
+            const char* name = shstrtab + sh.sh_name;
+            if (sh.sh_type == SHT_DYNSYM || std::strcmp(name, ".dynsym") == 0) {
+                dynsymShdr = &sh;
+            } else if (sh.sh_type == SHT_STRTAB && std::strcmp(name, ".dynstr") == 0) {
+                dynstrShdr = &sh;
+            }
+        }
+    }
+
+    if (dynsymShdr && dynstrShdr) {
+        if (dynsymShdr->sh_offset + dynsymShdr->sh_size <= bufferSize &&
+            dynstrShdr->sh_offset + dynstrShdr->sh_size <= bufferSize &&
+            dynsymShdr->sh_entsize >= sizeof(Elf32_Sym)) {
+
+            const auto* syms = reinterpret_cast<const Elf32_Sym*>(buffer + dynsymShdr->sh_offset);
+            size_t numSyms = dynsymShdr->sh_size / sizeof(Elf32_Sym);
+            const char* strings = reinterpret_cast<const char*>(buffer + dynstrShdr->sh_offset);
+
+            for (size_t i = 0; i < numSyms; ++i) {
+                if (syms[i].st_name < dynstrShdr->sh_size) {
+                    const char* symName = strings + syms[i].st_name;
+                    if (std::strcmp(symName, "JNI_OnLoad") == 0) {
+                        LOGI("Simbolo 'JNI_OnLoad' individuato nella tabella simboli a offset: 0x%08x", syms[i].st_value);
+                        return syms[i].st_value;
+                    }
+                }
+            }
+        }
+    }
+
+    return 0;
+}
+
 std::shared_ptr<LoadedLibrary> Elf32Loader::loadFromFile(const std::string& filePath) {
     int fd = open(filePath.c_str(), O_RDONLY | O_CLOEXEC);
     if (fd < 0) {
-        LOGE("Impossibile aprire il file binario: %s", filePath.c_str());
+        LOGE("Impossibile aprire il file binario: %s (errno=%d: %s)", filePath.c_str(), errno, strerror(errno));
         return nullptr;
     }
 
@@ -166,6 +227,7 @@ std::shared_ptr<LoadedLibrary> Elf32Loader::loadFromFile(const std::string& file
         return nullptr;
     }
 
+    LOGI("File binario letto da disco: %s (%zu byte)", filePath.c_str(), buffer.size());
     return loadFromMemory(buffer.data(), buffer.size(), filePath);
 }
 
@@ -244,15 +306,31 @@ std::shared_ptr<LoadedLibrary> Elf32Loader::loadFromMemory(
 
     auto loadedLib = std::make_shared<LoadedLibrary>();
     loadedLib->path = name;
+    loadedLib->aligned_min_vaddr = static_cast<uint32_t>(alignedMinVaddr);
+    loadedLib->aligned_max_vaddr = static_cast<uint32_t>(alignedMaxVaddr);
     loadedLib->total_memory_size = totalMemorySize;
     loadedLib->is_pie = (ehdr->e_type == ET_DYN);
-    loadedLib->load_bias = 0;
-    loadedLib->entry_point = ehdr->e_entry;
+
+    // Per librerie condivise (.so) viene impostato un load bias sicuro (0x40000000 = 1GB)
+    loadedLib->load_bias = loadedLib->is_pie ? 0x40000000U : 0U;
+
+    // Determinazione del punto di ingresso: e_entry, oppure ricerca del simbolo JNI_OnLoad
+    if (ehdr->e_entry != 0) {
+        loadedLib->entry_point = loadedLib->load_bias + ehdr->e_entry;
+    } else {
+        uint32_t jniOnLoad = findJniOnLoadSymbol(buffer, bufferSize, *ehdr);
+        if (jniOnLoad != 0) {
+            loadedLib->entry_point = loadedLib->load_bias + jniOnLoad;
+        } else {
+            loadedLib->entry_point = loadedLib->load_bias + loadSegments[0].vaddr;
+        }
+    }
+
     loadedLib->segments = loadSegments;
     loadedLib->raw_binary.assign(buffer, buffer + bufferSize);
 
-    LOGI("Caricamento ELF completato: %s (Entry Point: 0x%08x, Segmenti: %zu)",
-         name.c_str(), loadedLib->entry_point, loadSegments.size());
+    LOGI("Caricamento ELF completato: %s (Entry Point: 0x%08x, Load Bias: 0x%08x, Segmenti: %zu)",
+         name.c_str(), loadedLib->entry_point, loadedLib->load_bias, loadSegments.size());
     return loadedLib;
 }
 

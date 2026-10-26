@@ -307,38 +307,70 @@ class MainActivity : ComponentActivity() {
             // 2. ESTRAZIONE Esecuzione .so ARM32 nel motore Unicorn DBT
             val zip = java.util.zip.ZipFile(apkFile)
             val entries = zip.entries()
-            var extractedSo: File? = null
+            val extractedSos = mutableListOf<File>()
 
             while (entries.hasMoreElements()) {
                 val entry = entries.nextElement()
-                if (entry.name.startsWith("lib/armeabi-v7a/") && entry.name.endsWith(".so")) {
+                val isArm32 = (entry.name.startsWith("lib/armeabi-v7a/") || entry.name.startsWith("lib/armeabi/")) && entry.name.endsWith(".so")
+                if (isArm32) {
                     val outFile = File(cacheDir, File(entry.name).name)
+                    if (outFile.exists()) {
+                        outFile.delete()
+                    }
                     zip.getInputStream(entry).use { inStream ->
                         outFile.outputStream().use { outStream -> inStream.copyTo(outStream) }
                     }
-                    extractedSo = outFile
-                    break
+                    if (outFile.length() > 0) {
+                        extractedSos.add(outFile)
+                        Log.i("Emux32", "Estratta libreria nativa ARM32: ${outFile.name} (${outFile.length()} byte)")
+                    }
                 }
             }
             zip.close()
 
-            if (extractedSo != null && extractedSo.exists()) {
-                Log.i("Emux32", "Caricamento libreria nativa ELF: ${extractedSo.absolutePath}")
-                val loaded = NativeEngine.nativeLoadElfLibrary(extractedSo.absolutePath)
-                if (loaded) {
-                    Log.i("Emux32", "Avvio asincrono startEmulationNative su Dispatchers.IO...")
-                    val success = NativeEngine.startEmulationNative()
-                    if (!success) {
-                        Log.w("Emux32", "startEmulationNative ha completato l'esecuzione.")
-                    }
-                } else {
-                    withContext(Dispatchers.Main) {
-                        Toast.makeText(this@MainActivity, "Caricamento ELF fallito per ${extractedSo.name}", Toast.LENGTH_SHORT).show()
-                    }
+            if (extractedSos.isEmpty()) {
+                withContext(Dispatchers.Main) {
+                    Toast.makeText(this@MainActivity, "Nessuna libreria ARM32 (armeabi-v7a/armeabi) trovata nell'APK", Toast.LENGTH_LONG).show()
+                }
+                return@withContext
+            }
+
+            // Selezione intelligente della libreria principale del gioco:
+            // 1) Blood & Glory e titoli Glu Mobile usano 'libg.so'
+            // 2) Altri giochi utilizzano libgame.so, libmain.so, libunity.so
+            // 3) Scarta librerie di supporto generiche (libgnustl_shared, libc++_shared)
+            var mainSo: File? = extractedSos.firstOrNull { file ->
+                val name = file.name.lowercase()
+                name == "libg.so" || name == "libgame.so" || name == "libmain.so" || name == "libunity.so" ||
+                name.contains("blood") || name.contains("glory")
+            }
+
+            if (mainSo == null) {
+                mainSo = extractedSos.firstOrNull { file ->
+                    val name = file.name.lowercase()
+                    !name.contains("stl") && !name.contains("shared") && !name.contains("c++")
+                }
+            }
+
+            if (mainSo == null) {
+                mainSo = extractedSos.first()
+            }
+
+            Log.i("Emux32", "Libreria principale identificata per il caricamento: ${mainSo.name} (${mainSo.length()} byte)")
+
+            // Garantisce l'inizializzazione del motore anche dopo rotazione o recreate dell'activity
+            NativeEngine.nativeInitEngine(512)
+
+            val loaded = NativeEngine.nativeLoadElfLibrary(mainSo.absolutePath)
+            if (loaded) {
+                Log.i("Emux32", "Caricamento ELF riuscito per ${mainSo.name}. Avvio asincrono startEmulationNative su Dispatchers.IO...")
+                val success = NativeEngine.startEmulationNative()
+                if (!success) {
+                    Log.w("Emux32", "startEmulationNative completato o fermato.")
                 }
             } else {
                 withContext(Dispatchers.Main) {
-                    Toast.makeText(this@MainActivity, "Nessuna libreria ARM32 (armeabi-v7a) trovata nell'APK", Toast.LENGTH_LONG).show()
+                    Toast.makeText(this@MainActivity, "Caricamento ELF fallito per ${mainSo.name}", Toast.LENGTH_SHORT).show()
                 }
             }
         } catch (e: Throwable) {
