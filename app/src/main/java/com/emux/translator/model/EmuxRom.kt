@@ -1,147 +1,127 @@
 package com.emux.translator.model
 
 import android.content.Context
-import android.content.pm.PackageManager
 import android.graphics.Bitmap
 import android.graphics.Canvas
 import android.graphics.drawable.BitmapDrawable
 import android.graphics.drawable.Drawable
 import android.net.Uri
-import androidx.documentfile.provider.DocumentFile
 import java.io.File
 import java.io.FileOutputStream
-
-enum class XmbCategory(val title: String, val iconResName: String) {
-    SETTINGS("Impostazioni", "ic_settings"),
-    GAMES("Giochi", "ic_games"),
-    FAVORITES("Preferiti", "ic_star"),
-    SYSTEM("Sistema", "ic_info")
-}
 
 data class EmuxRom(
     val title: String,
     val coverUri: Uri?,
-    val apkUri: Uri?,
-    val obbDirUri: Uri?,
+    val apkFile: File,
+    val obbFile: File? = null,
     val packageName: String? = null,
-    val category: XmbCategory = XmbCategory.GAMES,
-    val isArm32: Boolean = true,
     val hasObb: Boolean = false
 )
 
-fun parseEmuxGames(context: Context, rootGamesDir: DocumentFile): List<EmuxRom> {
+/**
+ * Scansiona la cartella Emux/apk ed Emux/obb nella memoria esterna principale.
+ */
+fun scanEmuxStorage(context: Context, apkDir: File, obbDir: File): List<EmuxRom> {
     val gamesList = mutableListOf<EmuxRom>()
-    val files = rootGamesDir.listFiles()
 
-    // 1. MODELLO FLAT: File APK posizionati direttamente nella cartella root
-    for (file in files) {
-        val fileName = file.name?.lowercase() ?: ""
-        if (file.isFile && fileName.endsWith(".apk")) {
-            val defaultTitle = file.name?.substringBeforeLast(".")?.replace("_", " ") ?: "Sconosciuto"
-            val (pkgName, extractedIconUri) = extractApkMetadata(context, file)
-
-            gamesList.add(
-                EmuxRom(
-                    title = defaultTitle,
-                    coverUri = extractedIconUri,
-                    apkUri = file.uri,
-                    obbDirUri = null,
-                    packageName = pkgName,
-                    category = XmbCategory.GAMES,
-                    isArm32 = true,
-                    hasObb = false
-                )
-            )
-        }
+    if (!apkDir.exists()) {
+        apkDir.mkdirs()
+    }
+    if (!obbDir.exists()) {
+        obbDir.mkdirs()
     }
 
-    // 2. MODELLO SOTTOCARTELLE: Cartelle dedicate con APK + OBB + Cover personalizzata
-    for (folder in files) {
-        if (folder.isDirectory) {
-            val folderTitle = folder.name?.replace("_", " ") ?: "Sconosciuto"
-            var coverUri: Uri? = null
-            var apkDocFile: DocumentFile? = null
-            var obbUri: Uri? = null
+    val apkFiles = apkDir.listFiles { file ->
+        file.isFile && file.name.lowercase().endsWith(".apk")
+    } ?: emptyArray()
 
-            for (subFile in folder.listFiles()) {
-                val subName = subFile.name?.lowercase() ?: ""
-                if (subName.endsWith(".apk")) {
-                    apkDocFile = subFile
-                } else if (subName == "cover.jpg" || subName == "cover.png" || subName == "folder.jpg") {
-                    // Priorità massima alla locandina 3:4 personalizzata
-                    coverUri = subFile.uri
-                } else if (subName.endsWith(".obb") || (subFile.isDirectory && subName.contains("obb"))) {
-                    obbUri = subFile.uri
+    for (apkFile in apkFiles) {
+        val baseName = apkFile.nameWithoutExtension
+        val title = baseName.replace("_", " ")
+
+        val (pkgName, extractedIconUri) = extractApkMetadata(context, apkFile)
+
+        // Cerca eventuale OBB associato in Emux/obb/ o Emux/obb/<packageName>/
+        var matchedObbFile: File? = null
+        if (obbDir.exists()) {
+            // Controlla se c'è un file obb con nome simile o dentro una sottocartella col nome pacchetto
+            if (pkgName != null) {
+                val pkgFolder = File(obbDir, pkgName)
+                if (pkgFolder.isDirectory) {
+                    val obbInside = pkgFolder.listFiles { f -> f.isFile && f.name.endsWith(".obb") }
+                    if (!obbInside.isNullOrEmpty()) {
+                        matchedObbFile = obbInside.first()
+                    }
                 }
             }
-
-            if (apkDocFile != null) {
-                var pkgName: String? = null
-
-                // Se non c'è cover.jpg esterna, estrae automaticamente l'icona interna dell'APK
-                if (coverUri == null) {
-                    val (extractedPkg, extractedIcon) = extractApkMetadata(context, apkDocFile)
-                    pkgName = extractedPkg
-                    coverUri = extractedIcon
+            if (matchedObbFile == null) {
+                val directObb = obbDir.listFiles { f ->
+                    f.isFile && f.name.endsWith(".obb") && (f.name.contains(baseName, ignoreCase = true) || (pkgName != null && f.name.contains(pkgName, ignoreCase = true)))
                 }
-
-                gamesList.add(
-                    EmuxRom(
-                        title = folderTitle,
-                        coverUri = coverUri,
-                        apkUri = apkDocFile.uri,
-                        obbDirUri = obbUri ?: folder.uri,
-                        packageName = pkgName,
-                        category = XmbCategory.GAMES,
-                        isArm32 = true,
-                        hasObb = (obbUri != null)
-                    )
-                )
+                if (!directObb.isNullOrEmpty()) {
+                    matchedObbFile = directObb.first()
+                }
             }
         }
+
+        // Cerca copertina custom accanto all'apk (es: nome.jpg, nome.png o cover.jpg)
+        var coverUri = extractedIconUri
+        val possibleCovers = listOf(
+            File(apkDir, "$baseName.jpg"),
+            File(apkDir, "$baseName.png"),
+            File(apkDir, "$baseName.jpeg")
+        )
+        for (cand in possibleCovers) {
+            if (cand.exists() && cand.length() > 0) {
+                coverUri = Uri.fromFile(cand)
+                break
+            }
+        }
+
+        gamesList.add(
+            EmuxRom(
+                title = title,
+                coverUri = coverUri,
+                apkFile = apkFile,
+                obbFile = matchedObbFile,
+                packageName = pkgName,
+                hasObb = (matchedObbFile != null)
+            )
+        )
     }
 
     return gamesList
 }
 
 /**
- * Estrae l'icona e i metadati dell'APK memorizzandoli nella cache interna per Coil
+ * Estrae l'icona e il package name dall'APK memorizzandoli nella cache interna
  */
-private fun extractApkMetadata(context: Context, apkDocFile: DocumentFile): Pair<String?, Uri?> {
+private fun extractApkMetadata(context: Context, apkFile: File): Pair<String?, Uri?> {
     try {
         val iconsDir = File(context.cacheDir, "extracted_icons")
         if (!iconsDir.exists()) iconsDir.mkdirs()
 
-        val safeName = (apkDocFile.name ?: "temp").replace("[^a-zA-Z0-9]".toRegex(), "_")
+        val safeName = apkFile.name.replace("[^a-zA-Z0-9]".toRegex(), "_")
         val iconFile = File(iconsDir, "$safeName.png")
 
+        val pm = context.packageManager
+        val pkgInfo = pm.getPackageArchiveInfo(apkFile.absolutePath, 0)
+        val packageName = pkgInfo?.packageName
+
         if (iconFile.exists() && iconFile.length() > 0) {
-            return Pair(null, Uri.fromFile(iconFile))
+            return Pair(packageName, Uri.fromFile(iconFile))
         }
 
-        // Copia temporanea leggera dell'APK per interrogare PackageManager
-        val tempApk = File(context.cacheDir, "meta_${System.currentTimeMillis()}.apk")
-        context.contentResolver.openInputStream(apkDocFile.uri)?.use { inStream ->
-            tempApk.outputStream().use { outStream -> inStream.copyTo(outStream) }
-        }
+        if (pkgInfo != null) {
+            pkgInfo.applicationInfo.sourceDir = apkFile.absolutePath
+            pkgInfo.applicationInfo.publicSourceDir = apkFile.absolutePath
+            val drawable = pkgInfo.applicationInfo.loadIcon(pm)
 
-        if (tempApk.exists()) {
-            val pm = context.packageManager
-            val pkgInfo = pm.getPackageArchiveInfo(tempApk.absolutePath, 0)
-            if (pkgInfo != null) {
-                pkgInfo.applicationInfo.sourceDir = tempApk.absolutePath
-                pkgInfo.applicationInfo.publicSourceDir = tempApk.absolutePath
-                val drawable = pkgInfo.applicationInfo.loadIcon(pm)
-
-                val bitmap = drawableToBitmap(drawable)
-                FileOutputStream(iconFile).use { out ->
-                    bitmap.compress(Bitmap.CompressFormat.PNG, 95, out)
-                }
-
-                tempApk.delete()
-                return Pair(pkgInfo.packageName, Uri.fromFile(iconFile))
+            val bitmap = drawableToBitmap(drawable)
+            FileOutputStream(iconFile).use { out ->
+                bitmap.compress(Bitmap.CompressFormat.PNG, 95, out)
             }
-            tempApk.delete()
+            return Pair(packageName, Uri.fromFile(iconFile))
         }
     } catch (e: Exception) {
         e.printStackTrace()

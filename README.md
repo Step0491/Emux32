@@ -11,23 +11,19 @@ Applicazione Android nativa a 64-bit (ARM64-v8a) che funge da **Frontend + Dynam
 
 ---
 
-## 📲 Come Installare (Per gli Utenti)
+## 📲 Struttura Cartelle e Utilizzo
 
-Per chi vuole semplicemente usare l'applicazione sul proprio dispositivo Android moderno:
+All'avvio e installazione, Emux32 crea e monitora automaticamente la seguente cartella nella memoria principale del dispositivo:
 
-1. **Scarica l'APK più recente**: Tocca il pulsante verde [Download APK Latest](https://github.com/Step0491/Emux32/releases/download/latest/Emux32-app-debug.apk) (scarica sempre la versione aggiornata all'ultimo commit).
-2. **Installa sul telefono**: Apri il file scaricato `Emux32-app-debug.apk` e conferma l'installazione.
-3. **Prepara i giochi**: Crea una cartella nella memoria del telefono (es. `/sdcard/Giochi32/`) con la seguente gerarchia:
-   ```text
-   /sdcard/Giochi32/
-      ├── Gioco1/
-      │     ├── game.apk    <-- L'APK a 32 bit originale
-      │     └── cover.jpg   <-- Locandina verticale (opzionale)
-      └── Gioco2/
-            ├── game.apk
-            └── cover.png
-   ```
-4. **Avvia Emux32**: Apri l'app in verticale, tocca l'icona della cartella in alto per selezionare `/sdcard/Giochi32/` e tocca un titolo per avviare l'emulatore.
+```text
+/sdcard/Emux/
+   ├── apk/   <-- Inserisci qui i file .apk a 32 bit (ed eventuali cover .jpg/.png con lo stesso nome)
+   └── obb/   <-- Inserisci qui i file di espansione .obb (o cartelle package con .obb)
+```
+
+- **Lista immediata**: L'app si apre direttamente mostrando la griglia di giochi (2 per riga in verticale).
+- **Icone quadrate**: Copertina quadrata (1:1) estratta automaticamente dall'APK o dal file immagine omonimo.
+- **Lancio diretto al tocco**: Nessun selettore a scorrimento, nessun menu superiore, basta toccare l'icona del gioco per avviarlo.
 
 ---
 
@@ -36,9 +32,9 @@ Per chi vuole semplicemente usare l'applicazione sul proprio dispositivo Android
 ```text
                   ┌──────────────────────────────────────────────┐
                   │       FRONTEND (Kotlin + Compose)            │
-                  │  - Portrait Mode locked for Game Selector    │
+                  │  - Griglia touch 2 colonne con icone quadrate │
+                  │  - Cartelle automatiche Emux/apk ed Emux/obb │
                   │  - Continuous Auto-Release Pipeline (CI/CD)  │
-                  │  - SAF Game & Cover Parser                   │
                   └──────────────────────┬───────────────────────┘
                                          │ JNI Bridge
                   ┌──────────────────────▼───────────────────────┐
