@@ -5,17 +5,22 @@ project("emux_engine")
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-# Configura Boost Header-Only locale incorporato (nessun download esterno runtime)
-set(BOOST_MINI_DIR "${CMAKE_CURRENT_SOURCE_DIR}/externals/dynarmic/externals/boost_mini")
+# Configura Boost Header-Only locale incorporato
+set(BOOST_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/externals/dynarmic/externals/boost_mini")
+set(BOOST_INCLUDEDIR "${BOOST_ROOT}")
+set(Boost_INCLUDE_DIR "${BOOST_ROOT}")
+set(Boost_INCLUDE_DIRS "${BOOST_ROOT}")
+set(Boost_FOUND TRUE CACHE BOOL "Boost trovato" FORCE)
 
 if(NOT TARGET Boost::boost)
-    add_library(Boost::boost INTERFACE IMPORTED)
+    add_library(Boost::boost INTERFACE IMPORTED GLOBAL)
     set_target_properties(Boost::boost PROPERTIES
-        INTERFACE_INCLUDE_DIRECTORIES "${BOOST_MINI_DIR}"
+        INTERFACE_INCLUDE_DIRECTORIES "${BOOST_ROOT}"
     )
 endif()
 
-set(Boost_FOUND TRUE CACHE BOOL "Boost disponibile localmente" FORCE)
+# Disabilita esplicitamente la chiamata a find_package(Boost) in CMake
+set(CMAKE_DISABLE_FIND_PACKAGE_Boost ON)
 
 # Opzioni per Dynarmic JIT
 set(DYNARMIC_FRONTENDS "A32" CACHE STRING "Abilita solo frontend ARM32" FORCE)
@@ -45,7 +50,7 @@ target_include_directories(
     ${CMAKE_CURRENT_SOURCE_DIR}/externals/dynarmic/src
     ${CMAKE_CURRENT_SOURCE_DIR}/externals/dynarmic/externals/mcl/include
     ${CMAKE_CURRENT_SOURCE_DIR}/externals/dynarmic/externals/fmt/include
-    ${BOOST_MINI_DIR}
+    ${BOOST_ROOT}
 )
 
 find_library(log-lib log)
