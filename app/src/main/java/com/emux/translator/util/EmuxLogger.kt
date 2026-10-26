@@ -26,16 +26,32 @@ object EmuxLogger {
     private val logBuffer = mutableListOf<String>()
     private const val MAX_LOG_LINES = 2000
 
-    private var logFile: File? = null
+    private var primaryLogFile: File? = null
+    private var externalLogFile: File? = null
     private var isCapturingLogcat = false
 
-    fun initLogFile(cacheDir: File) {
+    fun initLogFiles(internalCacheDir: File, externalEmuxDir: File?) {
         try {
-            logFile = File(cacheDir, "emux_execution.log")
-            if (logFile?.exists() == true) {
-                logFile?.delete()
+            // 1. Log interno sempre disponibile (privato sandbox dell'app)
+            primaryLogFile = File(internalCacheDir, "emux_execution.log")
+            if (primaryLogFile?.exists() == true) {
+                primaryLogFile?.delete()
             }
-            logFile?.createNewFile()
+            primaryLogFile?.createNewFile()
+
+            // 2. Log pubblico richiesto in Emux32/log/emux_execution.log
+            if (externalEmuxDir != null) {
+                val logDir = File(externalEmuxDir, "log")
+                if (!logDir.exists()) {
+                    logDir.mkdirs()
+                }
+                externalLogFile = File(logDir, "emux_execution.log")
+                if (externalLogFile?.exists() == true) {
+                    externalLogFile?.delete()
+                }
+                externalLogFile?.createNewFile()
+                Log.i(DEFAULT_TAG, "File di log pubblico configurato: ${externalLogFile?.absolutePath}")
+            }
         } catch (e: Exception) {
             Log.e(DEFAULT_TAG, "Impossibile inizializzare file di log: ${e.message}")
         }
@@ -52,14 +68,7 @@ object EmuxLogger {
         logBuffer.add(formattedLine)
         _logs.value = logBuffer.toList()
 
-        // Scrittura su file cache
-        try {
-            logFile?.let { file ->
-                FileOutputStream(file, true).bufferedWriter().use { writer ->
-                    writer.appendLine(formattedLine)
-                }
-            }
-        } catch (_: Exception) {}
+        writeToFileSafe(formattedLine)
     }
 
     @Synchronized
@@ -70,10 +79,24 @@ object EmuxLogger {
         logBuffer.add(rawLine)
         _logs.value = logBuffer.toList()
 
+        writeToFileSafe(rawLine)
+    }
+
+    private fun writeToFileSafe(line: String) {
+        // Scrittura file primario sandbox
         try {
-            logFile?.let { file ->
+            primaryLogFile?.let { file ->
                 FileOutputStream(file, true).bufferedWriter().use { writer ->
-                    writer.appendLine(rawLine)
+                    writer.appendLine(line)
+                }
+            }
+        } catch (_: Exception) {}
+
+        // Scrittura file pubblico in Emux32/log
+        try {
+            externalLogFile?.let { file ->
+                FileOutputStream(file, true).bufferedWriter().use { writer ->
+                    writer.appendLine(line)
                 }
             }
         } catch (_: Exception) {}
@@ -99,6 +122,10 @@ object EmuxLogger {
         synchronized(this) {
             logBuffer.clear()
             _logs.value = emptyList()
+            try {
+                primaryLogFile?.writeText("")
+                externalLogFile?.writeText("")
+            } catch (_: Exception) {}
         }
     }
 
@@ -114,16 +141,12 @@ object EmuxLogger {
         clipboard.setPrimaryClip(clip)
     }
 
-    /**
-     * Cattura asincrona dei messaggi Logcat del processo nativo (UnicornCore, EmuxDbtEngine, EmuxElfLoader, EmuxLinkerHook)
-     */
     fun startLogcatCapture(scope: CoroutineScope) {
         if (isCapturingLogcat) return
         isCapturingLogcat = true
 
         scope.launch(Dispatchers.IO) {
             try {
-                // Clear initial logcat buffer
                 Runtime.getRuntime().exec(arrayOf("logcat", "-c")).waitFor()
                 val process = Runtime.getRuntime().exec(
                     arrayOf(
@@ -147,7 +170,7 @@ object EmuxLogger {
                     }
                 }
             } catch (e: Exception) {
-                Log.w(DEFAULT_TAG, "Logcat capture terminato o non disponibile: ${e.message}")
+                Log.w(DEFAULT_TAG, "Logcat capture non disponibile: ${e.message}")
             }
         }
     }

@@ -77,12 +77,14 @@ class MainActivity : ComponentActivity() {
 
         requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
 
-        // Inizializza file di log persistente e cattura asincrona dei log di sistema/nativo
-        EmuxLogger.initLogFile(cacheDir)
-        EmuxLogger.startLogcatCapture(lifecycleScope)
-        EmuxLogger.i("Emux32", "Emux32 avviato su Android SDK ${Build.VERSION.SDK_INT}. Frontend Jetpack Compose pronto.")
-
         val emuxDir = resolveEmuxDirectory()
+        ensureDirectoryTreeSafe(emuxDir)
+
+        // Inizializza file di log persistente: sia interno che in Emux32/log/emux_execution.log
+        EmuxLogger.initLogFiles(cacheDir, emuxDir)
+        EmuxLogger.startLogcatCapture(lifecycleScope)
+        EmuxLogger.i("Emux32", "Emux32 avviato su Android SDK ${Build.VERSION.SDK_INT}. Cartella storage: ${emuxDir.absolutePath}")
+
         NativeEngine.nativeSetStoragePath(emuxDir.absolutePath)
 
         val initialized = NativeEngine.nativeInitEngine(512)
@@ -257,6 +259,10 @@ class MainActivity : ComponentActivity() {
             val obbDir = File(emuxDir, "obb")
             if (!obbDir.exists()) {
                 obbDir.mkdirs()
+            }
+            val logDir = File(emuxDir, "log")
+            if (!logDir.exists()) {
+                logDir.mkdirs()
             }
         } catch (e: Exception) {
             EmuxLogger.e("Emux32", "Errore creazione directory Emux: ${e.message}")
