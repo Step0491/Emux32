@@ -6,7 +6,10 @@ import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.grid.GridCells
 import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
 import androidx.compose.foundation.lazy.grid.items
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.FolderOpen
 import androidx.compose.material3.*
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
@@ -25,38 +28,80 @@ import com.emux.translator.model.EmuxRom
 @Composable
 fun EmuxGridScreen(
     games: List<EmuxRom>,
-    onGameClick: (EmuxRom) -> Unit
+    currentPathLabel: String,
+    onGameClick: (EmuxRom) -> Unit,
+    onChangePathClick: () -> Unit
 ) {
     Surface(
         modifier = Modifier.fillMaxSize(),
         color = Color(0xFF121212)
     ) {
-        if (games.isEmpty()) {
-            Box(
-                modifier = Modifier.fillMaxSize(),
-                contentAlignment = Alignment.Center
-            ) {
-                Text(
-                    text = "Nessun gioco trovato in Emux/apk\nInserisci i file .apk nella cartella Emux/apk",
-                    color = Color.Gray,
-                    textAlign = TextAlign.Center,
-                    fontSize = 15.sp,
-                    modifier = Modifier.padding(24.dp)
-                )
-            }
-        } else {
-            LazyVerticalGrid(
-                columns = GridCells.Fixed(2),
-                modifier = Modifier
-                    .fillMaxSize()
-                    .padding(horizontal = 12.dp),
-                contentPadding = PaddingValues(top = 24.dp, bottom = 24.dp),
-                horizontalArrangement = Arrangement.spacedBy(12.dp),
-                verticalArrangement = Arrangement.spacedBy(16.dp)
-            ) {
-                items(games) { game ->
-                    GameCoverSquareCard(game = game, onClick = { onGameClick(game) })
+        Box(modifier = Modifier.fillMaxSize()) {
+            if (games.isEmpty()) {
+                Box(
+                    modifier = Modifier.fillMaxSize(),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Column(
+                        horizontalAlignment = Alignment.CenterHorizontally,
+                        modifier = Modifier.padding(24.dp)
+                    ) {
+                        Text(
+                            text = "Nessun gioco trovato",
+                            color = Color.White,
+                            fontWeight = FontWeight.Bold,
+                            fontSize = 18.sp
+                        )
+                        Spacer(modifier = Modifier.height(8.dp))
+                        Text(
+                            text = "Inserisci i tuoi file .apk nella cartella:\n$currentPathLabel/apk",
+                            color = Color.Gray,
+                            textAlign = TextAlign.Center,
+                            fontSize = 14.sp
+                        )
+                        Spacer(modifier = Modifier.height(16.dp))
+                        OutlinedButton(
+                            onClick = onChangePathClick,
+                            colors = ButtonDefaults.outlinedButtonColors(contentColor = Color(0xFF38BDF8))
+                        ) {
+                            Icon(Icons.Default.FolderOpen, contentDescription = null, modifier = Modifier.size(18.dp))
+                            Spacer(modifier = Modifier.width(8.dp))
+                            Text("Cambia Percorso")
+                        }
+                    }
                 }
+            } else {
+                LazyVerticalGrid(
+                    columns = GridCells.Fixed(2),
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .padding(horizontal = 12.dp),
+                    contentPadding = PaddingValues(top = 16.dp, bottom = 80.dp),
+                    horizontalArrangement = Arrangement.spacedBy(12.dp),
+                    verticalArrangement = Arrangement.spacedBy(16.dp)
+                ) {
+                    items(games) { game ->
+                        GameCoverSquareCard(game = game, onClick = { onGameClick(game) })
+                    }
+                }
+            }
+
+            // Tasto galleggiante discreto per cambiare percorso o cartella
+            FloatingActionButton(
+                onClick = onChangePathClick,
+                modifier = Modifier
+                    .align(Alignment.BottomEnd)
+                    .padding(16.dp),
+                shape = CircleShape,
+                containerColor = Color(0xFF262626),
+                contentColor = Color(0xFF38BDF8),
+                elevation = FloatingActionButtonDefaults.elevation(6.dp)
+            ) {
+                Icon(
+                    imageVector = Icons.Default.FolderOpen,
+                    contentDescription = "Cambia Percorso Emux",
+                    modifier = Modifier.size(24.dp)
+                )
             }
         }
     }

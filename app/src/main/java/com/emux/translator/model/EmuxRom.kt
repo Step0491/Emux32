@@ -6,6 +6,7 @@ import android.graphics.Canvas
 import android.graphics.drawable.BitmapDrawable
 import android.graphics.drawable.Drawable
 import android.net.Uri
+import com.emux.translator.util.ImageUpscaler
 import java.io.File
 import java.io.FileOutputStream
 
@@ -19,7 +20,8 @@ data class EmuxRom(
 )
 
 /**
- * Scansiona la cartella Emux/apk ed Emux/obb nella memoria esterna principale.
+ * Scansiona la cartella Emux/apk ed Emux/obb.
+ * Controlla se le cartelle esistono e crea SOLO ciò che manca senza cancellare o sovrascrivere nulla.
  */
 fun scanEmuxStorage(context: Context, apkDir: File, obbDir: File): List<EmuxRom> {
     val gamesList = mutableListOf<EmuxRom>()
@@ -35,16 +37,20 @@ fun scanEmuxStorage(context: Context, apkDir: File, obbDir: File): List<EmuxRom>
         file.isFile && file.name.lowercase().endsWith(".apk")
     } ?: emptyArray()
 
+    val upscaledCoversDir = File(apkDir, ".upscaled_covers")
+    if (!upscaledCoversDir.exists()) {
+        upscaledCoversDir.mkdirs()
+    }
+
     for (apkFile in apkFiles) {
         val baseName = apkFile.nameWithoutExtension
         val title = baseName.replace("_", " ")
 
-        val (pkgName, extractedIconUri) = extractApkMetadata(context, apkFile)
+        val (pkgName, rawIconFile) = extractApkMetadata(context, apkFile)
 
         // Cerca eventuale OBB associato in Emux/obb/ o Emux/obb/<packageName>/
         var matchedObbFile: File? = null
         if (obbDir.exists()) {
-            // Controlla se c'è un file obb con nome simile o dentro una sottocartella col nome pacchetto
             if (pkgName != null) {
                 val pkgFolder = File(obbDir, pkgName)
                 if (pkgFolder.isDirectory) {
@@ -64,24 +70,39 @@ fun scanEmuxStorage(context: Context, apkDir: File, obbDir: File): List<EmuxRom>
             }
         }
 
-        // Cerca copertina custom accanto all'apk (es: nome.jpg, nome.png o cover.jpg)
-        var coverUri = extractedIconUri
+        // Cerca copertina custom omonima (es: nome.jpg, nome.png, cover.jpg)
+        var sourceCoverFile: File? = null
         val possibleCovers = listOf(
             File(apkDir, "$baseName.jpg"),
             File(apkDir, "$baseName.png"),
-            File(apkDir, "$baseName.jpeg")
+            File(apkDir, "$baseName.jpeg"),
+            File(apkDir, "cover.jpg"),
+            File(apkDir, "cover.png")
         )
         for (cand in possibleCovers) {
             if (cand.exists() && cand.length() > 0) {
-                coverUri = Uri.fromFile(cand)
+                sourceCoverFile = cand
                 break
             }
+        }
+
+        if (sourceCoverFile == null) {
+            sourceCoverFile = rawIconFile
+        }
+
+        // Esegue l'upscaling rapido offline e salva il risultato permanente
+        val finalCoverUri: Uri? = if (sourceCoverFile != null && sourceCoverFile.exists()) {
+            val upscaledTarget = File(upscaledCoversDir, "${baseName}_upscaled.png")
+            val readyCover = ImageUpscaler.getOrUpscaleImage(sourceCoverFile, upscaledTarget, 512)
+            Uri.fromFile(readyCover)
+        } else {
+            null
         }
 
         gamesList.add(
             EmuxRom(
                 title = title,
-                coverUri = coverUri,
+                coverUri = finalCoverUri,
                 apkFile = apkFile,
                 obbFile = matchedObbFile,
                 packageName = pkgName,
@@ -94,9 +115,9 @@ fun scanEmuxStorage(context: Context, apkDir: File, obbDir: File): List<EmuxRom>
 }
 
 /**
- * Estrae l'icona e il package name dall'APK memorizzandoli nella cache interna
+ * Estrae l'icona originaria e il package name dall'APK senza sovrascrivere se esiste già
  */
-private fun extractApkMetadata(context: Context, apkFile: File): Pair<String?, Uri?> {
+private fun extractApkMetadata(context: Context, apkFile: File): Pair<String?, File?> {
     try {
         val iconsDir = File(context.cacheDir, "extracted_icons")
         if (!iconsDir.exists()) iconsDir.mkdirs()
@@ -109,7 +130,7 @@ private fun extractApkMetadata(context: Context, apkFile: File): Pair<String?, U
         val packageName = pkgInfo?.packageName
 
         if (iconFile.exists() && iconFile.length() > 0) {
-            return Pair(packageName, Uri.fromFile(iconFile))
+            return Pair(packageName, iconFile)
         }
 
         if (pkgInfo != null) {
@@ -121,7 +142,7 @@ private fun extractApkMetadata(context: Context, apkFile: File): Pair<String?, U
             FileOutputStream(iconFile).use { out ->
                 bitmap.compress(Bitmap.CompressFormat.PNG, 95, out)
             }
-            return Pair(packageName, Uri.fromFile(iconFile))
+            return Pair(packageName, iconFile)
         }
     } catch (e: Exception) {
         e.printStackTrace()
