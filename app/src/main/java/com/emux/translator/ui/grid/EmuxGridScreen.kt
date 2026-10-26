@@ -10,6 +10,7 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.FolderOpen
+import androidx.compose.material.icons.filled.Terminal
 import androidx.compose.material3.*
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
@@ -30,7 +31,8 @@ fun EmuxGridScreen(
     games: List<EmuxRom>,
     currentPathLabel: String,
     onGameClick: (EmuxRom) -> Unit,
-    onChangePathClick: () -> Unit
+    onChangePathClick: () -> Unit,
+    onShowLogsClick: () -> Unit = {}
 ) {
     Surface(
         modifier = Modifier.fillMaxSize(),
@@ -86,7 +88,25 @@ fun EmuxGridScreen(
                 }
             }
 
-            // Tasto galleggiante discreto per cambiare percorso o cartella
+            // Tasto galleggiante per visualizzare i log di sistema in tempo reale
+            FloatingActionButton(
+                onClick = onShowLogsClick,
+                modifier = Modifier
+                    .align(Alignment.BottomStart)
+                    .padding(16.dp),
+                shape = CircleShape,
+                containerColor = Color(0xFF1E293B),
+                contentColor = Color(0xFF38BDF8),
+                elevation = FloatingActionButtonDefaults.elevation(6.dp)
+            ) {
+                Icon(
+                    imageVector = Icons.Default.Terminal,
+                    contentDescription = "Log di Sistema",
+                    modifier = Modifier.size(24.dp)
+                )
+            }
+
+            // Tasto galleggiante per cambiare percorso o cartella
             FloatingActionButton(
                 onClick = onChangePathClick,
                 modifier = Modifier
@@ -118,68 +138,78 @@ fun GameCoverSquareCard(game: EmuxRom, onClick: () -> Unit) {
         Card(
             modifier = Modifier
                 .fillMaxWidth()
-                .aspectRatio(1f), // Tassativamente QUADRATO
-            shape = RoundedCornerShape(16.dp),
-            elevation = CardDefaults.cardElevation(defaultElevation = 4.dp),
-            colors = CardDefaults.cardColors(containerColor = Color(0xFF1E1E1E))
+                .aspectRatio(1f),
+            shape = RoundedCornerShape(14.dp),
+            colors = CardDefaults.cardColors(containerColor = Color(0xFF1E1E1E)),
+            elevation = CardDefaults.cardElevation(defaultElevation = 4.dp)
         ) {
             Box(modifier = Modifier.fillMaxSize()) {
-                if (game.coverUri != null) {
+                if (game.coverImage != null) {
                     AsyncImage(
-                        model = game.coverUri,
-                        contentDescription = "Cover ${game.title}",
-                        contentScale = ContentScale.Crop,
-                        modifier = Modifier
-                            .fillMaxSize()
-                            .clip(RoundedCornerShape(16.dp))
+                        model = game.coverImage,
+                        contentDescription = game.title,
+                        modifier = Modifier.fillMaxSize(),
+                        contentScale = ContentScale.Crop
                     )
                 } else {
                     Box(
                         modifier = Modifier
                             .fillMaxSize()
-                            .background(Color(0xFF2A2A2A)),
+                            .background(Color(0xFF2C2C2C)),
                         contentAlignment = Alignment.Center
                     ) {
                         Text(
                             text = game.title.take(2).uppercase(),
-                            color = Color.White.copy(alpha = 0.7f),
-                            fontWeight = FontWeight.Bold,
-                            fontSize = 32.sp
+                            color = Color.LightGray,
+                            fontSize = 32.sp,
+                            fontWeight = FontWeight.Bold
                         )
                     }
                 }
 
-                // Badge OBB se presente
-                if (game.hasObb) {
-                    Surface(
-                        color = Color(0xFF10B981).copy(alpha = 0.9f),
-                        shape = RoundedCornerShape(topStart = 0.dp, topEnd = 0.dp, bottomStart = 8.dp, bottomEnd = 0.dp),
-                        modifier = Modifier.align(Alignment.TopEnd)
-                    ) {
-                        Text(
-                            text = "OBB",
-                            color = Color.White,
-                            fontSize = 10.sp,
-                            fontWeight = FontWeight.Bold,
-                            modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
-                        )
-                    }
+                // Badge indicatore stato OBB
+                Surface(
+                    color = if (game.hasObb) Color(0xFF15803D).copy(alpha = 0.9f) else Color(0xFF475569).copy(alpha = 0.85f),
+                    shape = RoundedCornerShape(topStart = 8.dp, bottomEnd = 8.dp),
+                    modifier = Modifier.align(Alignment.TopStart)
+                ) {
+                    Text(
+                        text = if (game.hasObb) "OBB ✓" else "NO OBB",
+                        color = Color.White,
+                        fontSize = 10.sp,
+                        fontWeight = FontWeight.Bold,
+                        modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
+                    )
+                }
+
+                // Badge orientamento
+                Surface(
+                    color = Color.Black.copy(alpha = 0.7f),
+                    shape = RoundedCornerShape(topEnd = 8.dp, bottomStart = 8.dp),
+                    modifier = Modifier.align(Alignment.TopEnd)
+                ) {
+                    Text(
+                        text = if (game.preferredOrientation == android.content.pm.ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE) "LANDSCAPE" else "PORTRAIT",
+                        color = Color(0xFF38BDF8),
+                        fontSize = 9.sp,
+                        fontWeight = FontWeight.Bold,
+                        modifier = Modifier.padding(horizontal = 5.dp, vertical = 2.dp)
+                    )
                 }
             }
         }
 
         Spacer(modifier = Modifier.height(6.dp))
 
-        // Nome dell'app sotto l'icona quadrata
         Text(
             text = game.title,
             color = Color.White,
             fontSize = 13.sp,
-            fontWeight = FontWeight.Medium,
+            fontWeight = FontWeight.SemiBold,
             maxLines = 1,
             overflow = TextOverflow.Ellipsis,
             textAlign = TextAlign.Center,
-            modifier = Modifier.padding(horizontal = 4.dp)
+            modifier = Modifier.fillMaxWidth().padding(horizontal = 4.dp)
         )
     }
 }

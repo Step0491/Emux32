@@ -128,6 +128,9 @@ struct JNIEnv32 {
 // Dispatcher Syscall Linux ARM32 -> Host Android 64-bit
 class SyscallDispatcher {
 public:
+    static void setStoragePath(const std::string& path);
+    static std::string resolveFilePath(const char* guestPath);
+
     static int32_t handleSyscall(
         uint32_t syscallNum,
         uint32_t r0,

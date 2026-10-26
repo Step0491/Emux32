@@ -13,7 +13,7 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.ArrowBack
-import androidx.compose.material.icons.filled.Settings
+import androidx.compose.material.icons.filled.Terminal
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
@@ -29,7 +29,8 @@ import com.emux.translator.nativebridge.NativeEngine
 @Composable
 fun GamePlayerScreen(
     game: EmuxRom,
-    onExitGame: () -> Unit
+    onExitGame: () -> Unit,
+    onShowLogs: () -> Unit = {}
 ) {
     var showHud by remember { mutableStateOf(false) }
 
@@ -57,7 +58,6 @@ fun GamePlayerScreen(
         AndroidView(
             factory = { context ->
                 SurfaceView(context).apply {
-                    // Imposta la dimensione del buffer nativo a FHD per rendering a risoluzione piena
                     holder.setFixedSize(1920, 1080)
                     holder.addCallback(object : SurfaceHolder.Callback {
                         override fun surfaceCreated(holder: SurfaceHolder) {
@@ -144,13 +144,13 @@ fun GamePlayerScreen(
                     }
 
                     IconButton(
-                        onClick = { },
+                        onClick = onShowLogs,
                         modifier = Modifier.background(Color.Black.copy(alpha = 0.6f), CircleShape)
                     ) {
                         Icon(
-                            imageVector = Icons.Default.Settings,
-                            contentDescription = "Impostazioni Emulazione",
-                            tint = Color.White
+                            imageVector = Icons.Default.Terminal,
+                            contentDescription = "Log di Sistema",
+                            tint = Color(0xFF38BDF8)
                         )
                     }
                 }

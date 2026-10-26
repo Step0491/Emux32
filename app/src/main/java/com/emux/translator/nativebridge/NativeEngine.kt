@@ -16,6 +16,7 @@ object NativeEngine {
 
     external fun nativeInitEngine(guestRamMb: Long): Boolean
     external fun nativeConfigurePerformance(targetFps: Int, enableFhd: Boolean, throttleGuard: Boolean): Boolean
+    external fun nativeSetStoragePath(path: String): Boolean
     external fun nativeLoadElfLibrary(libraryPath: String): Boolean
     external fun startEmulationNative(): Boolean
     external fun nativeExecuteEntryPoint(): Boolean

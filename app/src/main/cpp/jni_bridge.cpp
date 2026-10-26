@@ -61,6 +61,21 @@ Java_com_emux_translator_nativebridge_NativeEngine_nativeConfigurePerformance(
 }
 
 JNIEXPORT jboolean JNICALL
+Java_com_emux_translator_nativebridge_NativeEngine_nativeSetStoragePath(
+    JNIEnv* env,
+    jobject /* thiz */,
+    jstring path
+) {
+    if (!path) return JNI_FALSE;
+    const char* nativePath = env->GetStringUTFChars(path, nullptr);
+    if (!nativePath) return JNI_FALSE;
+
+    emux::SyscallDispatcher::setStoragePath(nativePath);
+    env->ReleaseStringUTFChars(path, nativePath);
+    return JNI_TRUE;
+}
+
+JNIEXPORT jboolean JNICALL
 Java_com_emux_translator_nativebridge_NativeEngine_nativeLoadElfLibrary(
     JNIEnv* env,
     jobject /* thiz */,

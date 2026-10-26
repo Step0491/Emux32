@@ -11,29 +11,29 @@ import android.os.Build
 import android.os.Bundle
 import android.os.Environment
 import android.provider.Settings
-import android.util.Log
 import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
-import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
-import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
+import androidx.lifecycle.lifecycleScope
 import com.emux.translator.model.EmuxRom
 import com.emux.translator.model.scanEmuxStorage
 import com.emux.translator.nativebridge.NativeEngine
 import com.emux.translator.ui.game.GamePlayerScreen
 import com.emux.translator.ui.grid.EmuxGridScreen
+import com.emux.translator.ui.log.SystemLogViewerDialog
 import com.emux.translator.ui.theme.EmuxTranslatorTheme
+import com.emux.translator.util.EmuxLogger
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -77,9 +77,20 @@ class MainActivity : ComponentActivity() {
 
         requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
 
+        // Inizializza file di log persistente e cattura asincrona dei log di sistema/nativo
+        EmuxLogger.initLogFile(cacheDir)
+        EmuxLogger.startLogcatCapture(lifecycleScope)
+        EmuxLogger.i("Emux32", "Emux32 avviato su Android SDK ${Build.VERSION.SDK_INT}. Frontend Jetpack Compose pronto.")
+
+        val emuxDir = resolveEmuxDirectory()
+        NativeEngine.nativeSetStoragePath(emuxDir.absolutePath)
+
         val initialized = NativeEngine.nativeInitEngine(512)
         if (!initialized) {
+            EmuxLogger.e("Emux32", "Inizializzazione nativa iniziale dell'engine fallita.")
             Toast.makeText(this, "Inizializzazione Engine ARM32 fallita", Toast.LENGTH_LONG).show()
+        } else {
+            EmuxLogger.i("Emux32", "Unicorn ARM32 DBT Engine pre-inizializzato (512 MB guest RAM).")
         }
 
         setContent {
@@ -87,6 +98,7 @@ class MainActivity : ComponentActivity() {
                 var games by remember { mutableStateOf<List<EmuxRom>>(emptyList()) }
                 var activeGame by remember { mutableStateOf<EmuxRom?>(null) }
                 var showSetupDialog by remember { mutableStateOf(false) }
+                var showLogDialog by remember { mutableStateOf(false) }
                 var currentEmuxDir by remember { mutableStateOf(resolveEmuxDirectory()) }
 
                 val scope = rememberCoroutineScope()
@@ -98,8 +110,12 @@ class MainActivity : ComponentActivity() {
                         val obbDir = File(base, "obb")
 
                         ensureDirectoryTreeSafe(base)
+                        NativeEngine.nativeSetStoragePath(base.absolutePath)
 
+                        EmuxLogger.i("Emux32", "Scansione libreria giochi in: ${base.absolutePath}")
                         val scanned = scanEmuxStorage(this@MainActivity, apkDir, obbDir)
+                        EmuxLogger.i("Emux32", "Scansione completata: trovati ${scanned.size} titoli supportati.")
+
                         withContext(Dispatchers.Main) {
                             games = scanned
                             currentEmuxDir = base
@@ -130,10 +146,12 @@ class MainActivity : ComponentActivity() {
                     SetupStorageDialog(
                         defaultPath = getDefaultEmuxDirectory().absolutePath,
                         onConfirmDefault = {
+                            val dir = getDefaultEmuxDirectory()
                             prefs.edit()
                                 .putBoolean("emux_setup_completed", true)
-                                .putString("custom_emux_path", getDefaultEmuxDirectory().absolutePath)
+                                .putString("custom_emux_path", dir.absolutePath)
                                 .apply()
+                            NativeEngine.nativeSetStoragePath(dir.absolutePath)
                             showSetupDialog = false
                             refreshGames()
                         },
@@ -143,11 +161,18 @@ class MainActivity : ComponentActivity() {
                                     .putBoolean("emux_setup_completed", true)
                                     .putString("custom_emux_path", chosenDir.absolutePath)
                                     .apply()
+                                NativeEngine.nativeSetStoragePath(chosenDir.absolutePath)
                                 showSetupDialog = false
                                 refreshGames()
                             }
                             chooseFolderLauncher.launch(null)
                         }
+                    )
+                }
+
+                if (showLogDialog) {
+                    SystemLogViewerDialog(
+                        onDismiss = { showLogDialog = false }
                     )
                 }
 
@@ -157,6 +182,9 @@ class MainActivity : ComponentActivity() {
                         onExitGame = {
                             activeGame = null
                             refreshGames()
+                        },
+                        onShowLogs = {
+                            showLogDialog = true
                         }
                     )
                 } else {
@@ -165,6 +193,7 @@ class MainActivity : ComponentActivity() {
                         currentPathLabel = currentEmuxDir.absolutePath,
                         onGameClick = { rom ->
                             activeGame = rom
+                            EmuxLogger.i("Emux32", "Click su titolo: '${rom.title}' (${rom.packageName ?: "senza package"})")
                             // GESTIONE DELLA CONCORRENZA: Invocazione asincrona isolata su Dispatchers.IO
                             scope.launch(Dispatchers.IO) {
                                 launchGameAsync(rom)
@@ -175,9 +204,13 @@ class MainActivity : ComponentActivity() {
                                 prefs.edit()
                                     .putString("custom_emux_path", chosenDir.absolutePath)
                                     .apply()
+                                NativeEngine.nativeSetStoragePath(chosenDir.absolutePath)
                                 refreshGames()
                             }
                             chooseFolderLauncher.launch(null)
+                        },
+                        onShowLogsClick = {
+                            showLogDialog = true
                         }
                     )
                 }
@@ -226,7 +259,7 @@ class MainActivity : ComponentActivity() {
                 obbDir.mkdirs()
             }
         } catch (e: Exception) {
-            e.printStackTrace()
+            EmuxLogger.e("Emux32", "Errore creazione directory Emux: ${e.message}")
         }
     }
 
@@ -258,53 +291,88 @@ class MainActivity : ComponentActivity() {
     }
 
     /**
-     * Collega tutti i file OBB associati nel sandbox Android target (/sdcard/Android/obb/<packageName>/)
-     * ed esegue startEmulationNative in modo completamente asincrono su Dispatchers.IO senza bloccare
-     * il Main Thread di Compose.
+     * Esecuzione completa e rigorosa in 5 fasi con log di sistema per ogni step diagnostico.
      */
     private suspend fun launchGameAsync(rom: EmuxRom) = withContext(Dispatchers.IO) {
         try {
+            // ==========================================
+            // FASE 1: Rilevamento e Validazione APK
+            // ==========================================
+            EmuxLogger.i("Emux32", "========== AVVIO GIOCO: ${rom.title} ==========")
+            EmuxLogger.i("Emux32", "[FASE 1/5] Validazione file APK...")
             val apkFile = rom.apkFile
             if (!apkFile.exists()) {
+                EmuxLogger.e("Emux32", "[FASE 1/5] ERRORE FATALE: File APK inesistente: ${apkFile.absolutePath}")
                 withContext(Dispatchers.Main) {
                     Toast.makeText(this@MainActivity, "File APK non trovato: ${apkFile.name}", Toast.LENGTH_SHORT).show()
                 }
                 return@withContext
             }
 
-            val pkg = rom.packageName
-            val obbList = rom.obbFiles
+            EmuxLogger.i("Emux32", "[FASE 1/5] APK valido: ${apkFile.name} (${apkFile.length()} byte, path: ${apkFile.absolutePath})")
+            val pkg = rom.packageName ?: "com.game.legacy"
+            EmuxLogger.i("Emux32", "[FASE 1/5] Package Name target: $pkg")
 
-            // 1. LINKING AUTOMATICO OBB:
-            // I giochi Android cercano i loro OBB in /sdcard/Android/obb/<packageName>/
-            if (pkg != null && obbList.isNotEmpty()) {
-                try {
-                    val systemAndroidObbDir = File(Environment.getExternalStorageDirectory(), "Android/obb/$pkg")
-                    if (!systemAndroidObbDir.exists()) {
-                        systemAndroidObbDir.mkdirs()
-                    }
-                    for (obbFile in obbList) {
-                        val targetObb = File(systemAndroidObbDir, obbFile.name)
-                        if (!targetObb.exists()) {
-                            try {
-                                android.system.Os.symlink(obbFile.absolutePath, targetObb.absolutePath)
-                                Log.i("Emux32", "Symlink OBB creato: ${targetObb.absolutePath} -> ${obbFile.absolutePath}")
-                            } catch (e: Exception) {
-                                FileInputStream(obbFile).use { input ->
-                                    FileOutputStream(targetObb).use { output ->
-                                        input.copyTo(output)
+            // ==========================================
+            // FASE 2: Verifica e Linking File OBB
+            // ==========================================
+            EmuxLogger.i("Emux32", "[FASE 2/5] Verifica file OBB associati...")
+            val obbList = rom.obbFiles
+            if (obbList.isEmpty()) {
+                EmuxLogger.i("Emux32", "[FASE 2/5] Nessun file OBB richiesto o presente per questo titolo.")
+            } else {
+                EmuxLogger.i("Emux32", "[FASE 2/5] Trovati ${obbList.size} file OBB da collegare:")
+                for (obb in obbList) {
+                    EmuxLogger.i("Emux32", "   -> File OBB sorgente: ${obb.name} (${obb.length()} byte)")
+                }
+
+                // Percorsi target multipli per massima compatibilità con Scoped Storage
+                val targetDirs = listOf(
+                    File(Environment.getExternalStorageDirectory(), "Android/obb/$pkg"),
+                    File(getExternalFilesDir(null)?.parentFile?.parentFile, "obb/$pkg"),
+                    File(filesDir, "obb/$pkg")
+                )
+
+                for (targetDir in targetDirs) {
+                    try {
+                        if (!targetDir.exists()) {
+                            targetDir.mkdirs()
+                        }
+                    } catch (_: Exception) {}
+
+                    if (targetDir.exists() && targetDir.canWrite()) {
+                        for (obbFile in obbList) {
+                            val targetObb = File(targetDir, obbFile.name)
+                            if (!targetObb.exists() || targetObb.length() != obbFile.length()) {
+                                try {
+                                    // Tentativo symlink a costo zero
+                                    android.system.Os.symlink(obbFile.absolutePath, targetObb.absolutePath)
+                                    EmuxLogger.i("Emux32", "[FASE 2/5] Symlink OBB creato con successo: ${targetObb.absolutePath}")
+                                } catch (e: Exception) {
+                                    // Fallback copia fisica se symlink non supportato dal filesystem FAT/exFAT
+                                    try {
+                                        FileInputStream(obbFile).use { input ->
+                                            FileOutputStream(targetObb).use { output ->
+                                                input.copyTo(output)
+                                            }
+                                        }
+                                        EmuxLogger.i("Emux32", "[FASE 2/5] OBB collegato tramite copia: ${targetObb.absolutePath} (${targetObb.length()} byte)")
+                                    } catch (copyErr: Exception) {
+                                        EmuxLogger.w("Emux32", "[FASE 2/5] Impossibile scrivere OBB in ${targetDir.absolutePath}: ${copyErr.message}")
                                     }
                                 }
-                                Log.i("Emux32", "OBB collegato via copia: ${targetObb.absolutePath}")
+                            } else {
+                                EmuxLogger.i("Emux32", "[FASE 2/5] OBB già presente e verificato in: ${targetObb.absolutePath}")
                             }
                         }
                     }
-                } catch (e: Exception) {
-                    Log.w("Emux32", "Attenzione durante il linking OBB: ${e.message}")
                 }
             }
 
-            // 2. ESTRAZIONE Esecuzione .so ARM32 nel motore Unicorn DBT
+            // ==========================================
+            // FASE 3: Estrazione Librerie Native ARM32 (.so)
+            // ==========================================
+            EmuxLogger.i("Emux32", "[FASE 3/5] Analisi APK ed estrazione librerie native ARM32 (armeabi-v7a / armeabi)...")
             val zip = java.util.zip.ZipFile(apkFile)
             val entries = zip.entries()
             val extractedSos = mutableListOf<File>()
@@ -322,23 +390,23 @@ class MainActivity : ComponentActivity() {
                     }
                     if (outFile.length() > 0) {
                         extractedSos.add(outFile)
-                        Log.i("Emux32", "Estratta libreria nativa ARM32: ${outFile.name} (${outFile.length()} byte)")
+                        EmuxLogger.i("Emux32", "   -> Estratta libreria ARM32: ${outFile.name} (${outFile.length()} byte)")
                     }
                 }
             }
             zip.close()
 
             if (extractedSos.isEmpty()) {
+                EmuxLogger.e("Emux32", "[FASE 3/5] ERRORE: Nessun binario nativo ARM32 (armeabi-v7a/armeabi) trovato nell'APK.")
                 withContext(Dispatchers.Main) {
-                    Toast.makeText(this@MainActivity, "Nessuna libreria ARM32 (armeabi-v7a/armeabi) trovata nell'APK", Toast.LENGTH_LONG).show()
+                    Toast.makeText(this@MainActivity, "Nessuna libreria ARM32 trovata nell'APK", Toast.LENGTH_LONG).show()
                 }
                 return@withContext
             }
 
-            // Selezione intelligente della libreria principale del gioco:
+            // Selezione della libreria principale del gioco:
             // 1) Blood & Glory e titoli Glu Mobile usano 'libg.so'
-            // 2) Altri giochi utilizzano libgame.so, libmain.so, libunity.so
-            // 3) Scarta librerie di supporto generiche (libgnustl_shared, libc++_shared)
+            // 2) Titoli Unreal/Unity usano libgame.so, libmain.so, libunity.so
             var mainSo: File? = extractedSos.firstOrNull { file ->
                 val name = file.name.lowercase()
                 name == "libg.so" || name == "libgame.so" || name == "libmain.so" || name == "libunity.so" ||
@@ -356,25 +424,42 @@ class MainActivity : ComponentActivity() {
                 mainSo = extractedSos.first()
             }
 
-            Log.i("Emux32", "Libreria principale identificata per il caricamento: ${mainSo.name} (${mainSo.length()} byte)")
+            EmuxLogger.i("Emux32", "[FASE 3/5] Libreria principale selezionata per l'esecuzione: ${mainSo.name} (${mainSo.length()} byte)")
 
-            // Garantisce l'inizializzazione del motore anche dopo rotazione o recreate dell'activity
-            NativeEngine.nativeInitEngine(512)
+            // ==========================================
+            // FASE 4: Setup Motore Nativo DBT Unicorn
+            // ==========================================
+            EmuxLogger.i("Emux32", "[FASE 4/5] Configurazione e avvio Unicorn ARM32 DBT Engine...")
+            NativeEngine.nativeSetStoragePath(resolveEmuxDirectory().absolutePath)
+            val engineReady = NativeEngine.nativeInitEngine(512)
+            if (!engineReady) {
+                EmuxLogger.e("Emux32", "[FASE 4/5] Inizializzazione motore nativo fallita!")
+                return@withContext
+            }
+            NativeEngine.nativeConfigurePerformance(60, enableFhd = true, throttleGuard = true)
+            EmuxLogger.i("Emux32", "[FASE 4/5] Motore DBT configurato: 60 FPS Lock, Buffer FHD 1080p, Throttle Guard attivo.")
 
+            // ==========================================
+            // FASE 5: Caricamento ELF ed Esecuzione Guest
+            // ==========================================
+            EmuxLogger.i("Emux32", "[FASE 5/5] Caricamento ELF binario guest (${mainSo.name})...")
             val loaded = NativeEngine.nativeLoadElfLibrary(mainSo.absolutePath)
             if (loaded) {
-                Log.i("Emux32", "Caricamento ELF riuscito per ${mainSo.name}. Avvio asincrono startEmulationNative su Dispatchers.IO...")
+                EmuxLogger.i("Emux32", "[FASE 5/5] ELF caricato e rilocato. Avvio uc_emu_start su thread isolato Dispatchers.IO...")
                 val success = NativeEngine.startEmulationNative()
-                if (!success) {
-                    Log.w("Emux32", "startEmulationNative completato o fermato.")
+                if (success) {
+                    EmuxLogger.i("Emux32", "[FASE 5/5] Esecuzione guest completata regolarmente.")
+                } else {
+                    EmuxLogger.w("Emux32", "[FASE 5/5] startEmulationNative ha terminato il ciclo.")
                 }
             } else {
+                EmuxLogger.e("Emux32", "[FASE 5/5] ERRORE: Caricamento ELF fallito per ${mainSo.name}")
                 withContext(Dispatchers.Main) {
                     Toast.makeText(this@MainActivity, "Caricamento ELF fallito per ${mainSo.name}", Toast.LENGTH_SHORT).show()
                 }
             }
         } catch (e: Throwable) {
-            Log.e("Emux32", "Eccezione durante il lancio dell'emulazione: ${e.message}", e)
+            EmuxLogger.e("Emux32", "Eccezione critica durante il lancio del gioco: ${e.message}", e)
             withContext(Dispatchers.Main) {
                 Toast.makeText(this@MainActivity, "Errore avvio gioco: ${e.localizedMessage}", Toast.LENGTH_LONG).show()
             }
@@ -383,6 +468,7 @@ class MainActivity : ComponentActivity() {
 
     override fun onDestroy() {
         super.onDestroy()
+        EmuxLogger.i("Emux32", "MainActivity distrutta. Rilascio risorse motore nativo.")
         NativeEngine.nativeReleaseEngine()
     }
 }

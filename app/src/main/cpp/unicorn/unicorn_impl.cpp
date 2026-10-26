@@ -9,6 +9,7 @@
 #include <unordered_map>
 #include <atomic>
 #include <mutex>
+#include <algorithm>
 
 #define TAG "UnicornCore"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, TAG, __VA_ARGS__)
@@ -36,18 +37,51 @@ struct HookEntry {
     uint64_t end;
 };
 
+// Bit di stato del registro CPSR
+constexpr uint32_t FLAG_N = 1U << 31; // Negative
+constexpr uint32_t FLAG_Z = 1U << 30; // Zero
+constexpr uint32_t FLAG_C = 1U << 29; // Carry
+constexpr uint32_t FLAG_V = 1U << 28; // Overflow
+constexpr uint32_t FLAG_T = 1U << 5;  // Thumb state
+
+inline bool checkCondition(uint32_t cpsr, uint32_t cond) {
+    bool n = (cpsr & FLAG_N) != 0;
+    bool z = (cpsr & FLAG_Z) != 0;
+    bool c = (cpsr & FLAG_C) != 0;
+    bool v = (cpsr & FLAG_V) != 0;
+
+    switch (cond) {
+        case 0:  return z;                     // EQ
+        case 1:  return !z;                    // NE
+        case 2:  return c;                     // CS / HS
+        case 3:  return !c;                    // CC / LO
+        case 4:  return n;                     // MI
+        case 5:  return !n;                    // PL
+        case 6:  return v;                     // VS
+        case 7:  return !v;                    // VC
+        case 8:  return c && !z;               // HI
+        case 9:  return !c || z;               // LS
+        case 10: return n == v;                // GE
+        case 11: return n != v;                // LT
+        case 12: return !z && (n == v);        // GT
+        case 13: return z || (n != v);         // LE
+        case 14: return true;                  // AL (Always)
+        default: return false;
+    }
+}
+
 struct UnicornInstance {
     uc_arch arch{UC_ARCH_ARM};
     uc_mode mode{UC_MODE_ARM};
     std::atomic<bool> is_running{false};
     std::atomic<bool> stop_requested{false};
 
-    // Registri ARM32 standard
+    // Registri ARM32 standard: r0..r12, r13(SP), r14(LR), r15(PC)
     uint32_t regs[16]{0};
     uint32_t cpsr{0x00000010};
     uint32_t fpscr{0};
 
-    // Mappe memoria
+    // Mappe memoria virtuale guest
     std::vector<MemoryRegion> regions;
     std::mutex mem_mutex;
 
@@ -57,8 +91,8 @@ struct UnicornInstance {
     std::mutex hook_mutex;
 
     UnicornInstance(uc_arch a, uc_mode m) : arch(a), mode(m) {
-        regs[13] = 0x7FFF0000; // SP default
-        cpsr = 0x00000010;     // ARM User Mode
+        regs[13] = 0x7E1FF000; // SP default
+        cpsr = 0x00000010;     // ARM User Mode (32-bit)
     }
 
     ~UnicornInstance() {
@@ -72,13 +106,63 @@ struct UnicornInstance {
         regions.clear();
     }
 
-    MemoryRegion* findRegion(uint64_t addr) {
+    inline MemoryRegion* findRegion(uint64_t addr) {
         for (auto& r : regions) {
             if (addr >= r.address && addr < (r.address + r.size)) {
                 return &r;
             }
         }
         return nullptr;
+    }
+
+    inline uc_err readMem(uint64_t addr, void* dst, size_t size) {
+        if (!dst || size == 0) return UC_ERR_OK;
+        uint8_t* out = static_cast<uint8_t*>(dst);
+        size_t readCount = 0;
+
+        while (readCount < size) {
+            uint64_t cur = addr + readCount;
+            MemoryRegion* r = findRegion(cur);
+            if (!r) return UC_ERR_READ_UNMAPPED;
+
+            size_t off = static_cast<size_t>(cur - r->address);
+            size_t avail = r->size - off;
+            size_t take = std::min(size - readCount, avail);
+
+            std::memcpy(out + readCount, r->host_ptr + off, take);
+            readCount += take;
+        }
+        return UC_ERR_OK;
+    }
+
+    inline uc_err writeMem(uint64_t addr, const void* src, size_t size) {
+        if (!src || size == 0) return UC_ERR_OK;
+        const uint8_t* in = static_cast<const uint8_t*>(src);
+        size_t writeCount = 0;
+
+        while (writeCount < size) {
+            uint64_t cur = addr + writeCount;
+            MemoryRegion* r = findRegion(cur);
+            if (!r) return UC_ERR_WRITE_UNMAPPED;
+
+            size_t off = static_cast<size_t>(cur - r->address);
+            size_t avail = r->size - off;
+            size_t take = std::min(size - writeCount, avail);
+
+            std::memcpy(r->host_ptr + off, in + writeCount, take);
+            writeCount += take;
+        }
+        return UC_ERR_OK;
+    }
+
+    inline uint32_t readU32(uint32_t addr) {
+        uint32_t val = 0;
+        readMem(addr, &val, 4);
+        return val;
+    }
+
+    inline void writeU32(uint32_t addr, uint32_t val) {
+        writeMem(addr, &val, 4);
     }
 };
 
@@ -278,27 +362,7 @@ uc_err uc_mem_write(uc_engine *uc, uint64_t address, const void *bytes, size_t s
 
     auto* inst = reinterpret_cast<UnicornInstance*>(uc);
     std::lock_guard<std::mutex> lock(inst->mem_mutex);
-
-    size_t written = 0;
-    const uint8_t* src = static_cast<const uint8_t*>(bytes);
-
-    while (written < size) {
-        uint64_t curAddr = address + written;
-        MemoryRegion* reg = inst->findRegion(curAddr);
-        if (!reg) {
-            LOGE("uc_mem_write: UC_ERR_WRITE_UNMAPPED all'indirizzo guest 0x%llx", (unsigned long long)curAddr);
-            return UC_ERR_WRITE_UNMAPPED;
-        }
-
-        size_t offset = static_cast<size_t>(curAddr - reg->address);
-        size_t available = reg->size - offset;
-        size_t toWrite = std::min(size - written, available);
-
-        std::memcpy(reg->host_ptr + offset, src + written, toWrite);
-        written += toWrite;
-    }
-
-    return UC_ERR_OK;
+    return inst->writeMem(address, bytes, size);
 }
 
 uc_err uc_mem_read(uc_engine *uc, uint64_t address, void *bytes, size_t size) {
@@ -307,27 +371,7 @@ uc_err uc_mem_read(uc_engine *uc, uint64_t address, void *bytes, size_t size) {
 
     auto* inst = reinterpret_cast<UnicornInstance*>(uc);
     std::lock_guard<std::mutex> lock(inst->mem_mutex);
-
-    size_t readCount = 0;
-    uint8_t* dst = static_cast<uint8_t*>(bytes);
-
-    while (readCount < size) {
-        uint64_t curAddr = address + readCount;
-        MemoryRegion* reg = inst->findRegion(curAddr);
-        if (!reg) {
-            LOGE("uc_mem_read: UC_ERR_READ_UNMAPPED all'indirizzo guest 0x%llx", (unsigned long long)curAddr);
-            return UC_ERR_READ_UNMAPPED;
-        }
-
-        size_t offset = static_cast<size_t>(curAddr - reg->address);
-        size_t available = reg->size - offset;
-        size_t toRead = std::min(size - readCount, available);
-
-        std::memcpy(dst + readCount, reg->host_ptr + offset, toRead);
-        readCount += toRead;
-    }
-
-    return UC_ERR_OK;
+    return inst->readMem(address, bytes, size);
 }
 
 uc_err uc_hook_add(
@@ -380,12 +424,20 @@ uc_err uc_emu_start(uc_engine *uc, uint64_t begin, uint64_t until, uint64_t time
     if (!uc) return UC_ERR_HANDLE;
     auto* inst = reinterpret_cast<UnicornInstance*>(uc);
 
-    inst->regs[15] = static_cast<uint32_t>(begin);
+    // Gestione modalità iniziale ARM vs Thumb in base al bit 0 dell'entry point
+    if (begin & 1) {
+        inst->cpsr |= FLAG_T;
+        inst->regs[15] = static_cast<uint32_t>(begin & ~1ULL);
+    } else {
+        inst->cpsr &= ~FLAG_T;
+        inst->regs[15] = static_cast<uint32_t>(begin & ~3ULL);
+    }
+
     inst->is_running.store(true);
     inst->stop_requested.store(false);
 
-    LOGI("uc_emu_start: Avvio emulazione guest da PC=0x%08llx (until=0x%llx, SP=0x%08x)...",
-         (unsigned long long)begin, (unsigned long long)until, inst->regs[13]);
+    LOGI("uc_emu_start: Avvio emulazione guest da PC=0x%08x (Mode: %s, SP=0x%08x, LR=0x%08x, r0=0x%08x)...",
+         inst->regs[15], (inst->cpsr & FLAG_T) ? "Thumb" : "ARM32", inst->regs[13], inst->regs[14], inst->regs[0]);
 
     size_t instructionsExecuted = 0;
 
@@ -398,7 +450,7 @@ uc_err uc_emu_start(uc_engine *uc, uint64_t begin, uint64_t until, uint64_t time
         }
 
         if (pc == 0 || pc == 0xDEADBEEF) {
-            LOGI("uc_emu_start: Raggiunto return/trap address 0x%08x", pc);
+            LOGI("uc_emu_start: Raggiunto return/trap address 0x%08x (Return Value in r0: 0x%08x)", pc, inst->regs[0]);
             break;
         }
 
@@ -406,64 +458,367 @@ uc_err uc_emu_start(uc_engine *uc, uint64_t begin, uint64_t until, uint64_t time
             break;
         }
 
-        uint32_t insn = 0;
-        uc_err readErr = uc_mem_read(uc, pc, &insn, sizeof(insn));
-        if (readErr != UC_ERR_OK) {
-            LOGE("uc_emu_start: Fault lettura istruzione al PC=0x%08x (%s)", pc, uc_strerror(readErr));
-            inst->is_running.store(false);
-            return readErr;
-        }
+        bool isThumb = (inst->cpsr & FLAG_T) != 0;
 
-        // Intercetta istruzioni ARM Supervisor Call (SVC): 0xEF000000 o condizionali (0x0F000000 mask)
-        if ((insn & 0x0F000000) == 0x0F000000) {
-            uint32_t svcComment = insn & 0x00FFFFFF;
+        if (!isThumb) {
+            // ==================== DECODIFICA & ESECUZIONE ARM (32-bit) ====================
+            uint32_t insn = 0;
+            uc_err readErr = inst->readMem(pc, &insn, 4);
+            if (readErr != UC_ERR_OK) {
+                LOGE("uc_emu_start [ARM]: Fault lettura istruzione al PC=0x%08x (%s)", pc, uc_strerror(readErr));
+                inst->is_running.store(false);
+                return readErr;
+            }
 
-            std::vector<HookEntry> intrHooks;
-            {
-                std::lock_guard<std::mutex> lock(inst->hook_mutex);
-                for (const auto& h : inst->hooks) {
-                    if (h.type & UC_HOOK_INTR) {
-                        intrHooks.push_back(h);
+            uint32_t cond = (insn >> 28) & 0xF;
+            if (cond != 15 && !checkCondition(inst->cpsr, cond)) {
+                // Condizione non verificata: avanza al prossimo comando
+                inst->regs[15] += 4;
+                instructionsExecuted++;
+                continue;
+            }
+
+            // 1. Supervisor Call (SVC): 0xEF000000 o condizionale
+            if ((insn & 0x0F000000) == 0x0F000000) {
+                uint32_t svcComment = insn & 0x00FFFFFF;
+
+                std::vector<HookEntry> intrHooks;
+                {
+                    std::lock_guard<std::mutex> lock(inst->hook_mutex);
+                    for (const auto& h : inst->hooks) {
+                        if (h.type & UC_HOOK_INTR) intrHooks.push_back(h);
                     }
                 }
+
+                for (const auto& h : intrHooks) {
+                    auto cb = reinterpret_cast<uc_cb_hookintr_t>(h.callback);
+                    uint32_t intnoToSend = (svcComment != 0) ? (0x80000000U | svcComment) : 2U;
+                    cb(uc, intnoToSend, h.user_data);
+                }
+
+                inst->regs[15] += 4;
+                instructionsExecuted++;
+                continue;
             }
 
-            for (const auto& h : intrHooks) {
-                auto cb = reinterpret_cast<uc_cb_hookintr_t>(h.callback);
-                // In Unicorn ARM, intno per SVC/SWI è 2 (EXCP_SWI) oppure flag 0x80000000 + svcComment
-                uint32_t intnoToSend = (svcComment != 0) ? (0x80000000U | svcComment) : 2U;
-                cb(uc, intnoToSend, h.user_data);
+            // 2. Branch & Exchange: BX Rm (0x012FFF10) / BLX Rm (0x012FFF30)
+            if ((insn & 0x0FFFFFF0) == 0x012FFF10) { // BX Rm
+                uint32_t rm = insn & 0xF;
+                uint32_t target = inst->regs[rm];
+                if (target & 1) {
+                    inst->cpsr |= FLAG_T;
+                    inst->regs[15] = target & ~1U;
+                } else {
+                    inst->cpsr &= ~FLAG_T;
+                    inst->regs[15] = target & ~3U;
+                }
+                instructionsExecuted++;
+                if (target == 0xDEADBEEF || target == 0) break;
+                continue;
             }
 
+            if ((insn & 0x0FFFFFF0) == 0x012FFF30) { // BLX Rm
+                uint32_t rm = insn & 0xF;
+                uint32_t target = inst->regs[rm];
+                inst->regs[14] = pc + 4; // Imposta LR di ritorno
+                if (target & 1) {
+                    inst->cpsr |= FLAG_T;
+                    inst->regs[15] = target & ~1U;
+                } else {
+                    inst->cpsr &= ~FLAG_T;
+                    inst->regs[15] = target & ~3U;
+                }
+                instructionsExecuted++;
+                continue;
+            }
+
+            // 3. Branch / Branch with Link: B / BL (0x0A000000 / 0x0B000000)
+            if ((insn & 0x0E000000) == 0x0A000000) {
+                bool isBl = (insn & 0x01000000) != 0;
+                if (isBl) {
+                    inst->regs[14] = pc + 4;
+                }
+                int32_t imm24 = static_cast<int32_t>((insn & 0x00FFFFFF) << 8) >> 6;
+                inst->regs[15] = pc + 8 + imm24;
+                instructionsExecuted++;
+                continue;
+            }
+
+            // 4. Block Data Transfer: PUSH / POP / LDM / STM (0x08000000)
+            if ((insn & 0x0E000000) == 0x08000000) {
+                uint32_t rn = (insn >> 16) & 0xF;
+                bool isLoad = (insn & (1 << 20)) != 0;
+                bool writeBack = (insn & (1 << 21)) != 0;
+                bool preIndex = (insn & (1 << 24)) != 0;
+                bool up = (insn & (1 << 23)) != 0;
+                uint16_t regList = insn & 0xFFFF;
+
+                uint32_t addr = inst->regs[rn];
+                std::vector<int> regsToProcess;
+                for (int i = 0; i < 16; ++i) {
+                    if (regList & (1 << i)) regsToProcess.push_back(i);
+                }
+
+                if (!up) { // Decrement (es. PUSH = STMDB SP!)
+                    addr -= static_cast<uint32_t>(regsToProcess.size() * 4);
+                }
+
+                uint32_t curAddr = addr;
+                for (int regIdx : regsToProcess) {
+                    if (isLoad) {
+                        inst->regs[regIdx] = inst->readU32(curAddr);
+                    } else {
+                        inst->writeU32(curAddr, inst->regs[regIdx]);
+                    }
+                    curAddr += 4;
+                }
+
+                if (writeBack) {
+                    if (up) inst->regs[rn] += static_cast<uint32_t>(regsToProcess.size() * 4);
+                    else inst->regs[rn] -= static_cast<uint32_t>(regsToProcess.size() * 4);
+                }
+
+                if (isLoad && (regList & (1 << 15))) {
+                    // PC caricato dallo stack (es. POP {..., PC})
+                    instructionsExecuted++;
+                    continue;
+                }
+
+                inst->regs[15] += 4;
+                instructionsExecuted++;
+                continue;
+            }
+
+            // 5. Single Data Transfer: LDR / STR (0x04000000)
+            if ((insn & 0x0C000000) == 0x04000000) {
+                uint32_t rn = (insn >> 16) & 0xF;
+                uint32_t rd = (insn >> 12) & 0xF;
+                bool isLoad = (insn & (1 << 20)) != 0;
+                bool isByte = (insn & (1 << 22)) != 0;
+                bool up = (insn & (1 << 23)) != 0;
+                uint32_t offset = insn & 0xFFF;
+
+                uint32_t base = (rn == 15) ? (pc + 8) : inst->regs[rn];
+                uint32_t effAddr = up ? (base + offset) : (base - offset);
+
+                if (isLoad) {
+                    if (isByte) {
+                        uint8_t byteVal = 0;
+                        inst->readMem(effAddr, &byteVal, 1);
+                        inst->regs[rd] = byteVal;
+                    } else {
+                        inst->regs[rd] = inst->readU32(effAddr);
+                    }
+                    if (rd == 15) {
+                        instructionsExecuted++;
+                        continue;
+                    }
+                } else {
+                    if (isByte) {
+                        uint8_t byteVal = static_cast<uint8_t>(inst->regs[rd] & 0xFF);
+                        inst->writeMem(effAddr, &byteVal, 1);
+                    } else {
+                        inst->writeU32(effAddr, inst->regs[rd]);
+                    }
+                }
+
+                inst->regs[15] += 4;
+                instructionsExecuted++;
+                continue;
+            }
+
+            // 6. Data Processing (MOV, ADD, SUB, CMP, ecc.)
+            if ((insn & 0x0C000000) == 0x00000000) {
+                uint32_t opcode = (insn >> 21) & 0xF;
+                uint32_t rn = (insn >> 16) & 0xF;
+                uint32_t rd = (insn >> 12) & 0xF;
+                bool setFlags = (insn & (1 << 20)) != 0;
+                bool isImm = (insn & (1 << 25)) != 0;
+
+                uint32_t op2 = 0;
+                if (isImm) {
+                    uint32_t imm8 = insn & 0xFF;
+                    uint32_t rot = ((insn >> 8) & 0xF) * 2;
+                    op2 = (rot == 0) ? imm8 : ((imm8 >> rot) | (imm8 << (32 - rot)));
+                } else {
+                    op2 = inst->regs[insn & 0xF];
+                }
+
+                uint32_t val1 = (rn == 15) ? (pc + 8) : inst->regs[rn];
+                uint32_t res = 0;
+
+                switch (opcode) {
+                    case 0x0: res = val1 & op2; break;         // AND
+                    case 0x1: res = val1 ^ op2; break;         // EOR
+                    case 0x2: res = val1 - op2; break;         // SUB
+                    case 0x4: res = val1 + op2; break;         // ADD
+                    case 0xA: res = val1 - op2; setFlags = true; break; // CMP
+                    case 0xB: res = val1 + op2; setFlags = true; break; // CMN
+                    case 0xC: res = val1 | op2; break;         // ORR
+                    case 0xD: res = op2; break;                // MOV
+                    case 0xE: res = val1 & ~op2; break;        // BIC
+                    case 0xF: res = ~op2; break;               // MVN
+                    default: res = op2; break;
+                }
+
+                if (opcode != 0xA && opcode != 0xB) {
+                    inst->regs[rd] = res;
+                }
+
+                if (setFlags) {
+                    if (res == 0) inst->cpsr |= FLAG_Z; else inst->cpsr &= ~FLAG_Z;
+                    if (res & 0x80000000U) inst->cpsr |= FLAG_N; else inst->cpsr &= ~FLAG_N;
+                }
+
+                if (rd == 15 && opcode != 0xA && opcode != 0xB) {
+                    instructionsExecuted++;
+                    continue;
+                }
+
+                inst->regs[15] += 4;
+                instructionsExecuted++;
+                continue;
+            }
+
+            // Fallback avanzamento PC ARM standard
             inst->regs[15] += 4;
             instructionsExecuted++;
-            continue;
-        }
-
-        // Istruzione ARM BX LR o ritorno funzione
-        if (insn == 0xE12FFF1E) { // bx lr
-            uint32_t lr = inst->regs[14];
-            inst->regs[15] = lr;
-            instructionsExecuted++;
-            if (lr == 0 || lr == 0xDEADBEEF) {
-                break;
+        } else {
+            // ==================== DECODIFICA & ESECUZIONE THUMB (16-bit) ====================
+            uint16_t tInsn = 0;
+            uc_err tReadErr = inst->readMem(pc, &tInsn, 2);
+            if (tReadErr != UC_ERR_OK) {
+                LOGE("uc_emu_start [Thumb]: Fault lettura istruzione al PC=0x%08x", pc);
+                inst->is_running.store(false);
+                return tReadErr;
             }
-            continue;
+
+            // 1. Thumb PUSH (0xB400 / 0xB500) & POP (0xBC00 / 0xBD00)
+            if ((tInsn & 0xFE00) == 0xB400) { // PUSH {rlist, lr}
+                bool hasLr = (tInsn & (1 << 8)) != 0;
+                uint8_t rlist = tInsn & 0xFF;
+                std::vector<int> regsToPush;
+                for (int i = 0; i < 8; ++i) if (rlist & (1 << i)) regsToPush.push_back(i);
+                if (hasLr) regsToPush.push_back(14);
+
+                inst->regs[13] -= static_cast<uint32_t>(regsToPush.size() * 4);
+                uint32_t sp = inst->regs[13];
+                for (int regIdx : regsToPush) {
+                    inst->writeU32(sp, inst->regs[regIdx]);
+                    sp += 4;
+                }
+                inst->regs[15] += 2;
+                instructionsExecuted++;
+                continue;
+            }
+
+            if ((tInsn & 0xFE00) == 0xBC00) { // POP {rlist, pc}
+                bool hasPc = (tInsn & (1 << 8)) != 0;
+                uint8_t rlist = tInsn & 0xFF;
+                std::vector<int> regsToPop;
+                for (int i = 0; i < 8; ++i) if (rlist & (1 << i)) regsToPop.push_back(i);
+                if (hasPc) regsToPop.push_back(15);
+
+                uint32_t sp = inst->regs[13];
+                for (int regIdx : regsToPop) {
+                    inst->regs[regIdx] = inst->readU32(sp);
+                    sp += 4;
+                }
+                inst->regs[13] = sp;
+
+                if (hasPc) {
+                    uint32_t newPc = inst->regs[15];
+                    if (newPc & 1) {
+                        inst->cpsr |= FLAG_T;
+                        inst->regs[15] = newPc & ~1U;
+                    } else {
+                        inst->cpsr &= ~FLAG_T;
+                        inst->regs[15] = newPc & ~3U;
+                    }
+                    instructionsExecuted++;
+                    if (newPc == 0xDEADBEEF || newPc == 0) break;
+                    continue;
+                }
+
+                inst->regs[15] += 2;
+                instructionsExecuted++;
+                continue;
+            }
+
+            // 2. Thumb BX Rm (0x4700) / BLX Rm (0x4780)
+            if ((tInsn & 0xFF87) == 0x4700) { // BX Rm
+                uint32_t rm = (tInsn >> 3) & 0xF;
+                uint32_t target = inst->regs[rm];
+                if (target & 1) {
+                    inst->cpsr |= FLAG_T;
+                    inst->regs[15] = target & ~1U;
+                } else {
+                    inst->cpsr &= ~FLAG_T;
+                    inst->regs[15] = target & ~3U;
+                }
+                instructionsExecuted++;
+                if (target == 0xDEADBEEF || target == 0) break;
+                continue;
+            }
+
+            if ((tInsn & 0xFF87) == 0x4780) { // BLX Rm
+                uint32_t rm = (tInsn >> 3) & 0xF;
+                uint32_t target = inst->regs[rm];
+                inst->regs[14] = (pc + 2) | 1U;
+                if (target & 1) {
+                    inst->cpsr |= FLAG_T;
+                    inst->regs[15] = target & ~1U;
+                } else {
+                    inst->cpsr &= ~FLAG_T;
+                    inst->regs[15] = target & ~3U;
+                }
+                instructionsExecuted++;
+                continue;
+            }
+
+            // 3. Thumb Branch incondizionato B (0xE000)
+            if ((tInsn & 0xF800) == 0xE000) {
+                int32_t imm11 = static_cast<int32_t>((tInsn & 0x7FF) << 21) >> 20;
+                inst->regs[15] = pc + 4 + imm11;
+                instructionsExecuted++;
+                continue;
+            }
+
+            // 4. Thumb Supervisor Call: SVC #imm (0xDF00)
+            if ((tInsn & 0xFF00) == 0xDF00) {
+                uint32_t svcComment = tInsn & 0xFF;
+                std::vector<HookEntry> intrHooks;
+                {
+                    std::lock_guard<std::mutex> lock(inst->hook_mutex);
+                    for (const auto& h : inst->hooks) {
+                        if (h.type & UC_HOOK_INTR) intrHooks.push_back(h);
+                    }
+                }
+                for (const auto& h : intrHooks) {
+                    auto cb = reinterpret_cast<uc_cb_hookintr_t>(h.callback);
+                    uint32_t intnoToSend = (svcComment != 0) ? (0x80000000U | svcComment) : 2U;
+                    cb(uc, intnoToSend, h.user_data);
+                }
+                inst->regs[15] += 2;
+                instructionsExecuted++;
+                continue;
+            }
+
+            // Fallback avanzamento PC Thumb standard (2 byte)
+            inst->regs[15] += 2;
+            instructionsExecuted++;
         }
 
-        // Avanzamento PC standard 4 byte ARM
-        inst->regs[15] += 4;
-        instructionsExecuted++;
-
-        // Salvaguardia loop
-        if (instructionsExecuted >= 1000000) {
+        // Limite di guardia cicli
+        if (instructionsExecuted >= 5000000) {
+            LOGI("uc_emu_start: Raggiunto limite cicli protetto (5M istruzioni).");
             break;
         }
     }
 
     inst->is_running.store(false);
-    LOGI("uc_emu_start: Emulazione terminata al PC=0x%08x (Istruzioni eseguite: %zu)",
-         inst->regs[15], instructionsExecuted);
+    LOGI("uc_emu_start: Emulazione completata al PC=0x%08x (Istruzioni eseguite: %zu, r0=0x%08x)",
+         inst->regs[15], instructionsExecuted, inst->regs[0]);
     return UC_ERR_OK;
 }
 
