@@ -21,5 +21,6 @@ object NativeEngine {
     external fun startEmulationNative(): Boolean
     external fun nativeExecuteEntryPoint(): Boolean
     external fun nativeSetSurface(surface: Any?)
+    external fun nativeSendTouchEvent(action: Int, x: Float, y: Float, pointerId: Int): Boolean
     external fun nativeReleaseEngine()
 }

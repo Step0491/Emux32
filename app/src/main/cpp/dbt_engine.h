@@ -53,6 +53,7 @@ public:
 
     void onInterrupt(uint32_t intno);
     void setNativeSurface(ANativeWindow* window);
+    bool injectTouchEvent(int action, float x, float y, int pointerId);
 
     PerformanceGovernor& getGovernor() { return governor_; }
     uc_engine* getUnicorn() const { return uc_; }

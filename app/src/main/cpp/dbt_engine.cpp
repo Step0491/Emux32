@@ -54,6 +54,11 @@ void DbtEngine::setNativeSurface(ANativeWindow* window) {
     }
 }
 
+bool DbtEngine::injectTouchEvent(int action, float x, float y, int pointerId) {
+    LOGI("DbtEngine Touch Injected: action=%d, x=%.1f, y=%.1f, id=%d", action, x, y, pointerId);
+    return true;
+}
+
 bool DbtEngine::initialize(size_t /* guestRamSize */) {
     LOGI("Inizializzazione Unicorn Engine per architettura ARMv7-A...");
 

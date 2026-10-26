@@ -141,6 +141,20 @@ Java_com_emux_translator_nativebridge_NativeEngine_nativeSetSurface(
     }
 }
 
+JNIEXPORT jboolean JNICALL
+Java_com_emux_translator_nativebridge_NativeEngine_nativeSendTouchEvent(
+    JNIEnv* /* env */,
+    jobject /* thiz */,
+    jint action,
+    jfloat x,
+    jfloat y,
+    jint pointerId
+) {
+    std::lock_guard<std::mutex> lock(gEngineMutex);
+    if (!gEngine) return JNI_FALSE;
+    return gEngine->injectTouchEvent(action, x, y, pointerId) ? JNI_TRUE : JNI_FALSE;
+}
+
 JNIEXPORT void JNICALL
 Java_com_emux_translator_nativebridge_NativeEngine_nativeReleaseEngine(
     JNIEnv* /* env */,
