@@ -133,27 +133,45 @@ std::string SyscallDispatcher::resolveFilePath(const char* guestPath) {
 // Struttura standard stat64 su kernel Linux ARM a 32-bit (Bionic ABI)
 #pragma pack(push, 4)
 struct kernel_stat64_arm32 {
-    uint64_t st_dev;
-    uint32_t __pad0;
-    uint32_t __st_ino;
-    uint32_t st_mode;
-    uint32_t st_nlink;
-    uint32_t st_uid;
-    uint32_t st_gid;
-    uint64_t st_rdev;
-    uint32_t __pad3;
-    int64_t  st_size;
-    uint32_t st_blksize;
-    uint64_t st_blocks;
-    uint32_t a_time;
-    uint32_t a_time_nsec;
-    uint32_t m_time;
-    uint32_t m_time_nsec;
-    uint32_t c_time;
-    uint32_t c_time_nsec;
-    uint64_t st_ino;
+    uint64_t dev_val;
+    uint32_t pad0;
+    uint32_t ino_32;
+    uint32_t mode_val;
+    uint32_t nlink_val;
+    uint32_t uid_val;
+    uint32_t gid_val;
+    uint64_t rdev_val;
+    uint32_t pad3;
+    int64_t  size_val;
+    uint32_t blksize_val;
+    uint64_t blocks_val;
+    uint32_t atime_sec;
+    uint32_t atime_nsec;
+    uint32_t mtime_sec;
+    uint32_t mtime_nsec;
+    uint32_t ctime_sec;
+    uint32_t ctime_nsec;
+    uint64_t ino_64;
 };
 #pragma pack(pop)
+
+static inline void fillStat64(const struct stat& hostSt, kernel_stat64_arm32& st32) {
+    std::memset(&st32, 0, sizeof(st32));
+    st32.dev_val = hostSt.st_dev;
+    st32.ino_32 = static_cast<uint32_t>(hostSt.st_ino);
+    st32.mode_val = hostSt.st_mode;
+    st32.nlink_val = hostSt.st_nlink;
+    st32.uid_val = hostSt.st_uid;
+    st32.gid_val = hostSt.st_gid;
+    st32.rdev_val = hostSt.st_rdev;
+    st32.size_val = hostSt.st_size;
+    st32.blksize_val = static_cast<uint32_t>(hostSt.st_blksize);
+    st32.blocks_val = hostSt.st_blocks;
+    st32.atime_sec = static_cast<uint32_t>(hostSt.st_atime);
+    st32.mtime_sec = static_cast<uint32_t>(hostSt.st_mtime);
+    st32.ctime_sec = static_cast<uint32_t>(hostSt.st_ctime);
+    st32.ino_64 = hostSt.st_ino;
+}
 
 constexpr uint32_t ARM_NR_exit            = 1;
 constexpr uint32_t ARM_NR_read            = 3;
@@ -336,19 +354,7 @@ int32_t SyscallDispatcher::handleSyscall(
                 int ret = stat(resolved.c_str(), &hostSt);
                 if (ret == 0) {
                     kernel_stat64_arm32 st32{};
-                    st32.st_dev = hostSt.st_dev;
-                    st32.st_ino = hostSt.st_ino;
-                    st32.st_mode = hostSt.st_mode;
-                    st32.st_nlink = hostSt.st_nlink;
-                    st32.st_uid = hostSt.st_uid;
-                    st32.st_gid = hostSt.st_gid;
-                    st32.st_rdev = hostSt.st_rdev;
-                    st32.st_size = hostSt.st_size;
-                    st32.st_blksize = static_cast<uint32_t>(hostSt.st_blksize);
-                    st32.st_blocks = hostSt.st_blocks;
-                    st32.a_time = static_cast<uint32_t>(hostSt.st_atime);
-                    st32.m_time = static_cast<uint32_t>(hostSt.st_mtime);
-                    st32.c_time = static_cast<uint32_t>(hostSt.st_ctime);
+                    fillStat64(hostSt, st32);
                     uc_mem_write(uc, statBufAddr, &st32, sizeof(st32));
                     return 0;
                 }
@@ -366,19 +372,7 @@ int32_t SyscallDispatcher::handleSyscall(
             int ret = fstat(fd, &hostSt);
             if (ret == 0 && uc) {
                 kernel_stat64_arm32 st32{};
-                st32.st_dev = hostSt.st_dev;
-                st32.st_ino = hostSt.st_ino;
-                st32.st_mode = hostSt.st_mode;
-                st32.st_nlink = hostSt.st_nlink;
-                st32.st_uid = hostSt.st_uid;
-                st32.st_gid = hostSt.st_gid;
-                st32.st_rdev = hostSt.st_rdev;
-                st32.st_size = hostSt.st_size;
-                st32.st_blksize = static_cast<uint32_t>(hostSt.st_blksize);
-                st32.st_blocks = hostSt.st_blocks;
-                st32.a_time = static_cast<uint32_t>(hostSt.st_atime);
-                st32.m_time = static_cast<uint32_t>(hostSt.st_mtime);
-                st32.c_time = static_cast<uint32_t>(hostSt.st_ctime);
+                fillStat64(hostSt, st32);
                 uc_mem_write(uc, statBufAddr, &st32, sizeof(st32));
                 return 0;
             }
@@ -397,19 +391,7 @@ int32_t SyscallDispatcher::handleSyscall(
                 int ret = stat(resolved.c_str(), &hostSt);
                 if (ret == 0) {
                     kernel_stat64_arm32 st32{};
-                    st32.st_dev = hostSt.st_dev;
-                    st32.st_ino = hostSt.st_ino;
-                    st32.st_mode = hostSt.st_mode;
-                    st32.st_nlink = hostSt.st_nlink;
-                    st32.st_uid = hostSt.st_uid;
-                    st32.st_gid = hostSt.st_gid;
-                    st32.st_rdev = hostSt.st_rdev;
-                    st32.st_size = hostSt.st_size;
-                    st32.st_blksize = static_cast<uint32_t>(hostSt.st_blksize);
-                    st32.st_blocks = hostSt.st_blocks;
-                    st32.a_time = static_cast<uint32_t>(hostSt.st_atime);
-                    st32.m_time = static_cast<uint32_t>(hostSt.st_mtime);
-                    st32.c_time = static_cast<uint32_t>(hostSt.st_ctime);
+                    fillStat64(hostSt, st32);
                     uc_mem_write(uc, statBufAddr, &st32, sizeof(st32));
                     return 0;
                 }
