@@ -144,9 +144,9 @@ fun GameCoverSquareCard(game: EmuxRom, onClick: () -> Unit) {
             elevation = CardDefaults.cardElevation(defaultElevation = 4.dp)
         ) {
             Box(modifier = Modifier.fillMaxSize()) {
-                if (game.coverImage != null) {
+                if (game.coverUri != null) {
                     AsyncImage(
-                        model = game.coverImage,
+                        model = game.coverUri,
                         contentDescription = game.title,
                         modifier = Modifier.fillMaxSize(),
                         contentScale = ContentScale.Crop

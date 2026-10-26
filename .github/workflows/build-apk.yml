@@ -38,20 +38,9 @@ jobs:
         set -o pipefail
         ./gradlew assembleDebug --stacktrace --no-daemon 2>&1 | tee gradle_output.log || {
           echo "==================== BUILD FAILURE DETECTED ===================="
-          tail -n 250 gradle_output.log > failure_summary.txt
+          tail -n 120 gradle_output.log
           exit 1
         }
-
-    - name: Publish Failure Diagnosis to Release
-      if: failure() && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')
-      uses: softprops/action-gh-release@v2
-      with:
-        tag_name: latest
-        name: Emux32 Build Diagnosis
-        body_path: failure_summary.txt
-        prerelease: true
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
     - name: Prepare Named APK
       if: success()
