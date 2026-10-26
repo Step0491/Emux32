@@ -1,6 +1,8 @@
 package com.emux.translator.model
 
 import android.content.Context
+import android.content.pm.ActivityInfo
+import android.content.pm.PackageManager
 import android.graphics.Bitmap
 import android.graphics.Canvas
 import android.graphics.drawable.BitmapDrawable
@@ -16,7 +18,8 @@ data class EmuxRom(
     val apkFile: File,
     val obbFile: File? = null,
     val packageName: String? = null,
-    val hasObb: Boolean = false
+    val hasObb: Boolean = false,
+    val preferredOrientation: Int = ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
 )
 
 /**
@@ -46,7 +49,7 @@ fun scanEmuxStorage(context: Context, apkDir: File, obbDir: File): List<EmuxRom>
         val baseName = apkFile.nameWithoutExtension
         val title = baseName.replace("_", " ")
 
-        val (pkgName, rawIconFile) = extractApkMetadata(context, apkFile)
+        val (pkgName, rawIconFile, orientation) = extractApkMetadata(context, apkFile)
 
         // Cerca eventuale OBB associato in Emux/obb/ o Emux/obb/<packageName>/
         var matchedObbFile: File? = null
@@ -90,7 +93,7 @@ fun scanEmuxStorage(context: Context, apkDir: File, obbDir: File): List<EmuxRom>
             sourceCoverFile = rawIconFile
         }
 
-        // Esegue l'upscaling rapido offline e salva il risultato permanente
+        // Esegue l'upscaling rapido 4x offline e salva il risultato permanente
         val finalCoverUri: Uri? = if (sourceCoverFile != null && sourceCoverFile.exists()) {
             val upscaledTarget = File(upscaledCoversDir, "${baseName}_upscaled.png")
             val readyCover = ImageUpscaler.getOrUpscaleImage(sourceCoverFile, upscaledTarget, 512)
@@ -106,7 +109,8 @@ fun scanEmuxStorage(context: Context, apkDir: File, obbDir: File): List<EmuxRom>
                 apkFile = apkFile,
                 obbFile = matchedObbFile,
                 packageName = pkgName,
-                hasObb = (matchedObbFile != null)
+                hasObb = (matchedObbFile != null),
+                preferredOrientation = orientation
             )
         )
     }
@@ -115,9 +119,9 @@ fun scanEmuxStorage(context: Context, apkDir: File, obbDir: File): List<EmuxRom>
 }
 
 /**
- * Estrae l'icona originaria e il package name dall'APK senza sovrascrivere se esiste già
+ * Estrae l'icona, il package name e l'orientamento nativo del gioco dall'APK
  */
-private fun extractApkMetadata(context: Context, apkFile: File): Pair<String?, File?> {
+private fun extractApkMetadata(context: Context, apkFile: File): Triple<String?, File?, Int> {
     try {
         val iconsDir = File(context.cacheDir, "extracted_icons")
         if (!iconsDir.exists()) iconsDir.mkdirs()
@@ -126,11 +130,26 @@ private fun extractApkMetadata(context: Context, apkFile: File): Pair<String?, F
         val iconFile = File(iconsDir, "$safeName.png")
 
         val pm = context.packageManager
-        val pkgInfo = pm.getPackageArchiveInfo(apkFile.absolutePath, 0)
+        val pkgInfo = pm.getPackageArchiveInfo(apkFile.absolutePath, PackageManager.GET_ACTIVITIES)
         val packageName = pkgInfo?.packageName
 
+        var gameOrientation = ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
+        if (pkgInfo?.activities != null && pkgInfo.activities.isNotEmpty()) {
+            val mainAct = pkgInfo.activities.firstOrNull { it.screenOrientation != ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED }
+                ?: pkgInfo.activities.first()
+            gameOrientation = when (mainAct.screenOrientation) {
+                ActivityInfo.SCREEN_ORIENTATION_PORTRAIT,
+                ActivityInfo.SCREEN_ORIENTATION_SENSOR_PORTRAIT,
+                ActivityInfo.SCREEN_ORIENTATION_USER_PORTRAIT -> ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
+                ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE,
+                ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE,
+                ActivityInfo.SCREEN_ORIENTATION_USER_LANDSCAPE -> ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
+                else -> ActivityInfo.SCREEN_ORIENTATION_SENSOR
+            }
+        }
+
         if (iconFile.exists() && iconFile.length() > 0) {
-            return Pair(packageName, iconFile)
+            return Triple(packageName, iconFile, gameOrientation)
         }
 
         if (pkgInfo != null) {
@@ -142,12 +161,12 @@ private fun extractApkMetadata(context: Context, apkFile: File): Pair<String?, F
             FileOutputStream(iconFile).use { out ->
                 bitmap.compress(Bitmap.CompressFormat.PNG, 95, out)
             }
-            return Pair(packageName, iconFile)
+            return Triple(packageName, iconFile, gameOrientation)
         }
     } catch (e: Exception) {
         e.printStackTrace()
     }
-    return Pair(null, null)
+    return Triple(null, null, ActivityInfo.SCREEN_ORIENTATION_SENSOR)
 }
 
 private fun drawableToBitmap(drawable: Drawable): Bitmap {

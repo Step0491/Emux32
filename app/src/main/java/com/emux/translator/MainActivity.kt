@@ -49,13 +49,11 @@ class MainActivity : ComponentActivity() {
     private val permissionLauncher = registerForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions()
     ) {
-        // Permessi acquisiti
     }
 
     private val manageStorageLauncher = registerForActivityResult(
         ActivityResultContracts.StartActivityForResult()
     ) {
-        // Risultato gestione archiviazione
     }
 
     private val chooseFolderLauncher = registerForActivityResult(
@@ -66,7 +64,6 @@ class MainActivity : ComponentActivity() {
                 uri,
                 Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION
             )
-            // Selezionato percorso personalizzato
             handleCustomTreeUri(uri)
         }
     }
@@ -100,7 +97,6 @@ class MainActivity : ComponentActivity() {
                         val apkDir = File(base, "apk")
                         val obbDir = File(base, "obb")
 
-                        // Verifica esistenza e crea SOLO ciò che manca, senza cancellare o sovrascrivere nulla
                         ensureDirectoryTreeSafe(base)
 
                         val scanned = scanEmuxStorage(this@MainActivity, apkDir, obbDir)
@@ -113,7 +109,6 @@ class MainActivity : ComponentActivity() {
 
                 LaunchedEffect(Unit) {
                     requestPermissionsIfNeeded()
-                    // Mostra dialogo iniziale solo se non è mai stato confermato o scelto un percorso
                     val setupDone = prefs.getBoolean("emux_setup_completed", false)
                     if (!setupDone) {
                         showSetupDialog = true
@@ -122,9 +117,10 @@ class MainActivity : ComponentActivity() {
                     }
                 }
 
+                // Orientamento adattivo dinamico in base al titolo giocato
                 LaunchedEffect(activeGame) {
                     if (activeGame != null) {
-                        requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_SENSOR
+                        requestedOrientation = activeGame!!.preferredOrientation
                     } else {
                         requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
                     }
@@ -215,10 +211,6 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    /**
-     * Controlla se la cartella Emux e le sottocartelle apk e obb esistono già.
-     * Se non esistono le crea. Non cancella né sovrascrive mai nulla.
-     */
     private fun ensureDirectoryTreeSafe(emuxDir: File) {
         try {
             if (!emuxDir.exists()) {

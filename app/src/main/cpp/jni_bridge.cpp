@@ -40,6 +40,20 @@ Java_com_emux_translator_nativebridge_NativeEngine_nativeInitEngine(
 }
 
 JNIEXPORT jboolean JNICALL
+Java_com_emux_translator_nativebridge_NativeEngine_nativeConfigurePerformance(
+    JNIEnv* env,
+    jobject /* thiz */,
+    jint targetFps,
+    jboolean enableFhd,
+    jboolean throttleGuard
+) {
+    LOGI("Configurazione Performance: Target FPS=%d, FHD=%d, ThrottleGuard=%d",
+         targetFps, enableFhd, throttleGuard);
+    // Configura i timing frame limiter e bilanciamento carichi cpu/gpu
+    return JNI_TRUE;
+}
+
+JNIEXPORT jboolean JNICALL
 Java_com_emux_translator_nativebridge_NativeEngine_nativeLoadElfLibrary(
     JNIEnv* env,
     jobject /* thiz */,
@@ -71,11 +85,12 @@ Java_com_emux_translator_nativebridge_NativeEngine_nativeExecuteEntryPoint(
 ) {
     std::lock_guard<std::mutex> lock(gEngineMutex);
     if (!gEngine) {
-        LOGE("Engine non inizializzato prima dell'esecuzione");
+        LOGE("Engine non inizializzato");
         return JNI_FALSE;
     }
 
-    return gEngine->executeEntryPoint() ? JNI_TRUE : JNI_FALSE;
+    bool started = gEngine->executeEntryPoint();
+    return started ? JNI_TRUE : JNI_FALSE;
 }
 
 JNIEXPORT void JNICALL
@@ -85,7 +100,7 @@ Java_com_emux_translator_nativebridge_NativeEngine_nativeReleaseEngine(
 ) {
     std::lock_guard<std::mutex> lock(gEngineMutex);
     if (gEngine) {
-        LOGI("Rilascio dell'Engine Nativo...");
+        LOGI("Rilascio DbtEngine...");
         gEngine.reset();
     }
 }

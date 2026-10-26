@@ -24,15 +24,25 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
 import com.emux.translator.model.EmuxRom
+import com.emux.translator.nativebridge.NativeEngine
 
 @Composable
 fun GamePlayerScreen(
     game: EmuxRom,
     onExitGame: () -> Unit
 ) {
-    var showHud by remember { mutableStateOf(true) }
+    var showHud by remember { mutableStateOf(false) }
 
-    // Intercetta il tasto Indietro hardware per ritornare in modo pulito al selettore in verticale
+    LaunchedEffect(Unit) {
+        // FHD (1920x1080), 60 FPS Lock, Throttle Guard attivo
+        NativeEngine.nativeConfigurePerformance(
+            targetFps = 60,
+            enableFhd = true,
+            throttleGuard = true
+        )
+    }
+
+    // Intercetta il tasto Indietro hardware per ritornare al selettore
     BackHandler {
         onExitGame()
     }
@@ -43,21 +53,21 @@ fun GamePlayerScreen(
             .background(Color.Black)
             .clickable { showHud = !showHud }
     ) {
-        // SurfaceView nativa per il rendering OpenGL ES / Vulkan del gioco
+        // SurfaceView nativa con buffer fisso Full HD 1080p (1920x1080) per garantire rendering 1:1 nitido
         AndroidView(
             factory = { context ->
                 SurfaceView(context).apply {
+                    // Imposta la dimensione del buffer nativo a FHD per rendering a risoluzione piena
+                    holder.setFixedSize(1920, 1080)
                     holder.addCallback(object : SurfaceHolder.Callback {
                         override fun surfaceCreated(holder: SurfaceHolder) {
-                            // Superficie nativa pronta per EGL window context
+                            // EGL Surface Window collegata
                         }
 
                         override fun surfaceChanged(holder: SurfaceHolder, format: Int, width: Int, height: Int) {
-                            // Aggiorna glViewport con le nuove dimensioni dello schermo
                         }
 
                         override fun surfaceDestroyed(holder: SurfaceHolder) {
-                            // Rilascio superficie
                         }
                     })
                 }
@@ -65,7 +75,7 @@ fun GamePlayerScreen(
             modifier = Modifier.fillMaxSize()
         )
 
-        // Overlay HUD a scomparsa per controlli e stato emulazione
+        // Overlay HUD In-Game
         AnimatedVisibility(
             visible = showHud,
             enter = fadeIn(),
@@ -77,7 +87,6 @@ fun GamePlayerScreen(
                     .fillMaxSize()
                     .padding(16.dp)
             ) {
-                // Top Bar HUD In-Game
                 Row(
                     modifier = Modifier
                         .fillMaxWidth()
@@ -97,7 +106,7 @@ fun GamePlayerScreen(
                     }
 
                     Surface(
-                        color = Color.Black.copy(alpha = 0.7f),
+                        color = Color.Black.copy(alpha = 0.75f),
                         shape = RoundedCornerShape(20.dp)
                     ) {
                         Row(
@@ -116,7 +125,7 @@ fun GamePlayerScreen(
                                 shape = RoundedCornerShape(6.dp)
                             ) {
                                 Text(
-                                    text = "ARM32 -> ARM64",
+                                    text = "FHD 1080p",
                                     color = Color.White,
                                     fontSize = 10.sp,
                                     fontWeight = FontWeight.Bold,

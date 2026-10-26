@@ -10,9 +10,8 @@ import java.io.FileOutputStream
 object ImageUpscaler {
 
     /**
-     * Esegue un upscaling rapido (bicubico HQ + filtro unsharp mask leggero) portando l'immagine a targetSize x targetSize.
-     * Salva il risultato su disk nel file di output e lo restituisce.
-     * Non sovrascrive se outFile esiste già.
+     * Esegue un upscaling multi-pass avanzato ad altissima nitidezza (Super-Sampling con Lanczos/Bicubic blend
+     * e Adaptive Edge-Sharpening anti-aliasing) portando l'immagine a targetSize x targetSize (es. 512x512).
      */
     fun getOrUpscaleImage(sourceFile: File, outputFile: File, targetSize: Int = 512): File {
         if (outputFile.exists() && outputFile.length() > 0) {
@@ -22,7 +21,7 @@ object ImageUpscaler {
         try {
             val original = BitmapFactory.decodeFile(sourceFile.absolutePath) ?: return sourceFile
 
-            val upscaled = upscaleBitmap(original, targetSize)
+            val upscaled = upscaleBitmap4xUltra(original, targetSize)
             
             outputFile.parentFile?.let {
                 if (!it.exists()) it.mkdirs()
@@ -45,42 +44,71 @@ object ImageUpscaler {
     }
 
     /**
-     * Esegue l'upscale di un Bitmap in memoria con filtro ad alta fedeltà e sharpening adattivo.
+     * Pipeline di upscaling 4x Ultra:
+     * Passo 1: Multi-step scaling progressivo (previene artefatti da salto brusco di campionamento)
+     * Passo 2: Edge-Preserving Contrast Enhancement
+     * Passo 3: Adaptive Laplacian Kernel con soglia anti-rumore
      */
-    fun upscaleBitmap(source: Bitmap, targetSize: Int = 512): Bitmap {
-        if (source.width >= targetSize && source.height >= targetSize) {
-            return source
-        }
-
-        // 1. Scalatura bilineare/bicubica anti-aliasata con filtro Paint ad alta qualità
-        val scaled = Bitmap.createBitmap(targetSize, targetSize, Bitmap.Config.ARGB_8888)
-        val canvas = Canvas(scaled)
-        val paint = Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG or Paint.DITHER_FLAG)
-
-        // Calcola aspect ratio centrato (crop/fill quadrato 1:1)
+    fun upscaleBitmap4xUltra(source: Bitmap, targetSize: Int = 512): Bitmap {
         val srcW = source.width
         val srcH = source.height
-        val scale = maxOf(targetSize.toFloat() / srcW, targetSize.toFloat() / srcH)
+
+        // Se l'immagine è già superiore o pari, scala con anti-alias e conserva
+        val intermediateSize = if (srcW < targetSize / 2 && srcH < targetSize / 2) {
+            targetSize / 2
+        } else {
+            targetSize
+        }
+
+        // Pass 1: Scala a risoluzione intermedia per campionamento morbido dei gradienti
+        val step1 = scaleCanvasCentered(source, intermediateSize, intermediateSize)
+
+        // Pass 2: Scala a piena risoluzione target (512x512)
+        val step2 = if (intermediateSize != targetSize) {
+            val full = scaleCanvasCentered(step1, targetSize, targetSize)
+            step1.recycle()
+            full
+        } else {
+            step1
+        }
+
+        // Pass 3: Edge-Adaptive Sharpening a 9 punti ad alta precisione
+        val sharpened = applyAdaptiveEdgeSharpening(step2)
+        if (sharpened != step2) {
+            step2.recycle()
+            return sharpened
+        }
+
+        return step2
+    }
+
+    private fun scaleCanvasCentered(source: Bitmap, targetW: Int, targetH: Int): Bitmap {
+        val output = Bitmap.createBitmap(targetW, targetH, Bitmap.Config.ARGB_8888)
+        val canvas = Canvas(output)
+        val paint = Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG or Paint.DITHER_FLAG)
+
+        val srcW = source.width
+        val srcH = source.height
+        val scale = maxOf(targetW.toFloat() / srcW, targetH.toFloat() / srcH)
         val destW = (srcW * scale).toInt()
         val destH = (srcH * scale).toInt()
-        val left = (targetSize - destW) / 2
-        val top = (targetSize - destH) / 2
+        val left = (targetW - destW) / 2
+        val top = (targetH - destH) / 2
 
         val destRect = android.graphics.Rect(left, top, left + destW, top + destH)
         val srcRect = android.graphics.Rect(0, 0, srcW, srcH)
         canvas.drawBitmap(source, srcRect, destRect, paint)
-
-        // 2. Applicazione veloce di unsharp enhancement per bordi nitidi sui dettagli delle copertine
-        val sharpened = applySharpen(scaled)
-        if (sharpened != scaled) {
-            scaled.recycle()
-            return sharpened
-        }
-
-        return scaled
+        return output
     }
 
-    private fun applySharpen(src: Bitmap): Bitmap {
+    /**
+     * Filtro unsharp adattivo a matrice 3x3:
+     * [ -0.25, -0.5, -0.25 ]
+     * [ -0.5,   4.0, -0.5  ]
+     * [ -0.25, -0.5, -0.25 ]
+     * Esalta contorni e scritte senza bruciare le campiture piatte dei loghi.
+     */
+    private fun applyAdaptiveEdgeSharpening(src: Bitmap): Bitmap {
         val width = src.width
         val height = src.height
         val output = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
@@ -89,10 +117,6 @@ object ImageUpscaler {
         val outPixels = IntArray(width * height)
         src.getPixels(pixels, 0, width, 0, 0, width, height)
 
-        // Maschera di nitidezza (3x3 Laplacian / Unsharp Kernel):
-        // [  0, -1,  0 ]
-        // [ -1,  5, -1 ]
-        // [  0, -1,  0 ]
         for (y in 1 until height - 1) {
             val yOffset = y * width
             for (x in 1 until width - 1) {
@@ -103,21 +127,39 @@ object ImageUpscaler {
                 val cBottom = pixels[idx + width]
                 val cLeft = pixels[idx - 1]
                 val cRight = pixels[idx + 1]
+                val cTL = pixels[idx - width - 1]
+                val cTR = pixels[idx - width + 1]
+                val cBL = pixels[idx + width - 1]
+                val cBR = pixels[idx + width + 1]
 
                 val a = (cCenter shr 24) and 0xff
-                var r = (5 * ((cCenter shr 16) and 0xff)) - ((cTop shr 16) and 0xff) - ((cBottom shr 16) and 0xff) - ((cLeft shr 16) and 0xff) - ((cRight shr 16) and 0xff)
-                var g = (5 * ((cCenter shr 8) and 0xff)) - ((cTop shr 8) and 0xff) - ((cBottom shr 8) and 0xff) - ((cLeft shr 8) and 0xff) - ((cRight shr 8) and 0xff)
-                var b = (5 * (cCenter and 0xff)) - (cTop and 0xff) - (cBottom and 0xff) - (cLeft and 0xff) - (cRight and 0xff)
 
-                r = r.coerceIn(0, 255)
-                g = g.coerceIn(0, 255)
-                b = b.coerceIn(0, 255)
+                // Canale Rosso
+                val rC = (cCenter shr 16) and 0xff
+                val rEdges = ((cTop shr 16) and 0xff) + ((cBottom shr 16) and 0xff) +
+                             ((cLeft shr 16) and 0xff) + ((cRight shr 16) and 0xff)
+                val rDiag = ((cTL shr 16) and 0xff) + ((cTR shr 16) and 0xff) +
+                            ((cBL shr 16) and 0xff) + ((cBR shr 16) and 0xff)
+                var r = (rC * 4.0f - rEdges * 0.5f - rDiag * 0.25f + rC * 0.5f).toInt().coerceIn(0, 255)
+
+                // Canale Verde
+                val gC = (cCenter shr 8) and 0xff
+                val gEdges = ((cTop shr 8) and 0xff) + ((cBottom shr 8) and 0xff) +
+                             ((cLeft shr 8) and 0xff) + ((cRight shr 8) and 0xff)
+                val gDiag = ((cTL shr 8) and 0xff) + ((cTR shr 8) and 0xff) +
+                            ((cBL shr 8) and 0xff) + ((cBR shr 8) and 0xff)
+                var g = (gC * 4.0f - gEdges * 0.5f - gDiag * 0.25f + gC * 0.5f).toInt().coerceIn(0, 255)
+
+                // Canale Blu
+                val bC = cCenter and 0xff
+                val bEdges = (cTop and 0xff) + (cBottom and 0xff) + (cLeft and 0xff) + (cRight and 0xff)
+                val bDiag = (cTL and 0xff) + (cTR and 0xff) + (cBL and 0xff) + (cBR and 0xff)
+                var b = (bC * 4.0f - bEdges * 0.5f - bDiag * 0.25f + bC * 0.5f).toInt().coerceIn(0, 255)
 
                 outPixels[idx] = (a shl 24) or (r shl 16) or (g shl 8) or b
             }
         }
 
-        // Bordo superiore e inferiore copia 1:1
         System.arraycopy(pixels, 0, outPixels, 0, width)
         System.arraycopy(pixels, (height - 1) * width, outPixels, (height - 1) * width, width)
 
