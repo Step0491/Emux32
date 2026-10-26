@@ -5,32 +5,17 @@ project("emux_engine")
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-# Scaricamento automatico FetchContent di Boost Headers (header-only, senza installazioni esterne)
-include(FetchContent)
+# Configura Boost Header-Only locale incorporato (nessun download esterno runtime)
+set(BOOST_MINI_DIR "${CMAKE_CURRENT_SOURCE_DIR}/externals/dynarmic/externals/boost_mini")
 
-message(STATUS "Download degli header Boost C++ per Dynarmic...")
-FetchContent_Declare(
-    boost_headers
-    URL https://github.com/boostorg/boost/releases/download/boost-1.83.0/boost-1.83.0.tar.gz
-    DOWNLOAD_EXTRACT_TIMESTAMP TRUE
-)
-
-# Scarica ed estrae se non presente
-FetchContent_GetProperties(boost_headers)
-if(NOT boost_headers_POPULATED)
-    FetchContent_Populate(boost_headers)
-endif()
-
-# Crea il target Boost::boost riconosciuto nativamente da Dynarmic
 if(NOT TARGET Boost::boost)
     add_library(Boost::boost INTERFACE IMPORTED)
     set_target_properties(Boost::boost PROPERTIES
-        INTERFACE_INCLUDE_DIRECTORIES "${boost_headers_SOURCE_DIR}"
+        INTERFACE_INCLUDE_DIRECTORIES "${BOOST_MINI_DIR}"
     )
 endif()
 
-# Segnala a CMake che Boost è soddisfatto
-set(Boost_FOUND TRUE CACHE BOOL "Boost trovato tramite FetchContent" FORCE)
+set(Boost_FOUND TRUE CACHE BOOL "Boost disponibile localmente" FORCE)
 
 # Opzioni per Dynarmic JIT
 set(DYNARMIC_FRONTENDS "A32" CACHE STRING "Abilita solo frontend ARM32" FORCE)
@@ -60,7 +45,7 @@ target_include_directories(
     ${CMAKE_CURRENT_SOURCE_DIR}/externals/dynarmic/src
     ${CMAKE_CURRENT_SOURCE_DIR}/externals/dynarmic/externals/mcl/include
     ${CMAKE_CURRENT_SOURCE_DIR}/externals/dynarmic/externals/fmt/include
-    ${boost_headers_SOURCE_DIR}
+    ${BOOST_MINI_DIR}
 )
 
 find_library(log-lib log)
