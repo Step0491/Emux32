@@ -6,6 +6,11 @@
 #include <vector>
 #include <atomic>
 #include <chrono>
+#include <array>
+#include <optional>
+
+#include "dynarmic/interface/A32/a32.h"
+#include "dynarmic/interface/A32/config.h"
 
 namespace emux {
 
@@ -39,7 +44,6 @@ struct PerformanceGovernor {
         auto elapsedNs = std::chrono::duration_cast<std::chrono::nanoseconds>(now - frameStart).count();
         if (elapsedNs < frameTimeTargetNs) {
             auto sleepNs = frameTimeTargetNs - elapsedNs;
-            // Sleep leggero o yield per abbassare il clock CPU e prevenire riscaldamento
             struct timespec req;
             req.tv_sec = sleepNs / 1000000000ULL;
             req.tv_nsec = sleepNs % 1000000000ULL;
@@ -48,28 +52,7 @@ struct PerformanceGovernor {
     }
 };
 
-/**
- * Interfaccia Memory Callbacks per Dynarmic JIT
- */
-class DynarmicUserCallbacks {
-public:
-    virtual ~DynarmicUserCallbacks() = default;
-    virtual uint8_t MemoryRead8(uint32_t vaddr) = 0;
-    virtual uint16_t MemoryRead16(uint32_t vaddr) = 0;
-    virtual uint32_t MemoryRead32(uint32_t vaddr) = 0;
-    virtual uint64_t MemoryRead64(uint32_t vaddr) = 0;
-
-    virtual void MemoryWrite8(uint32_t vaddr, uint8_t value) = 0;
-    virtual void MemoryWrite16(uint32_t vaddr, uint16_t value) = 0;
-    virtual void MemoryWrite32(uint32_t vaddr, uint32_t value) = 0;
-    virtual void MemoryWrite64(uint32_t vaddr, uint64_t value) = 0;
-
-    virtual void InterpreterFallback(uint32_t pc, size_t num_instructions) = 0;
-    virtual void CallSVC(uint32_t swi) = 0;
-    virtual void ExceptionRaised(uint32_t pc, uint32_t exception) = 0;
-};
-
-class DbtEngine : public DynarmicUserCallbacks {
+class DbtEngine final : public Dynarmic::A32::UserCallbacks {
 public:
     DbtEngine();
     ~DbtEngine() override;
@@ -82,20 +65,23 @@ public:
     // Invoca una funzione nativa all'indirizzo target (es. JNI_OnLoad) con argomenti passati in r0, r1
     uint32_t callFunction(uint32_t functionAddress, uint32_t arg0 = 0, uint32_t arg1 = 0);
 
-    // Dynarmic Memory Callbacks con supporto Fastmem diretto
-    uint8_t MemoryRead8(uint32_t vaddr) override;
-    uint16_t MemoryRead16(uint32_t vaddr) override;
-    uint32_t MemoryRead32(uint32_t vaddr) override;
-    uint64_t MemoryRead64(uint32_t vaddr) override;
+    // Callbacks richiesti da Dynarmic UserCallbacks
+    std::uint8_t MemoryRead8(Dynarmic::A32::VAddr vaddr) override;
+    std::uint16_t MemoryRead16(Dynarmic::A32::VAddr vaddr) override;
+    std::uint32_t MemoryRead32(Dynarmic::A32::VAddr vaddr) override;
+    std::uint64_t MemoryRead64(Dynarmic::A32::VAddr vaddr) override;
 
-    void MemoryWrite8(uint32_t vaddr, uint8_t value) override;
-    void MemoryWrite16(uint32_t vaddr, uint16_t value) override;
-    void MemoryWrite32(uint32_t vaddr, uint32_t value) override;
-    void MemoryWrite64(uint32_t vaddr, uint64_t value) override;
+    void MemoryWrite8(Dynarmic::A32::VAddr vaddr, std::uint8_t value) override;
+    void MemoryWrite16(Dynarmic::A32::VAddr vaddr, std::uint16_t value) override;
+    void MemoryWrite32(Dynarmic::A32::VAddr vaddr, std::uint32_t value) override;
+    void MemoryWrite64(Dynarmic::A32::VAddr vaddr, std::uint64_t value) override;
 
-    void InterpreterFallback(uint32_t pc, size_t num_instructions) override;
-    void CallSVC(uint32_t swi) override;
-    void ExceptionRaised(uint32_t pc, uint32_t exception) override;
+    void InterpreterFallback(Dynarmic::A32::VAddr pc, size_t num_instructions) override;
+    void CallSVC(std::uint32_t swi) override;
+    void ExceptionRaised(Dynarmic::A32::VAddr pc, Dynarmic::A32::Exception exception) override;
+
+    void AddTicks(std::uint64_t ticks) override;
+    std::uint64_t GetTicksRemaining() override;
 
     uintptr_t getGuestBaseAddress() const { return guestRamBase_; }
     Arm32CpuState& getCpuState() { return cpuState_; }
@@ -114,6 +100,9 @@ private:
     Elf32Loader loader_;
     std::shared_ptr<LoadedLibrary> currentLib_;
     PerformanceGovernor governor_;
+
+    std::uint64_t ticksRemaining_{1000000};
+    std::unique_ptr<Dynarmic::A32::Jit> jit_;
     bool isRunning_{false};
 };
 

@@ -24,6 +24,10 @@ DbtEngine::DbtEngine() {
 
 DbtEngine::~DbtEngine() {
     governor_.isRunning.store(false);
+    if (jit_) {
+        jit_->HaltExecution();
+        jit_.reset();
+    }
     if (guestRamBase_ != 0 && guestRamSize_ > 0) {
         munmap(reinterpret_cast<void*>(guestRamBase_), guestRamSize_);
         guestRamBase_ = 0;
@@ -40,7 +44,7 @@ void DbtEngine::configurePerformance(uint32_t targetFps, bool enableFhd, bool th
 bool DbtEngine::initialize(size_t guestRamSize) {
     guestRamSize_ = guestRamSize;
 
-    // Fastmem mapping ad alta velocità (zero overhead di conversione puntatori se 32-bit offset)
+    // Fastmem mapping virtuale
     void* mapped = mmap(
         nullptr,
         guestRamSize_,
@@ -61,6 +65,25 @@ bool DbtEngine::initialize(size_t guestRamSize) {
 
     setupGuestStack();
     resetRegisters();
+
+    // Configurazione e creazione istanza Dynarmic JIT
+    Dynarmic::A32::UserConfig config;
+    config.callbacks = this;
+    config.arch_version = Dynarmic::A32::ArchVersion::v8; // ARMv8-A32 mode compatibile ARMv7
+    config.optimizations = Dynarmic::all_safe_optimizations;
+    config.unsafe_optimizations = false;
+
+    try {
+        jit_ = std::make_unique<Dynarmic::A32::Jit>(config);
+        LOGI("Dynarmic A32 JIT Recompiler istanziato con successo!");
+    } catch (const std::exception& ex) {
+        LOGE("Errore istanziazione Dynarmic JIT: %s", ex.what());
+        return false;
+    } catch (...) {
+        LOGE("Errore sconosciuto istanziazione Dynarmic JIT");
+        return false;
+    }
+
     return true;
 }
 
@@ -75,7 +98,7 @@ void DbtEngine::setupGuestStack() {
 void DbtEngine::resetRegisters() {
     std::memset(&cpuState_, 0, sizeof(cpuState_));
     cpuState_.r[13] = guestStackPointer_;
-    cpuState_.cpsr = 0x00000010; // Modalità User ARMv7
+    cpuState_.cpsr = 0x00000010; // User mode ARMv7
 }
 
 bool DbtEngine::loadLibrary(const std::string& libraryPath) {
@@ -91,119 +114,149 @@ bool DbtEngine::loadLibrary(const std::string& libraryPath) {
 }
 
 bool DbtEngine::executeEntryPoint() {
-    if (!currentLib_) {
-        LOGE("Nessuna libreria caricata da eseguire");
+    if (!currentLib_ || !jit_) {
+        LOGE("Libreria o JIT non inizializzati per l'avvio");
         return false;
     }
 
     if (currentLib_->entry_point == 0) {
-        LOGW("Libreria senza Entry Point esplicito (libreria JNI .so)");
+        LOGW("Libreria JNI senza ELF Entry Point diretto (.so dinamica)");
         return true;
     }
 
-    LOGI("Avvio esecuzione Dynarmic JIT da Entry Point 0x%08x...", currentLib_->entry_point);
-    cpuState_.r[15] = currentLib_->entry_point;
+    LOGI("Avvio ricompilazione Dynarmic JIT da Entry Point 0x%08x...", currentLib_->entry_point);
+    jit_->Regs()[15] = currentLib_->entry_point;
+    jit_->Regs()[13] = guestStackPointer_;
+    jit_->SetCpsr(0x00000010);
+
+    ticksRemaining_ = 1000000;
     governor_.isRunning.store(true);
+
+    auto frameStart = std::chrono::steady_clock::now();
+    jit_->Run();
+    governor_.syncFrame(frameStart);
 
     return true;
 }
 
 uint32_t DbtEngine::callFunction(uint32_t functionAddress, uint32_t arg0, uint32_t arg1) {
-    LOGI("Invocazione funzione guest ARM32 all'indirizzo 0x%08x con r0=0x%x, r1=0x%x",
-         functionAddress, arg0, arg1);
+    if (!jit_) {
+        LOGE("Dynarmic JIT non pronto per callFunction");
+        return 0;
+    }
+
+    LOGI("Dynarmic JIT invoke func 0x%08x (arg0=0x%x, arg1=0x%x)", functionAddress, arg0, arg1);
 
     auto frameStart = std::chrono::steady_clock::now();
 
-    cpuState_.r[0] = arg0;
-    cpuState_.r[1] = arg1;
-    cpuState_.r[14] = 0xDEADBEEF;
-    cpuState_.r[15] = functionAddress;
+    jit_->Regs()[0] = arg0;
+    jit_->Regs()[1] = arg1;
+    jit_->Regs()[14] = 0xDEADBEEF; // Return address trap
+    jit_->Regs()[15] = functionAddress;
+    jit_->Regs()[13] = guestStackPointer_;
+    jit_->SetCpsr(0x00000010);
 
-    // Regola i cicli di clock con il governor termico per evitare thermal throttling
+    ticksRemaining_ = 5000000;
+    jit_->Run();
+
     governor_.syncFrame(frameStart);
 
-    return cpuState_.r[0];
+    uint32_t retVal = jit_->Regs()[0];
+    return retVal;
 }
 
 void* DbtEngine::getHostAddress(uint32_t guestAddr) const {
     if (guestAddr == 0) return nullptr;
-    // Se l'indirizzo rientra nella RAM guest
     if (guestAddr < guestRamSize_) {
         return reinterpret_cast<void*>(guestRamBase_ + guestAddr);
     }
-    // Segmento caricato da ELF
     if (currentLib_ && guestAddr >= currentLib_->base_address) {
         uint32_t offset = guestAddr - currentLib_->base_address;
-        if (offset < currentLib_->total_size) {
-            return reinterpret_cast<void*>(currentLib_->host_address + offset);
+        if (offset < currentLib_->total_memory_size) {
+            return reinterpret_cast<void*>(currentLib_->base_address + offset);
         }
     }
     return reinterpret_cast<void*>(guestRamBase_ + (guestAddr % guestRamSize_));
 }
 
-// Memory Callbacks ad altissima prestazione (Fast Inlined Pointer Lookup)
-uint8_t DbtEngine::MemoryRead8(uint32_t vaddr) {
+// Memory Callbacks per Dynarmic
+std::uint8_t DbtEngine::MemoryRead8(Dynarmic::A32::VAddr vaddr) {
     void* host = getHostAddress(vaddr);
     return host ? *reinterpret_cast<uint8_t*>(host) : 0;
 }
 
-uint16_t DbtEngine::MemoryRead16(uint32_t vaddr) {
+std::uint16_t DbtEngine::MemoryRead16(Dynarmic::A32::VAddr vaddr) {
     void* host = getHostAddress(vaddr);
     return host ? *reinterpret_cast<uint16_t*>(host) : 0;
 }
 
-uint32_t DbtEngine::MemoryRead32(uint32_t vaddr) {
+std::uint32_t DbtEngine::MemoryRead32(Dynarmic::A32::VAddr vaddr) {
     void* host = getHostAddress(vaddr);
     return host ? *reinterpret_cast<uint32_t*>(host) : 0;
 }
 
-uint64_t DbtEngine::MemoryRead64(uint32_t vaddr) {
+std::uint64_t DbtEngine::MemoryRead64(Dynarmic::A32::VAddr vaddr) {
     void* host = getHostAddress(vaddr);
     return host ? *reinterpret_cast<uint64_t*>(host) : 0;
 }
 
-void DbtEngine::MemoryWrite8(uint32_t vaddr, uint8_t value) {
+void DbtEngine::MemoryWrite8(Dynarmic::A32::VAddr vaddr, std::uint8_t value) {
     void* host = getHostAddress(vaddr);
     if (host) *reinterpret_cast<uint8_t*>(host) = value;
 }
 
-void DbtEngine::MemoryWrite16(uint32_t vaddr, uint16_t value) {
+void DbtEngine::MemoryWrite16(Dynarmic::A32::VAddr vaddr, std::uint16_t value) {
     void* host = getHostAddress(vaddr);
     if (host) *reinterpret_cast<uint16_t*>(host) = value;
 }
 
-void DbtEngine::MemoryWrite32(uint32_t vaddr, uint32_t value) {
+void DbtEngine::MemoryWrite32(Dynarmic::A32::VAddr vaddr, std::uint32_t value) {
     void* host = getHostAddress(vaddr);
     if (host) *reinterpret_cast<uint32_t*>(host) = value;
 }
 
-void DbtEngine::MemoryWrite64(uint32_t vaddr, uint64_t value) {
+void DbtEngine::MemoryWrite64(Dynarmic::A32::VAddr vaddr, std::uint64_t value) {
     void* host = getHostAddress(vaddr);
     if (host) *reinterpret_cast<uint64_t*>(host) = value;
 }
 
-void DbtEngine::InterpreterFallback(uint32_t pc, size_t num_instructions) {
-    LOGW("Fallback interprete per blocco PC 0x%08x (%zu istruzioni)", pc, num_instructions);
+void DbtEngine::InterpreterFallback(Dynarmic::A32::VAddr pc, size_t num_instructions) {
+    LOGW("Dynarmic fallback a PC 0x%08x (%zu istruzioni)", pc, num_instructions);
 }
 
-void DbtEngine::CallSVC(uint32_t swi) {
-    // Dispaccia la chiamata di sistema verso l'host ARM64 tramite SyscallDispatcher
-    uint32_t syscallNum = cpuState_.r[7];
+void DbtEngine::CallSVC(std::uint32_t swi) {
+    if (!jit_) return;
+    uint32_t syscallNum = jit_->Regs()[7];
     int32_t result = SyscallDispatcher::handleSyscall(
         syscallNum,
-        cpuState_.r[0],
-        cpuState_.r[1],
-        cpuState_.r[2],
-        cpuState_.r[3],
-        cpuState_.r[4],
-        cpuState_.r[5],
+        jit_->Regs()[0],
+        jit_->Regs()[1],
+        jit_->Regs()[2],
+        jit_->Regs()[3],
+        jit_->Regs()[4],
+        jit_->Regs()[5],
         guestRamBase_
     );
-    cpuState_.r[0] = static_cast<uint32_t>(result);
+    jit_->Regs()[0] = static_cast<uint32_t>(result);
 }
 
-void DbtEngine::ExceptionRaised(uint32_t pc, uint32_t exception) {
-    LOGE("Eccezione CPU sollevata a PC 0x%08x: codice %u", pc, exception);
+void DbtEngine::ExceptionRaised(Dynarmic::A32::VAddr pc, Dynarmic::A32::Exception exception) {
+    LOGE("Dynarmic Exception at PC 0x%08x: enum %d", pc, static_cast<int>(exception));
+}
+
+void DbtEngine::AddTicks(std::uint64_t ticks) {
+    if (ticksRemaining_ > ticks) {
+        ticksRemaining_ -= ticks;
+    } else {
+        ticksRemaining_ = 0;
+        if (jit_) {
+            jit_->HaltExecution();
+        }
+    }
+}
+
+std::uint64_t DbtEngine::GetTicksRemaining() {
+    return ticksRemaining_;
 }
 
 } // namespace emux
