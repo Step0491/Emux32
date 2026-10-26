@@ -10,6 +10,7 @@
 #include <atomic>
 #include <mutex>
 #include <algorithm>
+#include <new>
 
 #define TAG "UnicornCore"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, TAG, __VA_ARGS__)

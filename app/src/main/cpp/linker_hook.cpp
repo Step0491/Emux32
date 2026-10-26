@@ -131,6 +131,7 @@ std::string SyscallDispatcher::resolveFilePath(const char* guestPath) {
 }
 
 // Struttura standard stat64 su kernel Linux ARM a 32-bit (Bionic ABI)
+#pragma pack(push, 4)
 struct kernel_stat64_arm32 {
     uint64_t st_dev;
     uint32_t __pad0;
@@ -144,14 +145,15 @@ struct kernel_stat64_arm32 {
     int64_t  st_size;
     uint32_t st_blksize;
     uint64_t st_blocks;
-    uint32_t st_atime;
-    uint32_t st_atime_nsec;
-    uint32_t st_mtime;
-    uint32_t st_mtime_nsec;
-    uint32_t st_ctime;
-    uint32_t st_ctime_nsec;
+    uint32_t a_time;
+    uint32_t a_time_nsec;
+    uint32_t m_time;
+    uint32_t m_time_nsec;
+    uint32_t c_time;
+    uint32_t c_time_nsec;
     uint64_t st_ino;
 };
+#pragma pack(pop)
 
 constexpr uint32_t ARM_NR_exit            = 1;
 constexpr uint32_t ARM_NR_read            = 3;
@@ -308,16 +310,14 @@ int32_t SyscallDispatcher::handleSyscall(
         }
 
         case ARM_NR_faccessat: {
-            int dirfd = static_cast<int>(r0);
             uint32_t pathAddr = r1;
             int mode = static_cast<int>(r2);
-            int flags = static_cast<int>(r3);
             if (pathAddr == 0) return -EFAULT;
 
             char pathBuffer[512] = {0};
             if (uc && uc_mem_read(uc, pathAddr, pathBuffer, sizeof(pathBuffer) - 1) == UC_ERR_OK) {
                 std::string resolved = resolveFilePath(pathBuffer);
-                int ret = faccessat(dirfd, resolved.c_str(), mode, flags);
+                int ret = access(resolved.c_str(), mode);
                 return (ret == 0) ? 0 : -errno;
             }
             return -EFAULT;
@@ -346,9 +346,9 @@ int32_t SyscallDispatcher::handleSyscall(
                     st32.st_size = hostSt.st_size;
                     st32.st_blksize = static_cast<uint32_t>(hostSt.st_blksize);
                     st32.st_blocks = hostSt.st_blocks;
-                    st32.st_atime = static_cast<uint32_t>(hostSt.st_atime);
-                    st32.st_mtime = static_cast<uint32_t>(hostSt.st_mtime);
-                    st32.st_ctime = static_cast<uint32_t>(hostSt.st_ctime);
+                    st32.a_time = static_cast<uint32_t>(hostSt.st_atime);
+                    st32.m_time = static_cast<uint32_t>(hostSt.st_mtime);
+                    st32.c_time = static_cast<uint32_t>(hostSt.st_ctime);
                     uc_mem_write(uc, statBufAddr, &st32, sizeof(st32));
                     return 0;
                 }
@@ -376,9 +376,9 @@ int32_t SyscallDispatcher::handleSyscall(
                 st32.st_size = hostSt.st_size;
                 st32.st_blksize = static_cast<uint32_t>(hostSt.st_blksize);
                 st32.st_blocks = hostSt.st_blocks;
-                st32.st_atime = static_cast<uint32_t>(hostSt.st_atime);
-                st32.st_mtime = static_cast<uint32_t>(hostSt.st_mtime);
-                st32.st_ctime = static_cast<uint32_t>(hostSt.st_ctime);
+                st32.a_time = static_cast<uint32_t>(hostSt.st_atime);
+                st32.m_time = static_cast<uint32_t>(hostSt.st_mtime);
+                st32.c_time = static_cast<uint32_t>(hostSt.st_ctime);
                 uc_mem_write(uc, statBufAddr, &st32, sizeof(st32));
                 return 0;
             }
@@ -386,17 +386,15 @@ int32_t SyscallDispatcher::handleSyscall(
         }
 
         case ARM_NR_fstatat64: {
-            int dirfd = static_cast<int>(r0);
             uint32_t pathAddr = r1;
             uint32_t statBufAddr = r2;
-            int flags = static_cast<int>(r3);
             if (pathAddr == 0 || statBufAddr == 0) return -EFAULT;
 
             char pathBuffer[512] = {0};
             if (uc && uc_mem_read(uc, pathAddr, pathBuffer, sizeof(pathBuffer) - 1) == UC_ERR_OK) {
                 std::string resolved = resolveFilePath(pathBuffer);
                 struct stat hostSt{};
-                int ret = fstatat(dirfd, resolved.c_str(), &hostSt, flags);
+                int ret = stat(resolved.c_str(), &hostSt);
                 if (ret == 0) {
                     kernel_stat64_arm32 st32{};
                     st32.st_dev = hostSt.st_dev;
@@ -409,9 +407,9 @@ int32_t SyscallDispatcher::handleSyscall(
                     st32.st_size = hostSt.st_size;
                     st32.st_blksize = static_cast<uint32_t>(hostSt.st_blksize);
                     st32.st_blocks = hostSt.st_blocks;
-                    st32.st_atime = static_cast<uint32_t>(hostSt.st_atime);
-                    st32.st_mtime = static_cast<uint32_t>(hostSt.st_mtime);
-                    st32.st_ctime = static_cast<uint32_t>(hostSt.st_ctime);
+                    st32.a_time = static_cast<uint32_t>(hostSt.st_atime);
+                    st32.m_time = static_cast<uint32_t>(hostSt.st_mtime);
+                    st32.c_time = static_cast<uint32_t>(hostSt.st_ctime);
                     uc_mem_write(uc, statBufAddr, &st32, sizeof(st32));
                     return 0;
                 }
