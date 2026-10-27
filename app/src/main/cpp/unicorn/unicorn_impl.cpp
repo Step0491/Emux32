@@ -1,5 +1,6 @@
 #include "unicorn/unicorn.h"
 #include "unicorn/arm.h"
+#include "core/guest_memory.h"
 
 #include <android/log.h>
 #include <sys/mman.h>
@@ -277,7 +278,8 @@ struct UnicornInstance {
         setVfpDRaw(regIdx, raw);
     }
 
-    // Mappe memoria virtuale guest con cache MRU per accesso O(1)
+    // Arena flat 4 GB GuestMemory O(1) (g2h = base + addr) + fallback regioni
+    emux::GuestMemory flat_mem;
     std::vector<MemoryRegion> regions;
     int last_region_idx{-1};
     std::mutex mem_mutex;
@@ -290,10 +292,12 @@ struct UnicornInstance {
     UnicornInstance(uc_arch a, uc_mode m) : arch(a), mode(m) {
         regs[13] = 0x7E1FF000;
         cpsr = 0x00000010;
+        flat_mem.initialize();
     }
 
     ~UnicornInstance() {
         std::lock_guard<std::mutex> lock(mem_mutex);
+        flat_mem.destroy();
         for (auto& reg : regions) {
             if (reg.owned && reg.host_ptr) {
                 munmap(reg.host_ptr, reg.size);
@@ -323,6 +327,14 @@ struct UnicornInstance {
 
     inline uc_err readMem(uint64_t addr, void* dst, size_t size) {
         if (!dst || size == 0) return UC_ERR_OK;
+        if (flat_mem.isReady() && addr < emux::GuestMemory::kAddressSpaceSize) {
+            uint32_t gaddr = static_cast<uint32_t>(addr);
+            if (flat_mem.isMappedRange(gaddr, size)) {
+                std::memcpy(dst, flat_mem.g2h(gaddr), size);
+                return UC_ERR_OK;
+            }
+            return UC_ERR_READ_UNMAPPED;
+        }
         MemoryRegion* first = findRegion(addr);
         if (first && (addr + size) <= (first->address + first->size)) {
             std::memcpy(dst, first->host_ptr + (addr - first->address), size);
@@ -348,6 +360,14 @@ struct UnicornInstance {
 
     inline uc_err writeMem(uint64_t addr, const void* src, size_t size) {
         if (!src || size == 0) return UC_ERR_OK;
+        if (flat_mem.isReady() && addr < emux::GuestMemory::kAddressSpaceSize) {
+            uint32_t gaddr = static_cast<uint32_t>(addr);
+            if (flat_mem.isMappedRange(gaddr, size)) {
+                std::memcpy(flat_mem.g2h(gaddr), src, size);
+                return UC_ERR_OK;
+            }
+            return UC_ERR_WRITE_UNMAPPED;
+        }
         MemoryRegion* first = findRegion(addr);
         if (first && (addr + size) <= (first->address + first->size)) {
             std::memcpy(first->host_ptr + (addr - first->address), src, size);
@@ -934,6 +954,21 @@ uc_err uc_mem_map(uc_engine *uc, uint64_t address, size_t size, uint32_t perms) 
     auto* inst = reinterpret_cast<UnicornInstance*>(uc);
     std::lock_guard<std::mutex> lock(inst->mem_mutex);
 
+    if (inst->flat_mem.isReady() && (address + size) <= emux::GuestMemory::kAddressSpaceSize) {
+        uint8_t gprot = emux::GP_NONE;
+        if (perms & UC_PROT_READ)  gprot |= emux::GP_READ;
+        if (perms & UC_PROT_WRITE) gprot |= emux::GP_WRITE;
+        if (perms & UC_PROT_EXEC)  gprot |= emux::GP_EXEC;
+        if (gprot == emux::GP_NONE) gprot = emux::GP_RWX;
+
+        if (!inst->flat_mem.map(static_cast<uint32_t>(address), static_cast<uint32_t>(size), gprot)) {
+            LOGE("uc_mem_map: GuestMemory::map fallita per guest 0x%llx (%zu byte)",
+                 (unsigned long long)address, size);
+            return UC_ERR_NOMEM;
+        }
+        return UC_ERR_OK;
+    }
+
     for (auto& r : inst->regions) {
         if (address >= r.address && (address + size) <= (r.address + r.size)) {
             r.perms |= perms;
@@ -979,6 +1014,12 @@ uc_err uc_mem_unmap(uc_engine *uc, uint64_t address, size_t size) {
 
     auto* inst = reinterpret_cast<UnicornInstance*>(uc);
     std::lock_guard<std::mutex> lock(inst->mem_mutex);
+
+    if (inst->flat_mem.isReady() && (address + size) <= emux::GuestMemory::kAddressSpaceSize) {
+        return inst->flat_mem.unmap(static_cast<uint32_t>(address), static_cast<uint32_t>(size))
+            ? UC_ERR_OK
+            : UC_ERR_NOMEM;
+    }
 
     for (auto it = inst->regions.begin(); it != inst->regions.end(); ++it) {
         if (it->address == address && it->size == size) {
