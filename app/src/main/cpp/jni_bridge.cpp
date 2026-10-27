@@ -12,7 +12,7 @@
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, TAG, __VA_ARGS__)
 
-static std::unique_ptr<emux::DbtEngine> gEngine = nullptr;
+static std::shared_ptr<emux::DbtEngine> gEngine = nullptr;
 static ANativeWindow* gSavedWindow = nullptr;
 static std::mutex gEngineMutex;
 
@@ -24,19 +24,25 @@ Java_com_emux_translator_nativebridge_NativeEngine_nativeInitEngine(
     jobject /* thiz */,
     jlong guestRamMb
 ) {
+    std::shared_ptr<emux::DbtEngine> oldEngine;
+    {
+        std::lock_guard<std::mutex> lock(gEngineMutex);
+        oldEngine = gEngine;
+    }
+    if (oldEngine) {
+        oldEngine->requestStop();
+    }
+
     std::lock_guard<std::mutex> lock(gEngineMutex);
     LOGI("Inizializzazione Engine Nativo Unicorn DBT con %ld MB di RAM...", (long)guestRamMb);
 
-    gEngine = std::make_unique<emux::DbtEngine>();
+    gEngine = std::make_shared<emux::DbtEngine>();
     if (gSavedWindow) {
-        LOGI("Collegamento ANativeWindow salvata al nuovo DbtEngine.");
         gEngine->setNativeSurface(gSavedWindow);
     }
 
     size_t ramBytes = static_cast<size_t>(guestRamMb) * 1024 * 1024;
-    bool success = gEngine->initialize(ramBytes);
-
-    if (!success) {
+    if (!gEngine->initialize(ramBytes)) {
         LOGE("Inizializzazione DbtEngine fallita!");
         gEngine.reset();
         return JNI_FALSE;
@@ -54,11 +60,13 @@ Java_com_emux_translator_nativebridge_NativeEngine_nativeConfigurePerformance(
     jboolean enableFhd,
     jboolean throttleGuard
 ) {
-    std::lock_guard<std::mutex> lock(gEngineMutex);
-    if (!gEngine) {
-        return JNI_FALSE;
+    std::shared_ptr<emux::DbtEngine> engine;
+    {
+        std::lock_guard<std::mutex> lock(gEngineMutex);
+        engine = gEngine;
     }
-    gEngine->configurePerformance(
+    if (!engine) return JNI_FALSE;
+    engine->configurePerformance(
         static_cast<uint32_t>(targetFps),
         enableFhd == JNI_TRUE,
         throttleGuard == JNI_TRUE
@@ -81,29 +89,57 @@ Java_com_emux_translator_nativebridge_NativeEngine_nativeSetStoragePath(
     return JNI_TRUE;
 }
 
+JNIEXPORT void JNICALL
+Java_com_emux_translator_nativebridge_NativeEngine_nativeSetGameContext(
+    JNIEnv* env,
+    jobject /* thiz */,
+    jstring packageName,
+    jstring apkPath,
+    jstring obbDir,
+    jstring nativeLibDir,
+    jstring filesDir
+) {
+    auto jstrToStd = [&](jstring js) -> std::string {
+        if (!js) return "";
+        const char* cs = env->GetStringUTFChars(js, nullptr);
+        if (!cs) return "";
+        std::string res(cs);
+        env->ReleaseStringUTFChars(js, cs);
+        return res;
+    };
+
+    emux::GuestRuntimeEnvironment::getInstance().setGameContext(
+        jstrToStd(packageName),
+        jstrToStd(apkPath),
+        jstrToStd(obbDir),
+        jstrToStd(nativeLibDir),
+        jstrToStd(filesDir)
+    );
+}
+
 JNIEXPORT jboolean JNICALL
 Java_com_emux_translator_nativebridge_NativeEngine_nativeLoadElfLibrary(
     JNIEnv* env,
     jobject /* thiz */,
     jstring libraryPath
 ) {
-    std::lock_guard<std::mutex> lock(gEngineMutex);
-    if (!gEngine) {
+    std::shared_ptr<emux::DbtEngine> engine;
+    {
+        std::lock_guard<std::mutex> lock(gEngineMutex);
+        engine = gEngine;
+    }
+    if (!engine) {
         LOGE("Engine non inizializzato prima del caricamento ELF");
         return JNI_FALSE;
     }
 
     const char* nativePath = env->GetStringUTFChars(libraryPath, nullptr);
-    if (!nativePath) {
-        return JNI_FALSE;
-    }
-
+    if (!nativePath) return JNI_FALSE;
     std::string pathStr(nativePath);
     env->ReleaseStringUTFChars(libraryPath, nativePath);
 
     LOGI("Caricamento binario ELF 32-bit: %s", pathStr.c_str());
-    bool loaded = gEngine->loadLibrary(pathStr);
-    return loaded ? JNI_TRUE : JNI_FALSE;
+    return engine->loadLibrary(pathStr) ? JNI_TRUE : JNI_FALSE;
 }
 
 JNIEXPORT jboolean JNICALL
@@ -111,14 +147,19 @@ Java_com_emux_translator_nativebridge_NativeEngine_startEmulationNative(
     JNIEnv* /* env */,
     jobject /* thiz */
 ) {
-    std::lock_guard<std::mutex> lock(gEngineMutex);
-    if (!gEngine) {
+    std::shared_ptr<emux::DbtEngine> engine;
+    {
+        std::lock_guard<std::mutex> lock(gEngineMutex);
+        engine = gEngine;
+    }
+    if (!engine) {
         LOGE("Engine non inizializzato prima di startEmulationNative");
         return JNI_FALSE;
     }
 
-    LOGI("Invocazione startEmulationNative su Unicorn Engine...");
-    bool started = gEngine->startEmulation();
+    // NON mantenere gEngineMutex bloccato durante il loop a 60 FPS per evitare deadlock con UI/Touch/Surface
+    LOGI("Invocazione startEmulationNative su Worker Thread isolato...");
+    bool started = engine->startEmulation();
     return started ? JNI_TRUE : JNI_FALSE;
 }
 
@@ -131,23 +172,42 @@ Java_com_emux_translator_nativebridge_NativeEngine_nativeExecuteEntryPoint(
 }
 
 JNIEXPORT void JNICALL
+Java_com_emux_translator_nativebridge_NativeEngine_nativeStopEmulation(
+    JNIEnv* /* env */,
+    jobject /* thiz */
+) {
+    std::shared_ptr<emux::DbtEngine> engine;
+    {
+        std::lock_guard<std::mutex> lock(gEngineMutex);
+        engine = gEngine;
+    }
+    if (engine) {
+        engine->requestStop();
+    }
+}
+
+JNIEXPORT void JNICALL
 Java_com_emux_translator_nativebridge_NativeEngine_nativeSetSurface(
     JNIEnv* env,
     jobject /* thiz */,
     jobject surface
 ) {
-    std::lock_guard<std::mutex> lock(gEngineMutex);
-    if (gSavedWindow) {
-        ANativeWindow_release(gSavedWindow);
-        gSavedWindow = nullptr;
+    std::shared_ptr<emux::DbtEngine> engine;
+    ANativeWindow* win = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(gEngineMutex);
+        if (gSavedWindow) {
+            ANativeWindow_release(gSavedWindow);
+            gSavedWindow = nullptr;
+        }
+        if (surface) {
+            gSavedWindow = ANativeWindow_fromSurface(env, surface);
+        }
+        win = gSavedWindow;
+        engine = gEngine;
     }
-
-    if (surface) {
-        gSavedWindow = ANativeWindow_fromSurface(env, surface);
-    }
-
-    if (gEngine) {
-        gEngine->setNativeSurface(gSavedWindow);
+    if (engine) {
+        engine->setNativeSurface(win);
     }
 }
 
@@ -160,9 +220,13 @@ Java_com_emux_translator_nativebridge_NativeEngine_nativeSendTouchEvent(
     jfloat y,
     jint pointerId
 ) {
-    std::lock_guard<std::mutex> lock(gEngineMutex);
-    if (!gEngine) return JNI_FALSE;
-    return gEngine->injectTouchEvent(action, x, y, pointerId) ? JNI_TRUE : JNI_FALSE;
+    std::shared_ptr<emux::DbtEngine> engine;
+    {
+        std::lock_guard<std::mutex> lock(gEngineMutex);
+        engine = gEngine;
+    }
+    if (!engine) return JNI_FALSE;
+    return engine->injectTouchEvent(action, x, y, pointerId) ? JNI_TRUE : JNI_FALSE;
 }
 
 JNIEXPORT void JNICALL
@@ -170,14 +234,19 @@ Java_com_emux_translator_nativebridge_NativeEngine_nativeReleaseEngine(
     JNIEnv* /* env */,
     jobject /* thiz */
 ) {
-    std::lock_guard<std::mutex> lock(gEngineMutex);
-    if (gEngine) {
-        LOGI("Rilascio DbtEngine...");
-        gEngine.reset();
+    std::shared_ptr<emux::DbtEngine> engine;
+    {
+        std::lock_guard<std::mutex> lock(gEngineMutex);
+        engine = std::move(gEngine);
+        if (gSavedWindow) {
+            ANativeWindow_release(gSavedWindow);
+            gSavedWindow = nullptr;
+        }
     }
-    if (gSavedWindow) {
-        ANativeWindow_release(gSavedWindow);
-        gSavedWindow = nullptr;
+    if (engine) {
+        LOGI("Rilascio DbtEngine...");
+        engine->requestStop();
+        engine.reset();
     }
 }
 

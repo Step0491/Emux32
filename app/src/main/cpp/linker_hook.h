@@ -5,6 +5,8 @@
 #include <string>
 #include <vector>
 #include <memory>
+#include <atomic>
+#include <mutex>
 #include <jni.h>
 #include <EGL/egl.h>
 #include <GLES2/gl2.h>
@@ -13,18 +15,33 @@
 namespace emux {
 
 struct PerformanceGovernor;
+struct LoadedLibrary;
 
 struct RegisteredNativeMethod {
+    std::string className;
     std::string name;
     std::string signature;
     uint32_t fnPtr{0};
+};
+
+struct GuestJniMethodInfo {
+    std::string className;
+    std::string name;
+    std::string signature;
+    bool isStatic{false};
+};
+
+struct GuestJniFieldInfo {
+    std::string className;
+    std::string name;
+    std::string signature;
+    bool isStatic{false};
 };
 
 using jint32_t = int32_t;
 using jlong32_t = int64_t;
 using jptr32_t = uint32_t;
 
-// Tabella di mapping per Handle 32-bit <-> Puntatori Host 64-bit
 class JniHandleTable {
 public:
     static JniHandleTable& getInstance();
@@ -43,92 +60,19 @@ private:
     std::unordered_map<jptr32_t, jmethodID> methodMap_;
 };
 
-// Simulazione dell'interfaccia JavaVM a 32-bit
+// Tabella JNIInvokeInterface32 standard a 8 slot (JavaVM)
 struct JNIInvokeInterface32 {
-    jptr32_t reserved0;
-    jptr32_t reserved1;
-    jptr32_t reserved2;
-    jptr32_t DestroyJavaVM;
-    jptr32_t AttachCurrentThread;
-    jptr32_t DetachCurrentThread;
-    jptr32_t GetEnv;
-    jptr32_t AttachCurrentThreadAsDaemon;
+    jptr32_t slots[8];
 };
 
 struct JavaVM32 {
     jptr32_t functions;
 };
 
-// Simulazione della vtable JNINativeInterface conforme all'ABI a 32-bit
+// Tabella JNINativeInterface32 standard completa a 256 slot (JNIEnv)
+// Slot 215 (offset 0x35C) = RegisterNatives conforme all'ABI Android NDK
 struct JNINativeInterface32 {
-    jptr32_t reserved0;
-    jptr32_t reserved1;
-    jptr32_t reserved2;
-    jptr32_t reserved3;
-
-    jptr32_t GetVersion;
-    jptr32_t DefineClass;
-    jptr32_t FindClass;
-    jptr32_t FromReflectedMethod;
-    jptr32_t FromReflectedField;
-    jptr32_t ToReflectedMethod;
-    jptr32_t GetSuperclass;
-    jptr32_t IsAssignableFrom;
-    jptr32_t ToReflectedField;
-
-    jptr32_t Throw;
-    jptr32_t ThrowNew;
-    jptr32_t ExceptionOccurred;
-    jptr32_t ExceptionDescribe;
-    jptr32_t ExceptionClear;
-    jptr32_t FatalError;
-
-    jptr32_t PushLocalFrame;
-    jptr32_t PopLocalFrame;
-
-    jptr32_t NewGlobalRef;
-    jptr32_t DeleteGlobalRef;
-    jptr32_t DeleteLocalRef;
-    jptr32_t IsSameObject;
-    jptr32_t NewLocalRef;
-    jptr32_t EnsureLocalCapacity;
-
-    jptr32_t AllocObject;
-    jptr32_t NewObject;
-    jptr32_t NewObjectA;
-    jptr32_t NewObjectV;
-
-    jptr32_t GetObjectClass;
-    jptr32_t IsInstanceOf;
-    jptr32_t GetMethodID;
-
-    jptr32_t CallObjectMethod;
-    jptr32_t CallObjectMethodA;
-    jptr32_t CallObjectMethodV;
-    jptr32_t CallBooleanMethod;
-    jptr32_t CallByteMethod;
-    jptr32_t CallCharMethod;
-    jptr32_t CallShortMethod;
-    jptr32_t CallIntMethod;
-    jptr32_t CallLongMethod;
-    jptr32_t CallFloatMethod;
-    jptr32_t CallDoubleMethod;
-    jptr32_t CallVoidMethod;
-
-    jptr32_t GetFieldID;
-    jptr32_t GetObjectField;
-    jptr32_t SetObjectField;
-
-    jptr32_t GetStaticMethodID;
-    jptr32_t CallStaticVoidMethod;
-
-    jptr32_t NewStringUTF;
-    jptr32_t GetStringUTFLength;
-    jptr32_t GetStringUTFChars;
-    jptr32_t ReleaseStringUTFChars;
-
-    jptr32_t RegisterNatives;
-    jptr32_t UnregisterNatives;
+    jptr32_t slots[256];
 };
 
 struct JNIEnv32 {
@@ -153,27 +97,56 @@ public:
     );
 };
 
-// Intercettore simboli e Forwarder verso librerie native host (OpenGL ES pass-through)
 class SymbolResolver {
 public:
     static void* resolveHostSymbol(const char* symbolName);
 };
 
-// Gestore Runtime JNI e Trampoline Bridge per Unicorn Engine
 class GuestRuntimeEnvironment {
 public:
     static GuestRuntimeEnvironment& getInstance();
 
     bool initialize(uc_engine* uc);
+    void setGameContext(
+        const std::string& pkg,
+        const std::string& apkPath,
+        const std::string& obbDir,
+        const std::string& nativeLibDir,
+        const std::string& filesDir
+    );
+
+    const std::string& getPackageName() const { return packageName_; }
+    const std::string& getApkPath() const { return apkPath_; }
+    const std::string& getObbDir() const { return obbDir_; }
+    const std::string& getNativeLibDir() const { return nativeLibDir_; }
+    const std::string& getFilesDir() const { return filesDir_; }
+
     uint32_t getJavaVMPointer() const { return guestJavaVMAddr_; }
     uint32_t getJNIEnvPointer() const { return guestJNIEnvAddr_; }
+    uint32_t getCtypePointer() const { return guestJniBase_ + 0x2400U; }
+    uint32_t getSFilePointer() const { return guestJniBase_ + 0x2100U; }
+    uint32_t getStackChkGuardPointer() const { return guestJniBase_ + 0x2010U; }
 
     uint32_t registerSymbolTrampoline(const std::string& symbolName, uc_engine* uc);
+    uint32_t resolveOrRegisterSymbol(const std::string& symbolName, uc_engine* uc);
+    void registerLoadedLibrary(const std::shared_ptr<LoadedLibrary>& lib);
+    uint32_t findExportedSymbol(const std::string& symbolName) const;
+
+    uint32_t createGuestString(uc_engine* uc, const std::string& str);
+    uint32_t createGuestJString(uc_engine* uc, const std::string& str);
+
     void handleTrampolineCall(uint32_t trampolineId, uc_engine* uc);
 
     const std::vector<RegisteredNativeMethod>& getRegisteredMethods() const { return registeredMethods_; }
-    void addRegisteredMethod(const std::string& name, const std::string& sig, uint32_t fnPtr) {
-        registeredMethods_.push_back({name, sig, fnPtr});
+    void addRegisteredMethod(const std::string& cls, const std::string& name, const std::string& sig, uint32_t fnPtr) {
+        registeredMethods_.push_back({cls, name, sig, fnPtr});
+    }
+
+    void setLastTouchState(int action, float x, float y, int pointerId) {
+        lastTouchAction_.store(action, std::memory_order_relaxed);
+        lastTouchX_.store(x, std::memory_order_relaxed);
+        lastTouchY_.store(y, std::memory_order_relaxed);
+        lastTouchPointerId_.store(pointerId, std::memory_order_relaxed);
     }
 
     void setEglState(EGLDisplay dpy, EGLSurface surf, EGLContext ctx, PerformanceGovernor* gov) {
@@ -186,7 +159,12 @@ public:
     void swapBuffers() {
         if (eglDisplay_ != EGL_NO_DISPLAY && eglSurface_ != EGL_NO_SURFACE) {
             ::eglSwapBuffers(eglDisplay_, eglSurface_);
+            swappedThisFrame_.store(true, std::memory_order_relaxed);
         }
+    }
+
+    bool consumeFrameSwapFlag() {
+        return swappedThisFrame_.exchange(false, std::memory_order_relaxed);
     }
 
     EGLDisplay getEglDisplay() const { return eglDisplay_; }
@@ -195,16 +173,43 @@ public:
 
 private:
     GuestRuntimeEnvironment();
+    void handleJniCall(uint32_t slotIndex, uc_engine* uc);
+    void handleJavaVmCall(uint32_t slotIndex, uc_engine* uc);
 
     uint32_t guestJniBase_{0x7D000000};
     uint32_t guestJavaVMAddr_{0x7D000000};
     uint32_t guestJNIEnvAddr_{0x7D000200};
+    uint32_t guestTlsBase_{0x7D020000};
 
     uint32_t guestTrampolineBase_{0x70000000};
     uint32_t nextTrampolineId_{1};
 
     std::unordered_map<std::string, uint32_t> symbolToTrampolineMap_;
     std::unordered_map<uint32_t, std::string> trampolineToSymbolMap_;
+
+    uint32_t nextMockHandle_{0x2000};
+    std::unordered_map<uint32_t, std::string> classHandleMap_;
+    std::unordered_map<uint32_t, GuestJniMethodInfo> methodHandleMap_;
+    std::unordered_map<uint32_t, GuestJniFieldInfo> fieldHandleMap_;
+    std::unordered_map<uint32_t, std::string> jstringMap_;
+    std::unordered_map<uint32_t, uint32_t> jstringGuestPtrMap_;
+    std::unordered_map<uint32_t, std::pair<uint32_t, uint32_t>> arrayHandleMap_; // handle -> (guestBufPtr, lengthElements)
+
+    std::vector<std::shared_ptr<LoadedLibrary>> loadedLibraries_;
+    std::unordered_map<uint32_t, std::shared_ptr<LoadedLibrary>> dlopenHandleMap_;
+    uint32_t nextDlHandle_{0x50000010};
+
+    std::string packageName_{"com.turner.cardwars"};
+    std::string apkPath_;
+    std::string obbDir_;
+    std::string nativeLibDir_;
+    std::string filesDir_{"/data/user/0/com.emux.translator/files"};
+
+    std::atomic<int> lastTouchAction_{0};
+    std::atomic<float> lastTouchX_{0.0f};
+    std::atomic<float> lastTouchY_{0.0f};
+    std::atomic<int> lastTouchPointerId_{0};
+    std::atomic<bool> swappedThisFrame_{false};
 
     std::vector<RegisteredNativeMethod> registeredMethods_;
     EGLDisplay eglDisplay_{EGL_NO_DISPLAY};

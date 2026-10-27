@@ -3,6 +3,7 @@
 
 #include <android/log.h>
 #include <sys/mman.h>
+#include <cmath>
 #include <cstring>
 #include <vector>
 #include <memory>
@@ -51,7 +52,7 @@ inline bool checkCondition(uint32_t cpsr, uint32_t cond) {
     bool c = (cpsr & FLAG_C) != 0;
     bool v = (cpsr & FLAG_V) != 0;
 
-    switch (cond) {
+    switch (cond & 0xF) {
         case 0:  return z;                     // EQ
         case 1:  return !z;                    // NE
         case 2:  return c;                     // CS / HS
@@ -67,8 +68,151 @@ inline bool checkCondition(uint32_t cpsr, uint32_t cond) {
         case 12: return !z && (n == v);        // GT
         case 13: return z || (n != v);         // LE
         case 14: return true;                  // AL (Always)
-        default: return false;
+        default: return true;
     }
+}
+
+inline uint32_t ror32(uint32_t val, uint32_t shift) {
+    shift &= 31U;
+    if (shift == 0) return val;
+    return (val >> shift) | (val << (32U - shift));
+}
+
+inline uint32_t bitrev32(uint32_t x) {
+    x = ((x >> 1) & 0x55555555U) | ((x & 0x55555555U) << 1);
+    x = ((x >> 2) & 0x33333333U) | ((x & 0x33333333U) << 2);
+    x = ((x >> 4) & 0x0F0F0F0FU) | ((x & 0x0F0F0F0FU) << 4);
+    x = ((x >> 8) & 0x00FF00FFU) | ((x & 0x00FF00FFU) << 8);
+    return (x >> 16) | (x << 16);
+}
+
+inline uint32_t clz32(uint32_t x) {
+    return (x == 0) ? 32U : static_cast<uint32_t>(__builtin_clz(x));
+}
+
+inline uint32_t barrelShiftImm(uint32_t val, uint32_t shiftType, uint32_t imm5, bool carryIn, bool& carryOut) {
+    carryOut = carryIn;
+    switch (shiftType & 3U) {
+        case 0: // LSL
+            if (imm5 == 0) return val;
+            carryOut = ((val >> (32U - imm5)) & 1U) != 0;
+            return val << imm5;
+        case 1: // LSR
+            if (imm5 == 0) {
+                carryOut = (val & 0x80000000U) != 0;
+                return 0;
+            }
+            carryOut = ((val >> (imm5 - 1U)) & 1U) != 0;
+            return val >> imm5;
+        case 2: // ASR
+            if (imm5 == 0) {
+                bool neg = (val & 0x80000000U) != 0;
+                carryOut = neg;
+                return neg ? 0xFFFFFFFFU : 0U;
+            }
+            carryOut = ((val >> (imm5 - 1U)) & 1U) != 0;
+            return static_cast<uint32_t>(static_cast<int32_t>(val) >> imm5);
+        case 3: // ROR / RRX
+            if (imm5 == 0) { // RRX
+                carryOut = (val & 1U) != 0;
+                return (carryIn ? 0x80000000U : 0U) | (val >> 1);
+            }
+            carryOut = ((val >> (imm5 - 1U)) & 1U) != 0;
+            return ror32(val, imm5);
+    }
+    return val;
+}
+
+inline uint32_t barrelShiftReg(uint32_t val, uint32_t shiftType, uint32_t rsByte, bool carryIn, bool& carryOut) {
+    carryOut = carryIn;
+    if (rsByte == 0) return val;
+    switch (shiftType & 3U) {
+        case 0: // LSL
+            if (rsByte < 32U) {
+                carryOut = ((val >> (32U - rsByte)) & 1U) != 0;
+                return val << rsByte;
+            } else if (rsByte == 32U) {
+                carryOut = (val & 1U) != 0;
+                return 0U;
+            } else {
+                carryOut = false;
+                return 0U;
+            }
+        case 1: // LSR
+            if (rsByte < 32U) {
+                carryOut = ((val >> (rsByte - 1U)) & 1U) != 0;
+                return val >> rsByte;
+            } else if (rsByte == 32U) {
+                carryOut = (val & 0x80000000U) != 0;
+                return 0U;
+            } else {
+                carryOut = false;
+                return 0U;
+            }
+        case 2: // ASR
+            if (rsByte < 32U) {
+                carryOut = ((val >> (rsByte - 1U)) & 1U) != 0;
+                return static_cast<uint32_t>(static_cast<int32_t>(val) >> rsByte);
+            } else {
+                bool neg = (val & 0x80000000U) != 0;
+                carryOut = neg;
+                return neg ? 0xFFFFFFFFU : 0U;
+            }
+        case 3: { // ROR
+            uint32_t r = rsByte & 31U;
+            if (r == 0) {
+                carryOut = (val & 0x80000000U) != 0;
+                return val;
+            }
+            carryOut = ((val >> (r - 1U)) & 1U) != 0;
+            return ror32(val, r);
+        }
+    }
+    return val;
+}
+
+inline uint32_t thumbExpandImmC(uint32_t imm12, bool carryIn, bool& carryOut) {
+    carryOut = carryIn;
+    uint32_t imm8 = imm12 & 0xFFU;
+    if ((imm12 >> 10) == 0) {
+        switch ((imm12 >> 8) & 3U) {
+            case 0: return imm8;
+            case 1: return (imm8 << 16) | imm8;
+            case 2: return (imm8 << 24) | (imm8 << 8);
+            case 3: return (imm8 << 24) | (imm8 << 16) | (imm8 << 8) | imm8;
+        }
+    } else {
+        uint32_t unrotated = 0x80U | (imm12 & 0x7FU);
+        uint32_t rot = (imm12 >> 7) & 0x1FU;
+        uint32_t res = ror32(unrotated, rot);
+        carryOut = (res & 0x80000000U) != 0;
+        return res;
+    }
+    return imm8;
+}
+
+inline float vfpExpandImm32(uint32_t imm8) {
+    uint32_t sign = (imm8 >> 7) & 1U;
+    uint32_t b = (imm8 >> 6) & 1U;
+    uint32_t notB = b ^ 1U;
+    uint32_t repB = b ? 0x1FU : 0U;
+    uint32_t frac = imm8 & 0x3FU;
+    uint32_t raw = (sign << 31) | (notB << 30) | (repB << 25) | (frac << 19);
+    float f = 0.0f;
+    std::memcpy(&f, &raw, 4);
+    return f;
+}
+
+inline double vfpExpandImm64(uint32_t imm8) {
+    uint64_t sign = (imm8 >> 7) & 1ULL;
+    uint64_t b = (imm8 >> 6) & 1ULL;
+    uint64_t notB = b ^ 1ULL;
+    uint64_t repB = b ? 0xFFULL : 0ULL;
+    uint64_t frac = imm8 & 0x3FULL;
+    uint64_t raw = (sign << 63) | (notB << 62) | (repB << 54) | (frac << 48);
+    double d = 0.0;
+    std::memcpy(&d, &raw, 8);
+    return d;
 }
 
 struct UnicornInstance {
@@ -81,8 +225,11 @@ struct UnicornInstance {
     uint32_t regs[16]{0};
     uint32_t cpsr{0x00000010};
     uint32_t fpscr{0};
+    uint32_t cp15_tpidr_rw{0x7D020000};
+    uint32_t cp15_tpidr_ro{0x7D020000};
+    uint8_t  itstate{0};
 
-    // Registri VFP (32 registri singola precisione s0..s31, e 16 registri doppia precisione estesi d16..d31)
+    // Registri VFP (32 registri singola precisione s0..s31 + 16 doppia precisione estesi d16..d31)
     uint32_t vfp_s[32]{0};
     uint64_t vfp_d_ext[16]{0};
 
@@ -99,23 +246,16 @@ struct UnicornInstance {
         }
     }
 
-    inline double getVfpD(uint32_t regIdx) const {
+    inline uint64_t getVfpDRaw(uint32_t regIdx) const {
         if (regIdx < 16) {
-            uint64_t raw = (static_cast<uint64_t>(vfp_s[regIdx * 2 + 1]) << 32) | vfp_s[regIdx * 2];
-            double val;
-            std::memcpy(&val, &raw, 8);
-            return val;
+            return (static_cast<uint64_t>(vfp_s[regIdx * 2 + 1]) << 32) | vfp_s[regIdx * 2];
         } else if (regIdx < 32) {
-            double val;
-            std::memcpy(&val, &vfp_d_ext[regIdx - 16], 8);
-            return val;
+            return vfp_d_ext[regIdx - 16];
         }
-        return 0.0;
+        return 0ULL;
     }
 
-    inline void setVfpD(uint32_t regIdx, double val) {
-        uint64_t raw;
-        std::memcpy(&raw, &val, 8);
+    inline void setVfpDRaw(uint32_t regIdx, uint64_t raw) {
         if (regIdx < 16) {
             vfp_s[regIdx * 2] = static_cast<uint32_t>(raw & 0xFFFFFFFFU);
             vfp_s[regIdx * 2 + 1] = static_cast<uint32_t>(raw >> 32);
@@ -124,8 +264,22 @@ struct UnicornInstance {
         }
     }
 
-    // Mappe memoria virtuale guest
+    inline double getVfpD(uint32_t regIdx) const {
+        uint64_t raw = getVfpDRaw(regIdx);
+        double val;
+        std::memcpy(&val, &raw, 8);
+        return val;
+    }
+
+    inline void setVfpD(uint32_t regIdx, double val) {
+        uint64_t raw;
+        std::memcpy(&raw, &val, 8);
+        setVfpDRaw(regIdx, raw);
+    }
+
+    // Mappe memoria virtuale guest con cache MRU per accesso O(1)
     std::vector<MemoryRegion> regions;
+    int last_region_idx{-1};
     std::mutex mem_mutex;
 
     // Hook registrati
@@ -134,8 +288,8 @@ struct UnicornInstance {
     std::mutex hook_mutex;
 
     UnicornInstance(uc_arch a, uc_mode m) : arch(a), mode(m) {
-        regs[13] = 0x7E1FF000; // SP default
-        cpsr = 0x00000010;     // ARM User Mode (32-bit)
+        regs[13] = 0x7E1FF000;
+        cpsr = 0x00000010;
     }
 
     ~UnicornInstance() {
@@ -147,11 +301,20 @@ struct UnicornInstance {
             }
         }
         regions.clear();
+        last_region_idx = -1;
     }
 
     inline MemoryRegion* findRegion(uint64_t addr) {
-        for (auto& r : regions) {
+        if (last_region_idx >= 0 && static_cast<size_t>(last_region_idx) < regions.size()) {
+            MemoryRegion& mr = regions[last_region_idx];
+            if (addr >= mr.address && addr < (mr.address + mr.size)) {
+                return &mr;
+            }
+        }
+        for (size_t i = 0; i < regions.size(); ++i) {
+            MemoryRegion& r = regions[i];
             if (addr >= r.address && addr < (r.address + r.size)) {
+                last_region_idx = static_cast<int>(i);
                 return &r;
             }
         }
@@ -160,9 +323,14 @@ struct UnicornInstance {
 
     inline uc_err readMem(uint64_t addr, void* dst, size_t size) {
         if (!dst || size == 0) return UC_ERR_OK;
+        MemoryRegion* first = findRegion(addr);
+        if (first && (addr + size) <= (first->address + first->size)) {
+            std::memcpy(dst, first->host_ptr + (addr - first->address), size);
+            return UC_ERR_OK;
+        }
+
         uint8_t* out = static_cast<uint8_t*>(dst);
         size_t readCount = 0;
-
         while (readCount < size) {
             uint64_t cur = addr + readCount;
             MemoryRegion* r = findRegion(cur);
@@ -180,9 +348,14 @@ struct UnicornInstance {
 
     inline uc_err writeMem(uint64_t addr, const void* src, size_t size) {
         if (!src || size == 0) return UC_ERR_OK;
+        MemoryRegion* first = findRegion(addr);
+        if (first && (addr + size) <= (first->address + first->size)) {
+            std::memcpy(first->host_ptr + (addr - first->address), src, size);
+            return UC_ERR_OK;
+        }
+
         const uint8_t* in = static_cast<const uint8_t*>(src);
         size_t writeCount = 0;
-
         while (writeCount < size) {
             uint64_t cur = addr + writeCount;
             MemoryRegion* r = findRegion(cur);
@@ -198,16 +371,406 @@ struct UnicornInstance {
         return UC_ERR_OK;
     }
 
+    inline uint8_t readU8(uint32_t addr) {
+        uint8_t val = 0;
+        readMem(addr, &val, 1);
+        return val;
+    }
+
+    inline uint16_t readU16(uint32_t addr) {
+        uint16_t val = 0;
+        readMem(addr, &val, 2);
+        return val;
+    }
+
     inline uint32_t readU32(uint32_t addr) {
         uint32_t val = 0;
         readMem(addr, &val, 4);
         return val;
     }
 
+    inline void writeU8(uint32_t addr, uint8_t val) {
+        writeMem(addr, &val, 1);
+    }
+
+    inline void writeU16(uint32_t addr, uint16_t val) {
+        writeMem(addr, &val, 2);
+    }
+
     inline void writeU32(uint32_t addr, uint32_t val) {
         writeMem(addr, &val, 4);
     }
+
+    inline void setFlagsNZ(uint32_t res) {
+        if (res == 0) cpsr |= FLAG_Z; else cpsr &= ~FLAG_Z;
+        if (res & 0x80000000U) cpsr |= FLAG_N; else cpsr &= ~FLAG_N;
+    }
+
+    inline void setFlagsNZC(uint32_t res, bool carry) {
+        setFlagsNZ(res);
+        if (carry) cpsr |= FLAG_C; else cpsr &= ~FLAG_C;
+    }
+
+    inline uint32_t addWithCarry(uint32_t a, uint32_t b, bool carryIn, bool updateFlags) {
+        uint64_t uSum = static_cast<uint64_t>(a) + static_cast<uint64_t>(b) + (carryIn ? 1ULL : 0ULL);
+        uint32_t res = static_cast<uint32_t>(uSum);
+        if (updateFlags) {
+            setFlagsNZ(res);
+            if (uSum > 0xFFFFFFFFULL) cpsr |= FLAG_C; else cpsr &= ~FLAG_C;
+            bool ovf = ((~(a ^ b) & (a ^ res)) & 0x80000000U) != 0;
+            if (ovf) cpsr |= FLAG_V; else cpsr &= ~FLAG_V;
+        }
+        return res;
+    }
+
+    inline uint32_t subWithBorrow(uint32_t a, uint32_t b, bool carryIn, bool updateFlags) {
+        return addWithCarry(a, ~b, carryIn, updateFlags);
+    }
+
+    inline void branchWritePC(uint32_t target) {
+        itstate = 0;
+        if (target == 0xDEADBEEF || target == 0) {
+            regs[15] = target;
+            return;
+        }
+        if (target & 1U) {
+            cpsr |= FLAG_T;
+            regs[15] = target & ~1U;
+        } else {
+            cpsr &= ~FLAG_T;
+            regs[15] = target & ~3U;
+        }
+    }
 };
+
+// Esecutore condiviso Coprocessore CP10/CP11 (VFPv3/v4) e CP15 (TLS / Barriere) per ARM32 e Thumb-2
+bool executeCoprocessorInsn(UnicornInstance* inst, uint32_t insn, uint32_t pcRelBase) {
+    uint32_t coproc = (insn >> 8) & 0xFU;
+
+    // CP15: TLS (TPIDRURO / TPIDRURW) & System Control / Barriers
+    if (coproc == 15) {
+        bool isMrc = (insn & (1U << 20)) != 0;
+        uint32_t crn = (insn >> 16) & 0xFU;
+        uint32_t rt = (insn >> 12) & 0xFU;
+        uint32_t crm = insn & 0xFU;
+        uint32_t opc2 = (insn >> 5) & 7U;
+
+        if (crn == 13 && crm == 0 && (opc2 == 3 || opc2 == 2)) {
+            if (isMrc) {
+                uint32_t val = (opc2 == 3) ? inst->cp15_tpidr_ro : inst->cp15_tpidr_rw;
+                if (rt != 15) inst->regs[rt] = val;
+            } else {
+                if (opc2 == 2) inst->cp15_tpidr_rw = inst->regs[rt];
+                else inst->cp15_tpidr_ro = inst->regs[rt];
+            }
+            return true;
+        }
+        if (isMrc && rt != 15) {
+            inst->regs[rt] = 0;
+        }
+        return true;
+    }
+
+    if (coproc != 10 && coproc != 11) {
+        return false;
+    }
+
+    bool isDouble = (coproc == 11);
+
+    // 1. VMRS / VMSR
+    if ((insn & 0x0FFF0FFFU) == 0x0EF10A10U) { // VMRS APSR_nzcv, FPSCR
+        inst->cpsr = (inst->cpsr & ~0xF0000000U) | (inst->fpscr & 0xF0000000U);
+        return true;
+    }
+    if ((insn & 0x0FF00FFFU) == 0x0EF00A10U) { // VMRS Rt, FPSCR
+        uint32_t rt = (insn >> 12) & 0xFU;
+        if (rt != 15) inst->regs[rt] = inst->fpscr;
+        return true;
+    }
+    if ((insn & 0x0FF00FFFU) == 0x0EE00A10U) { // VMSR FPSCR, Rt
+        uint32_t rt = (insn >> 12) & 0xFU;
+        inst->fpscr = inst->regs[rt];
+        return true;
+    }
+
+    // 2. VMOV core <-> single (0x0E000A10 / 0x0E100A10) & scalar <-> core (0x0E000B10..)
+    if ((insn & 0x0FE00F70U) == 0x0E000A10U && !isDouble) {
+        bool isToCore = (insn & (1U << 20)) != 0;
+        uint32_t vn = (insn >> 16) & 0xFU;
+        uint32_t rt = (insn >> 12) & 0xFU;
+        uint32_t n = (insn >> 7) & 1U;
+        uint32_t sn = (vn << 1) | n;
+        if (isToCore) {
+            if (rt != 15) inst->regs[rt] = inst->vfp_s[sn];
+        } else {
+            inst->vfp_s[sn] = inst->regs[rt];
+        }
+        return true;
+    }
+    if ((insn & 0x0F900F70U) == 0x0E000B10U && isDouble) { // VMOV Dd[x] <-> Rt
+        bool isToCore = (insn & (1U << 20)) != 0;
+        uint32_t vd = (((insn >> 7) & 1U) << 4) | ((insn >> 16) & 0xFU);
+        uint32_t rt = (insn >> 12) & 0xFU;
+        bool hiWord = ((insn >> 21) & 1U) != 0;
+        uint64_t raw = inst->getVfpDRaw(vd);
+        if (isToCore) {
+            if (rt != 15) inst->regs[rt] = hiWord ? static_cast<uint32_t>(raw >> 32) : static_cast<uint32_t>(raw);
+        } else {
+            if (hiWord) raw = (raw & 0x00000000FFFFFFFFULL) | (static_cast<uint64_t>(inst->regs[rt]) << 32);
+            else raw = (raw & 0xFFFFFFFF00000000ULL) | static_cast<uint64_t>(inst->regs[rt]);
+            inst->setVfpDRaw(vd, raw);
+        }
+        return true;
+    }
+
+    // 3. VMOV core pair <-> double / two singles (0x0C400A10 / 0x0C400B10)
+    if ((insn & 0x0FE00FD0U) == 0x0C400A10U || (insn & 0x0FE00FD0U) == 0x0C400B10U) {
+        bool isToCore = (insn & (1U << 20)) != 0;
+        uint32_t rt = (insn >> 12) & 0xFU;
+        uint32_t rt2 = (insn >> 16) & 0xFU;
+        uint32_t m = (insn >> 5) & 1U;
+        uint32_t vm = insn & 0xFU;
+        if (!isDouble) {
+            uint32_t sm = (vm << 1) | m;
+            if (isToCore) {
+                if (rt < 15) inst->regs[rt] = (sm < 32) ? inst->vfp_s[sm] : 0;
+                if (rt2 < 15) inst->regs[rt2] = (sm + 1 < 32) ? inst->vfp_s[sm + 1] : 0;
+            } else {
+                if (sm < 32) inst->vfp_s[sm] = inst->regs[rt];
+                if (sm + 1 < 32) inst->vfp_s[sm + 1] = inst->regs[rt2];
+            }
+        } else {
+            uint32_t dm = (m << 4) | vm;
+            if (isToCore) {
+                uint64_t raw = inst->getVfpDRaw(dm);
+                if (rt < 15) inst->regs[rt] = static_cast<uint32_t>(raw & 0xFFFFFFFFU);
+                if (rt2 < 15) inst->regs[rt2] = static_cast<uint32_t>(raw >> 32);
+            } else {
+                uint64_t raw = (static_cast<uint64_t>(inst->regs[rt2]) << 32) | inst->regs[rt];
+                inst->setVfpDRaw(dm, raw);
+            }
+        }
+        return true;
+    }
+
+    // 4. VLDR / VSTR & VLDM / VSTM (VPUSH / VPOP): bits [27:25] == 110 (0x0C000000)
+    if ((insn & 0x0E000000U) == 0x0C000000U) {
+        bool p = (insn & (1U << 24)) != 0;
+        bool u = (insn & (1U << 23)) != 0;
+        bool d = (insn & (1U << 22)) != 0;
+        bool w = (insn & (1U << 21)) != 0;
+        bool isLoad = (insn & (1U << 20)) != 0;
+        uint32_t rn = (insn >> 16) & 0xFU;
+        uint32_t vd = (insn >> 12) & 0xFU;
+        uint32_t imm8 = insn & 0xFFU;
+
+        uint32_t base = (rn == 15) ? pcRelBase : inst->regs[rn];
+
+        if (p && !w) {
+            // VLDR / VSTR singolo
+            uint32_t offset = imm8 * 4U;
+            uint32_t effAddr = u ? (base + offset) : (base - offset);
+            if (!isDouble) {
+                uint32_t sd = (vd << 1) | (d ? 1U : 0U);
+                if (sd < 32) {
+                    if (isLoad) inst->vfp_s[sd] = inst->readU32(effAddr);
+                    else inst->writeU32(effAddr, inst->vfp_s[sd]);
+                }
+            } else {
+                uint32_t dd = ((d ? 1U : 0U) << 4) | vd;
+                if (dd < 32) {
+                    if (isLoad) {
+                        uint64_t lo = inst->readU32(effAddr);
+                        uint64_t hi = inst->readU32(effAddr + 4);
+                        inst->setVfpDRaw(dd, (hi << 32) | lo);
+                    } else {
+                        uint64_t raw = inst->getVfpDRaw(dd);
+                        inst->writeU32(effAddr, static_cast<uint32_t>(raw));
+                        inst->writeU32(effAddr + 4, static_cast<uint32_t>(raw >> 32));
+                    }
+                }
+            }
+        } else if (p || u) {
+            // VLDM / VSTM (IA: p=0,u=1 / DB: p=1,u=0, inclusi VPOP = VLDMIA sp! e VPUSH = VSTMDB sp!)
+            uint32_t bytesTotal = imm8 * 4U;
+            uint32_t startAddr = u ? base : (base - bytesTotal);
+            uint32_t curAddr = startAddr;
+
+            if (!isDouble) {
+                uint32_t count = imm8;
+                uint32_t firstReg = (vd << 1) | (d ? 1U : 0U);
+                for (uint32_t idx = 0; idx < count; ++idx) {
+                    uint32_t rIdx = firstReg + idx;
+                    if (rIdx < 32) {
+                        if (isLoad) inst->vfp_s[rIdx] = inst->readU32(curAddr);
+                        else inst->writeU32(curAddr, inst->vfp_s[rIdx]);
+                    }
+                    curAddr += 4;
+                }
+            } else {
+                uint32_t count = imm8 / 2U;
+                uint32_t firstReg = ((d ? 1U : 0U) << 4) | vd;
+                for (uint32_t idx = 0; idx < count; ++idx) {
+                    uint32_t rIdx = firstReg + idx;
+                    if (rIdx < 32) {
+                        if (isLoad) {
+                            uint64_t lo = inst->readU32(curAddr);
+                            uint64_t hi = inst->readU32(curAddr + 4);
+                            inst->setVfpDRaw(rIdx, (hi << 32) | lo);
+                        } else {
+                            uint64_t raw = inst->getVfpDRaw(rIdx);
+                            inst->writeU32(curAddr, static_cast<uint32_t>(raw));
+                            inst->writeU32(curAddr + 4, static_cast<uint32_t>(raw >> 32));
+                        }
+                    }
+                    curAddr += 8;
+                }
+            }
+
+            if (w && rn < 15) {
+                inst->regs[rn] = u ? (base + bytesTotal) : (base - bytesTotal);
+            }
+        }
+        return true;
+    }
+
+    // 5. VFP Data Processing (bits [27:24] == 1110, bit 4 == 0)
+    if ((insn & 0x0F000010U) == 0x0E000000U) {
+        uint32_t d = (insn >> 22) & 1U;
+        uint32_t n = (insn >> 7) & 1U;
+        uint32_t m = (insn >> 5) & 1U;
+        uint32_t vdField = (insn >> 12) & 0xFU;
+        uint32_t vnField = (insn >> 16) & 0xFU;
+        uint32_t vmField = insn & 0xFU;
+
+        uint32_t sd = isDouble ? ((d << 4) | vdField) : ((vdField << 1) | d);
+        uint32_t sn = isDouble ? ((n << 4) | vnField) : ((vnField << 1) | n);
+        uint32_t sm = isDouble ? ((m << 4) | vmField) : ((vmField << 1) | m);
+
+        uint32_t opc1 = (insn >> 20) & 0xBU; // bits 23, 21, 20
+        bool bit6 = (insn & (1U << 6)) != 0;
+
+        if (opc1 == 0xBU) {
+            // VMOV immediate oppure operazioni unarie / conversioni / VCMP
+            if (!bit6) {
+                uint32_t imm8 = (vnField << 4) | vmField;
+                if (!isDouble) inst->setVfpS(sd, vfpExpandImm32(imm8));
+                else inst->setVfpD(sd, vfpExpandImm64(imm8));
+                return true;
+            }
+
+            uint32_t opc2 = vnField;
+            uint32_t opc3 = (insn >> 6) & 3U; // bit 7 e bit 6 (bit 6 e' 1 -> opc3 = 1 o 3)
+
+            if (opc2 == 0x0) {
+                if (opc3 == 1) { // VMOV reg
+                    if (!isDouble) inst->vfp_s[sd] = inst->vfp_s[sm];
+                    else inst->setVfpDRaw(sd, inst->getVfpDRaw(sm));
+                } else { // VABS
+                    if (!isDouble) inst->setVfpS(sd, std::fabs(inst->getVfpS(sm)));
+                    else inst->setVfpD(sd, std::fabs(inst->getVfpD(sm)));
+                }
+            } else if (opc2 == 0x1) {
+                if (opc3 == 1) { // VNEG
+                    if (!isDouble) inst->setVfpS(sd, -inst->getVfpS(sm));
+                    else inst->setVfpD(sd, -inst->getVfpD(sm));
+                } else { // VSQRT
+                    if (!isDouble) {
+                        float v = inst->getVfpS(sm);
+                        inst->setVfpS(sd, v >= 0.0f ? std::sqrt(v) : 0.0f);
+                    } else {
+                        double v = inst->getVfpD(sm);
+                        inst->setVfpD(sd, v >= 0.0 ? std::sqrt(v) : 0.0);
+                    }
+                }
+            } else if (opc2 == 0x4 || opc2 == 0x5) { // VCMP / VCMPE
+                bool withZero = (opc2 == 0x5);
+                double fa = isDouble ? inst->getVfpD(sd) : static_cast<double>(inst->getVfpS(sd));
+                double fb = withZero ? 0.0 : (isDouble ? inst->getVfpD(sm) : static_cast<double>(inst->getVfpS(sm)));
+                inst->fpscr &= ~0xF0000000U;
+                if (std::isnan(fa) || std::isnan(fb)) {
+                    inst->fpscr |= (FLAG_C | FLAG_V);
+                } else if (fa == fb) {
+                    inst->fpscr |= (FLAG_Z | FLAG_C);
+                } else if (fa < fb) {
+                    inst->fpscr |= FLAG_N;
+                } else {
+                    inst->fpscr |= FLAG_C;
+                }
+            } else if (opc2 == 0x7 && opc3 == 3) { // VCVT.F64.F32 / VCVT.F32.F64
+                if (!isDouble) {
+                    uint32_t dDst = (d << 4) | vdField;
+                    uint32_t sSrc = (vmField << 1) | m;
+                    inst->setVfpD(dDst, static_cast<double>(inst->getVfpS(sSrc)));
+                } else {
+                    uint32_t sDst = (vdField << 1) | d;
+                    uint32_t dSrc = (m << 4) | vmField;
+                    inst->setVfpS(sDst, static_cast<float>(inst->getVfpD(dSrc)));
+                }
+            } else if (opc2 == 0x8) { // VCVT.F32/F64.U32/S32
+                uint32_t sSrc = (vmField << 1) | m;
+                uint32_t rawInt = inst->vfp_s[sSrc];
+                bool isSigned = (opc3 == 3);
+                if (!isDouble) {
+                    float res = isSigned ? static_cast<float>(static_cast<int32_t>(rawInt)) : static_cast<float>(rawInt);
+                    inst->setVfpS(sd, res);
+                } else {
+                    double res = isSigned ? static_cast<double>(static_cast<int32_t>(rawInt)) : static_cast<double>(rawInt);
+                    inst->setVfpD(sd, res);
+                }
+            } else if (opc2 == 0xC || opc2 == 0xD) { // VCVT.U32/S32.F32/F64
+                bool toSigned = (opc2 == 0xD);
+                uint32_t sDst = (vdField << 1) | d;
+                double srcVal = isDouble ? inst->getVfpD(sm) : static_cast<double>(inst->getVfpS(sm));
+                if (std::isnan(srcVal)) srcVal = 0.0;
+                if (toSigned) {
+                    int32_t iVal = (srcVal >= 2147483647.0) ? 2147483647 :
+                                   ((srcVal <= -2147483648.0) ? -2147483647 - 1 : static_cast<int32_t>(srcVal));
+                    inst->vfp_s[sDst] = static_cast<uint32_t>(iVal);
+                } else {
+                    uint32_t uVal = (srcVal <= 0.0) ? 0U :
+                                    ((srcVal >= 4294967295.0) ? 0xFFFFFFFFU : static_cast<uint32_t>(srcVal));
+                    inst->vfp_s[sDst] = uVal;
+                }
+            }
+            return true;
+        }
+
+        // Operazioni binarie VFP (VMLA, VMLS, VNMLA, VNMLS, VMUL, VNMUL, VADD, VSUB, VDIV, VFMA, VFMS)
+        if (!isDouble) {
+            float a = inst->getVfpS(sn);
+            float b = inst->getVfpS(sm);
+            float acc = inst->getVfpS(sd);
+            switch (opc1) {
+                case 0x0: inst->setVfpS(sd, bit6 ? (acc - a * b) : (acc + a * b)); break; // VMLA / VMLS
+                case 0x1: inst->setVfpS(sd, bit6 ? (-acc + a * b) : (-acc - a * b)); break; // VNMLA / VNMLS
+                case 0x2: inst->setVfpS(sd, bit6 ? -(a * b) : (a * b)); break; // VMUL / VNMUL
+                case 0x3: inst->setVfpS(sd, bit6 ? (a - b) : (a + b)); break; // VADD / VSUB
+                case 0x8: inst->setVfpS(sd, (b != 0.0f) ? (a / b) : 0.0f); break; // VDIV
+                case 0xA: inst->setVfpS(sd, bit6 ? (acc - a * b) : (acc + a * b)); break; // VFMA / VFMS
+                case 0x9: inst->setVfpS(sd, bit6 ? (-acc + a * b) : (-acc - a * b)); break; // VFNMA / VFNMS
+                default: break;
+            }
+        } else {
+            double a = inst->getVfpD(sn);
+            double b = inst->getVfpD(sm);
+            double acc = inst->getVfpD(sd);
+            switch (opc1) {
+                case 0x0: inst->setVfpD(sd, bit6 ? (acc - a * b) : (acc + a * b)); break;
+                case 0x1: inst->setVfpD(sd, bit6 ? (-acc + a * b) : (-acc - a * b)); break;
+                case 0x2: inst->setVfpD(sd, bit6 ? -(a * b) : (a * b)); break;
+                case 0x3: inst->setVfpD(sd, bit6 ? (a - b) : (a + b)); break;
+                case 0x8: inst->setVfpD(sd, (b != 0.0) ? (a / b) : 0.0); break;
+                case 0xA: inst->setVfpD(sd, bit6 ? (acc - a * b) : (acc + a * b)); break;
+                case 0x9: inst->setVfpD(sd, bit6 ? (-acc + a * b) : (-acc - a * b)); break;
+                default: break;
+            }
+        }
+        return true;
+    }
+
+    return true;
+}
 
 } // namespace
 
@@ -284,7 +847,7 @@ uc_err uc_reg_read(uc_engine *uc, int regid, void *value) {
         *reinterpret_cast<uint32_t*>(value) = inst->regs[15];
         return UC_ERR_OK;
     }
-    if (regid == UC_ARM_REG_CPSR) {
+    if (regid == UC_ARM_REG_CPSR || regid == UC_ARM_REG_APSR) {
         *reinterpret_cast<uint32_t*>(value) = inst->cpsr;
         return UC_ERR_OK;
     }
@@ -296,6 +859,14 @@ uc_err uc_reg_read(uc_engine *uc, int regid, void *value) {
     }
     if (regid == UC_ARM_REG_FPSCR || regid == UC_ARM_REG_FPSCR_NZCV) {
         *reinterpret_cast<uint32_t*>(value) = inst->fpscr;
+        return UC_ERR_OK;
+    }
+    if (regid == UC_ARM_REG_C13_C0_2) {
+        *reinterpret_cast<uint32_t*>(value) = inst->cp15_tpidr_rw;
+        return UC_ERR_OK;
+    }
+    if (regid == UC_ARM_REG_C13_C0_3) {
+        *reinterpret_cast<uint32_t*>(value) = inst->cp15_tpidr_ro;
         return UC_ERR_OK;
     }
 
@@ -323,7 +894,7 @@ uc_err uc_reg_write(uc_engine *uc, int regid, const void *value) {
         inst->regs[15] = val;
         return UC_ERR_OK;
     }
-    if (regid == UC_ARM_REG_CPSR) {
+    if (regid == UC_ARM_REG_CPSR || regid == UC_ARM_REG_APSR) {
         inst->cpsr = val;
         return UC_ERR_OK;
     }
@@ -338,6 +909,14 @@ uc_err uc_reg_write(uc_engine *uc, int regid, const void *value) {
         inst->fpscr = *reinterpret_cast<const uint32_t*>(value);
         return UC_ERR_OK;
     }
+    if (regid == UC_ARM_REG_C13_C0_2) {
+        inst->cp15_tpidr_rw = val;
+        return UC_ERR_OK;
+    }
+    if (regid == UC_ARM_REG_C13_C0_3) {
+        inst->cp15_tpidr_ro = val;
+        return UC_ERR_OK;
+    }
 
     return UC_ERR_ARG;
 }
@@ -346,7 +925,6 @@ uc_err uc_mem_map(uc_engine *uc, uint64_t address, size_t size, uint32_t perms) 
     if (!uc) return UC_ERR_HANDLE;
     if (size == 0) return UC_ERR_ARG;
 
-    // Rigorosa verifica allineamento pagina 0x1000 byte richiesta da Unicorn Engine
     if ((address & (UNICORN_PAGE_SIZE - 1)) != 0 || (size & (UNICORN_PAGE_SIZE - 1)) != 0) {
         LOGE("uc_mem_map: Errore fatale UC_ERR_ARG: Indirizzo 0x%llx o dimensione 0x%zx non allineati alla pagina 0x1000!",
              (unsigned long long)address, size);
@@ -356,17 +934,13 @@ uc_err uc_mem_map(uc_engine *uc, uint64_t address, size_t size, uint32_t perms) 
     auto* inst = reinterpret_cast<UnicornInstance*>(uc);
     std::lock_guard<std::mutex> lock(inst->mem_mutex);
 
-    // Se l'intervallo richiesto è già interamente compreso in una regione esistente, aggiorna i permessi e ritorna UC_ERR_OK
     for (auto& r : inst->regions) {
         if (address >= r.address && (address + size) <= (r.address + r.size)) {
             r.perms |= perms;
-            LOGI("uc_mem_map: Range 0x%llx (size 0x%zx) già coperto da regione a 0x%llx (size 0x%zx)",
-                 (unsigned long long)address, size, (unsigned long long)r.address, r.size);
             return UC_ERR_OK;
         }
     }
 
-    // Verifica sovrapposizioni parziali
     for (const auto& r : inst->regions) {
         if (!(address + size <= r.address || address >= r.address + r.size)) {
             LOGW("uc_mem_map: Regione 0x%llx (size 0x%zx) si sovrappone con 0x%llx (size 0x%zx)",
@@ -383,8 +957,6 @@ uc_err uc_mem_map(uc_engine *uc, uint64_t address, size_t size, uint32_t perms) 
         return UC_ERR_NOMEM;
     }
 
-    std::memset(host, 0, size);
-
     MemoryRegion reg{};
     reg.address = address;
     reg.size = size;
@@ -392,6 +964,7 @@ uc_err uc_mem_map(uc_engine *uc, uint64_t address, size_t size, uint32_t perms) 
     reg.host_ptr = static_cast<uint8_t*>(host);
     reg.owned = true;
     inst->regions.push_back(reg);
+    inst->last_region_idx = static_cast<int>(inst->regions.size() - 1);
 
     LOGI("uc_mem_map successo: Guest 0x%08llx - 0x%08llx (Size: %zu KB, Perms: 0x%x)",
          (unsigned long long)address, (unsigned long long)(address + size), size / 1024, perms);
@@ -413,6 +986,7 @@ uc_err uc_mem_unmap(uc_engine *uc, uint64_t address, size_t size) {
                 munmap(it->host_ptr, it->size);
             }
             inst->regions.erase(it);
+            inst->last_region_idx = -1;
             return UC_ERR_OK;
         }
     }
@@ -484,12 +1058,12 @@ uc_err uc_hook_del(uc_engine *uc, uc_hook hh) {
     return UC_ERR_HOOK;
 }
 
-uc_err uc_emu_start(uc_engine *uc, uint64_t begin, uint64_t until, uint64_t timeout, size_t count) {
+uc_err uc_emu_start(uc_engine *uc, uint64_t begin, uint64_t until, uint64_t /* timeout */, size_t count) {
     if (!uc) return UC_ERR_HANDLE;
     auto* inst = reinterpret_cast<UnicornInstance*>(uc);
 
-    // Gestione modalità iniziale ARM vs Thumb in base al bit 0 dell'entry point
-    if (begin & 1) {
+    inst->itstate = 0;
+    if (begin & 1ULL) {
         inst->cpsr |= FLAG_T;
         inst->regs[15] = static_cast<uint32_t>(begin & ~1ULL);
     } else {
@@ -500,648 +1074,1071 @@ uc_err uc_emu_start(uc_engine *uc, uint64_t begin, uint64_t until, uint64_t time
     inst->is_running.store(true);
     inst->stop_requested.store(false);
 
-    LOGI("uc_emu_start: Avvio emulazione guest da PC=0x%08x (Mode: %s, SP=0x%08x, LR=0x%08x, r0=0x%08x)...",
-         inst->regs[15], (inst->cpsr & FLAG_T) ? "Thumb" : "ARM32", inst->regs[13], inst->regs[14], inst->regs[0]);
-
+    uint32_t lastValidPc = inst->regs[15];
     size_t instructionsExecuted = 0;
+    uint32_t nullRecoveries = 0;
 
-    while (inst->is_running.load() && !inst->stop_requested.load()) {
+    auto dispatchIntr = [&](uint32_t svcComment) {
+        HookEntry localHooks[8];
+        size_t hookCount = 0;
+        {
+            std::lock_guard<std::mutex> lock(inst->hook_mutex);
+            for (const auto& h : inst->hooks) {
+                if ((h.type & UC_HOOK_INTR) && hookCount < 8) {
+                    localHooks[hookCount++] = h;
+                }
+            }
+        }
+        uint32_t intnoToSend = (svcComment != 0) ? (0x80000000U | svcComment) : 2U;
+        for (size_t i = 0; i < hookCount; ++i) {
+            auto cb = reinterpret_cast<uc_cb_hookintr_t>(localHooks[i].callback);
+            cb(uc, intnoToSend, localHooks[i].user_data);
+        }
+    };
+
+    while (inst->is_running.load(std::memory_order_relaxed) && !inst->stop_requested.load(std::memory_order_relaxed)) {
         uint32_t pc = inst->regs[15];
 
-        if (until != 0 && pc == until) {
-            LOGI("uc_emu_start: Raggiunto target address until=0x%llx", (unsigned long long)until);
+        if (until != 0 && pc == static_cast<uint32_t>(until)) break;
+        if (pc == 0xDEADBEEF) break;
+
+        // Linux ARM32 Kernel User Helpers (0xFFFF0F60 .. 0xFFFF0FE0)
+        if ((pc & 0xFFFFF000U) == 0xFFFF0000U) {
+            if (pc == 0xFFFF0FE0U) { // __kuser_get_tls
+                inst->regs[0] = inst->cp15_tpidr_ro;
+                inst->branchWritePC(inst->regs[14]);
+                instructionsExecuted++;
+                continue;
+            }
+            if (pc == 0xFFFF0FA0U) { // __kuser_memory_barrier
+                inst->branchWritePC(inst->regs[14]);
+                instructionsExecuted++;
+                continue;
+            }
+            if (pc == 0xFFFF0FC0U) { // __kuser_cmpxchg
+                uint32_t cur = inst->readU32(inst->regs[2]);
+                if (cur == inst->regs[0]) {
+                    inst->writeU32(inst->regs[2], inst->regs[1]);
+                    inst->regs[0] = 0;
+                    inst->cpsr |= FLAG_C;
+                } else {
+                    inst->regs[0] = 1;
+                    inst->cpsr &= ~FLAG_C;
+                }
+                inst->branchWritePC(inst->regs[14]);
+                instructionsExecuted++;
+                continue;
+            }
+            if (pc == 0xFFFF0F60U) { // __kuser_cmpxchg64
+                uint64_t oldV = (static_cast<uint64_t>(inst->readU32(inst->regs[0] + 4)) << 32) | inst->readU32(inst->regs[0]);
+                uint64_t newV = (static_cast<uint64_t>(inst->readU32(inst->regs[1] + 4)) << 32) | inst->readU32(inst->regs[1]);
+                uint64_t curV = (static_cast<uint64_t>(inst->readU32(inst->regs[2] + 4)) << 32) | inst->readU32(inst->regs[2]);
+                if (curV == oldV) {
+                    inst->writeU32(inst->regs[2], static_cast<uint32_t>(newV));
+                    inst->writeU32(inst->regs[2] + 4, static_cast<uint32_t>(newV >> 32));
+                    inst->regs[0] = 0;
+                    inst->cpsr |= FLAG_C;
+                } else {
+                    inst->regs[0] = 1;
+                    inst->cpsr &= ~FLAG_C;
+                }
+                inst->branchWritePC(inst->regs[14]);
+                instructionsExecuted++;
+                continue;
+            }
+        }
+
+        if (pc < 0x1000U) {
+            uint32_t lr = inst->regs[14];
+            LOGW("uc_emu_start: Salto a NULL/LowAddr PC=0x%08x da lastPC=0x%08x (LR=0x%08x, SP=0x%08x, r0=0x%08x, insns=%zu)",
+                 pc, lastValidPc, lr, inst->regs[13], inst->regs[0], instructionsExecuted);
+            if (lr >= 0x1000U && lr != 0xDEADBEEFU && lr != lastValidPc && nullRecoveries < 64) {
+                nullRecoveries++;
+                inst->regs[0] = 0;
+                inst->branchWritePC(lr);
+                continue;
+            }
             break;
         }
 
-        if (pc == 0 || pc == 0xDEADBEEF) {
-            LOGI("uc_emu_start: Raggiunto return/trap address 0x%08x (Return Value in r0: 0x%08x)", pc, inst->regs[0]);
-            break;
-        }
+        if (count > 0 && instructionsExecuted >= count) break;
 
-        if (count > 0 && instructionsExecuted >= count) {
-            break;
-        }
-
+        lastValidPc = pc;
         bool isThumb = (inst->cpsr & FLAG_T) != 0;
 
         if (!isThumb) {
-            // ==================== DECODIFICA & ESECUZIONE ARM (32-bit) ====================
             uint32_t insn = 0;
             uc_err readErr = inst->readMem(pc, &insn, 4);
             if (readErr != UC_ERR_OK) {
-                LOGE("uc_emu_start [ARM]: Fault lettura istruzione al PC=0x%08x (%s)", pc, uc_strerror(readErr));
+                LOGE("uc_emu_start [ARM]: Fault lettura PC=0x%08x (LR=0x%08x)", pc, inst->regs[14]);
+                if (inst->regs[14] >= 0x1000U && inst->regs[14] != 0xDEADBEEFU && nullRecoveries < 32) {
+                    nullRecoveries++;
+                    inst->regs[0] = 0;
+                    inst->branchWritePC(inst->regs[14]);
+                    continue;
+                }
                 inst->is_running.store(false);
                 return readErr;
             }
 
-            uint32_t cond = (insn >> 28) & 0xF;
-            if (cond != 15 && !checkCondition(inst->cpsr, cond)) {
-                // Condizione non verificata: avanza al prossimo comando
-                inst->regs[15] += 4;
-                instructionsExecuted++;
-                continue;
-            }
-
-            // 1. Supervisor Call (SVC): 0xEF000000 o condizionale
-            if ((insn & 0x0F000000) == 0x0F000000) {
-                uint32_t svcComment = insn & 0x00FFFFFF;
-
-                std::vector<HookEntry> intrHooks;
-                {
-                    std::lock_guard<std::mutex> lock(inst->hook_mutex);
-                    for (const auto& h : inst->hooks) {
-                        if (h.type & UC_HOOK_INTR) intrHooks.push_back(h);
-                    }
-                }
-
-                for (const auto& h : intrHooks) {
-                    auto cb = reinterpret_cast<uc_cb_hookintr_t>(h.callback);
-                    uint32_t intnoToSend = (svcComment != 0) ? (0x80000000U | svcComment) : 2U;
-                    cb(uc, intnoToSend, h.user_data);
-                }
-
-                inst->regs[15] += 4;
-                instructionsExecuted++;
-                continue;
-            }
-
-            // 2. Branch & Exchange: BX Rm (0x012FFF10) / BLX Rm (0x012FFF30)
-            if ((insn & 0x0FFFFFF0) == 0x012FFF10) { // BX Rm
-                uint32_t rm = insn & 0xF;
-                uint32_t target = inst->regs[rm];
-                if (target == 0xDEADBEEF || target == 0) {
-                    LOGI("uc_emu_start [ARM]: Raggiunto return/trap address 0x%08x (Return Value in r0: 0x%08x)",
-                         target, inst->regs[0]);
-                    instructionsExecuted++;
-                    break;
-                }
-                if (target & 1) {
-                    inst->cpsr |= FLAG_T;
-                    inst->regs[15] = target & ~1U;
-                } else {
-                    inst->cpsr &= ~FLAG_T;
-                    inst->regs[15] = target & ~3U;
-                }
-                instructionsExecuted++;
-                continue;
-            }
-
-            if ((insn & 0x0FFFFFF0) == 0x012FFF30) { // BLX Rm
-                uint32_t rm = insn & 0xF;
-                uint32_t target = inst->regs[rm];
-                inst->regs[14] = pc + 4; // Imposta LR di ritorno
-                if (target & 1) {
-                    inst->cpsr |= FLAG_T;
-                    inst->regs[15] = target & ~1U;
-                } else {
-                    inst->cpsr &= ~FLAG_T;
-                    inst->regs[15] = target & ~3U;
-                }
-                instructionsExecuted++;
-                continue;
-            }
-
-            // 3. Branch / Branch with Link: B / BL (0x0A000000 / 0x0B000000)
-            if ((insn & 0x0E000000) == 0x0A000000) {
-                bool isBl = (insn & 0x01000000) != 0;
-                if (isBl) {
+            uint32_t cond = (insn >> 28) & 0xFU;
+            if (cond == 15) {
+                if ((insn & 0xFE000000U) == 0xFA000000U) { // BLX imm
+                    int32_t imm24 = static_cast<int32_t>((insn & 0x00FFFFFFU) << 8) >> 6;
+                    uint32_t hBit = ((insn >> 24) & 1U) << 1;
                     inst->regs[14] = pc + 4;
+                    inst->cpsr |= FLAG_T;
+                    inst->regs[15] = (pc + 8 + imm24 + hBit) & ~1U;
+                    instructionsExecuted++;
+                    continue;
                 }
-                int32_t imm24 = static_cast<int32_t>((insn & 0x00FFFFFF) << 8) >> 6;
+                inst->regs[15] = pc + 4;
+                instructionsExecuted++;
+                continue;
+            }
+
+            if (!checkCondition(inst->cpsr, cond)) {
+                inst->regs[15] = pc + 4;
+                instructionsExecuted++;
+                continue;
+            }
+
+            if ((insn & 0x0F000000U) == 0x0F000000U) { // SVC
+                uint32_t svcComment = insn & 0x00FFFFFFU;
+                inst->regs[15] = pc + 4;
+                dispatchIntr(svcComment);
+                instructionsExecuted++;
+                continue;
+            }
+
+            if ((insn & 0x0C000000U) == 0x0C000000U) { // Coprocessor VFP/CP15
+                executeCoprocessorInsn(inst, insn, pc + 8);
+                inst->regs[15] = pc + 4;
+                instructionsExecuted++;
+                continue;
+            }
+
+            if ((insn & 0x0E000000U) == 0x0A000000U) { // B / BL
+                if (insn & 0x01000000U) inst->regs[14] = pc + 4;
+                int32_t imm24 = static_cast<int32_t>((insn & 0x00FFFFFFU) << 8) >> 6;
                 inst->regs[15] = pc + 8 + imm24;
                 instructionsExecuted++;
                 continue;
             }
 
-            // 4. Block Data Transfer: PUSH / POP / LDM / STM (0x08000000)
-            if ((insn & 0x0E000000) == 0x08000000) {
-                uint32_t rn = (insn >> 16) & 0xF;
-                bool isLoad = (insn & (1 << 20)) != 0;
-                bool writeBack = (insn & (1 << 21)) != 0;
-                bool preIndex = (insn & (1 << 24)) != 0;
-                bool up = (insn & (1 << 23)) != 0;
-                uint16_t regList = insn & 0xFFFF;
+            if ((insn & 0x0E000000U) == 0x08000000U) { // LDM / STM
+                uint32_t rn = (insn >> 16) & 0xFU;
+                bool isLoad = (insn & (1U << 20)) != 0;
+                bool writeBack = (insn & (1U << 21)) != 0;
+                bool up = (insn & (1U << 23)) != 0;
+                bool preIndex = (insn & (1U << 24)) != 0;
+                uint16_t regList = static_cast<uint16_t>(insn & 0xFFFFU);
 
-                uint32_t addr = inst->regs[rn];
-                std::vector<int> regsToProcess;
+                uint32_t nRegs = 0;
+                for (int i = 0; i < 16; ++i) if (regList & (1U << i)) nRegs++;
+
+                uint32_t base = inst->regs[rn];
+                uint32_t totalBytes = nRegs * 4U;
+                uint32_t startAddr = up ? (preIndex ? (base + 4U) : base)
+                                        : (preIndex ? (base - totalBytes) : (base - totalBytes + 4U));
+                uint32_t wbVal = up ? (base + totalBytes) : (base - totalBytes);
+                uint32_t curAddr = startAddr;
+                uint32_t loadedPc = 0;
+                bool loadedPcFlag = false;
+
                 for (int i = 0; i < 16; ++i) {
-                    if (regList & (1 << i)) regsToProcess.push_back(i);
-                }
-
-                if (!up) { // Decrement (es. PUSH = STMDB SP!)
-                    addr -= static_cast<uint32_t>(regsToProcess.size() * 4);
-                }
-
-                uint32_t curAddr = addr;
-                for (int regIdx : regsToProcess) {
-                    if (isLoad) {
-                        inst->regs[regIdx] = inst->readU32(curAddr);
-                    } else {
-                        inst->writeU32(curAddr, inst->regs[regIdx]);
+                    if (regList & (1U << i)) {
+                        if (isLoad) {
+                            uint32_t v = inst->readU32(curAddr);
+                            if (i == 15) { loadedPc = v; loadedPcFlag = true; }
+                            else inst->regs[i] = v;
+                        } else {
+                            inst->writeU32(curAddr, (i == 15) ? (pc + 8) : inst->regs[i]);
+                        }
+                        curAddr += 4;
                     }
-                    curAddr += 4;
                 }
-
-                if (writeBack) {
-                    if (up) inst->regs[rn] += static_cast<uint32_t>(regsToProcess.size() * 4);
-                    else inst->regs[rn] -= static_cast<uint32_t>(regsToProcess.size() * 4);
-                }
-
-                if (isLoad && (regList & (1 << 15))) {
-                    // PC caricato dallo stack (es. POP {..., PC})
-                    instructionsExecuted++;
-                    continue;
-                }
-
-                inst->regs[15] += 4;
+                if (writeBack && rn < 15 && !(isLoad && (regList & (1U << rn)))) inst->regs[rn] = wbVal;
+                if (loadedPcFlag) inst->branchWritePC(loadedPc);
+                else inst->regs[15] = pc + 4;
                 instructionsExecuted++;
                 continue;
             }
 
-            // 5. Single Data Transfer: LDR / STR (0x04000000)
-            if ((insn & 0x0C000000) == 0x04000000) {
-                uint32_t rn = (insn >> 16) & 0xF;
-                uint32_t rd = (insn >> 12) & 0xF;
-                bool isLoad = (insn & (1 << 20)) != 0;
-                bool isByte = (insn & (1 << 22)) != 0;
-                bool up = (insn & (1 << 23)) != 0;
-                uint32_t offset = insn & 0xFFF;
+            if ((insn & 0x0E000010U) == 0x06000010U) { // Media instructions
+                uint32_t op1 = (insn >> 20) & 0x1FU;
+                uint32_t op2 = (insn >> 5) & 0x7U;
+                if ((op1 == 0x11 || op1 == 0x13) && op2 == 0) {
+                    uint32_t rd = (insn >> 16) & 0xFU, rm = (insn >> 8) & 0xFU, rn = insn & 0xFU;
+                    if (op1 == 0x11) {
+                        int32_t a = static_cast<int32_t>(inst->regs[rn]), b = static_cast<int32_t>(inst->regs[rm]);
+                        inst->regs[rd] = (b == 0) ? 0U : ((a == -2147483647 - 1 && b == -1) ? 0x80000000U : static_cast<uint32_t>(a / b));
+                    } else {
+                        uint32_t a = inst->regs[rn], b = inst->regs[rm];
+                        inst->regs[rd] = (b == 0) ? 0U : (a / b);
+                    }
+                } else if ((op1 & 0x1EU) == 0x1CU && (op2 & 3U) == 0) {
+                    uint32_t msb = (insn >> 16) & 0x1FU, rd = (insn >> 12) & 0xFU, lsb = (insn >> 7) & 0x1FU, rn = insn & 0xFU;
+                    if (msb >= lsb) {
+                        uint32_t width = msb - lsb + 1U;
+                        uint32_t mask = (width >= 32U) ? 0xFFFFFFFFU : ((1U << width) - 1U);
+                        uint32_t src = (rn == 15) ? 0U : (inst->regs[rn] & mask);
+                        inst->regs[rd] = (inst->regs[rd] & ~(mask << lsb)) | (src << lsb);
+                    }
+                } else if (((op1 & 0x1EU) == 0x1AU || (op1 & 0x1EU) == 0x1EU) && (op2 & 3U) == 2U) {
+                    bool isSigned = ((op1 & 0x1EU) == 0x1AU);
+                    uint32_t width = ((insn >> 16) & 0x1FU) + 1U, rd = (insn >> 12) & 0xFU, lsb = (insn >> 7) & 0x1FU, rn = insn & 0xFU;
+                    uint32_t val = inst->regs[rn] >> lsb;
+                    if (width < 32U) {
+                        val &= (1U << width) - 1U;
+                        if (isSigned && (val & (1U << (width - 1U)))) val |= ~((1U << width) - 1U);
+                    }
+                    inst->regs[rd] = val;
+                } else if ((insn & 0x0FF00FF0U) == 0x06BF0F30U) {
+                    inst->regs[(insn >> 12) & 0xFU] = __builtin_bswap32(inst->regs[insn & 0xFU]);
+                } else if ((insn & 0x0FF00FF0U) == 0x06BF0FB0U) {
+                    uint32_t v = inst->regs[insn & 0xFU];
+                    inst->regs[(insn >> 12) & 0xFU] = ((v >> 8) & 0x00FF00FFU) | ((v & 0x00FF00FFU) << 8);
+                } else if ((insn & 0x0FF00FF0U) == 0x06FF0F30U) {
+                    inst->regs[(insn >> 12) & 0xFU] = bitrev32(inst->regs[insn & 0xFU]);
+                } else if ((insn & 0x0FF00FF0U) == 0x06FF0FB0U) {
+                    uint16_t h = static_cast<uint16_t>(inst->regs[insn & 0xFU] & 0xFFFFU);
+                    inst->regs[(insn >> 12) & 0xFU] = static_cast<uint32_t>(static_cast<int32_t>(static_cast<int16_t>((h >> 8) | (h << 8))));
+                } else if ((insn & 0x0F8000F0U) == 0x06800070U) {
+                    uint32_t opExt = (insn >> 20) & 7U, rn = (insn >> 16) & 0xFU, rd = (insn >> 12) & 0xFU;
+                    uint32_t rmVal = ror32(inst->regs[insn & 0xFU], ((insn >> 10) & 3U) * 8U);
+                    uint32_t addBase = (rn == 15) ? 0U : inst->regs[rn];
+                    uint32_t ext = rmVal;
+                    if (opExt == 2) ext = static_cast<uint32_t>(static_cast<int32_t>(static_cast<int8_t>(rmVal & 0xFFU)));
+                    else if (opExt == 3) ext = static_cast<uint32_t>(static_cast<int32_t>(static_cast<int16_t>(rmVal & 0xFFFFU)));
+                    else if (opExt == 6) ext = rmVal & 0xFFU;
+                    else if (opExt == 7) ext = rmVal & 0xFFFFU;
+                    inst->regs[rd] = addBase + ext;
+                }
+                inst->regs[15] = pc + 4;
+                instructionsExecuted++;
+                continue;
+            }
 
+            if ((insn & 0x0C000000U) == 0x04000000U) { // LDR / STR / LDRB / STRB
+                bool isRegOffset = (insn & (1U << 25)) != 0;
+                bool preIndex = (insn & (1U << 24)) != 0;
+                bool up = (insn & (1U << 23)) != 0;
+                bool isByte = (insn & (1U << 22)) != 0;
+                bool writeBack = (insn & (1U << 21)) != 0;
+                bool isLoad = (insn & (1U << 20)) != 0;
+                uint32_t rn = (insn >> 16) & 0xFU, rd = (insn >> 12) & 0xFU;
+                bool dummyC = false;
+                uint32_t offset = !isRegOffset ? (insn & 0xFFFU)
+                    : barrelShiftImm(inst->regs[insn & 0xFU], (insn >> 5) & 3U, (insn >> 7) & 0x1FU, (inst->cpsr & FLAG_C) != 0, dummyC);
                 uint32_t base = (rn == 15) ? (pc + 8) : inst->regs[rn];
-                uint32_t effAddr = up ? (base + offset) : (base - offset);
+                uint32_t modAddr = up ? (base + offset) : (base - offset);
+                uint32_t effAddr = preIndex ? modAddr : base;
 
                 if (isLoad) {
-                    if (isByte) {
-                        uint8_t byteVal = 0;
-                        inst->readMem(effAddr, &byteVal, 1);
-                        inst->regs[rd] = byteVal;
-                    } else {
-                        inst->regs[rd] = inst->readU32(effAddr);
-                    }
+                    uint32_t loaded = isByte ? static_cast<uint32_t>(inst->readU8(effAddr)) : inst->readU32(effAddr);
+                    if ((!preIndex || writeBack) && rn < 15 && rn != rd) inst->regs[rn] = modAddr;
                     if (rd == 15) {
+                        inst->branchWritePC(loaded);
                         instructionsExecuted++;
                         continue;
                     }
+                    inst->regs[rd] = loaded;
                 } else {
-                    if (isByte) {
-                        uint8_t byteVal = static_cast<uint8_t>(inst->regs[rd] & 0xFF);
-                        inst->writeMem(effAddr, &byteVal, 1);
-                    } else {
-                        inst->writeU32(effAddr, inst->regs[rd]);
-                    }
+                    uint32_t storeVal = (rd == 15) ? (pc + 8) : inst->regs[rd];
+                    if (isByte) inst->writeU8(effAddr, static_cast<uint8_t>(storeVal & 0xFFU));
+                    else inst->writeU32(effAddr, storeVal);
+                    if ((!preIndex || writeBack) && rn < 15) inst->regs[rn] = modAddr;
                 }
-
-                inst->regs[15] += 4;
+                inst->regs[15] = pc + 4;
                 instructionsExecuted++;
                 continue;
             }
 
-            // 6. Data Processing (MOV, ADD, SUB, CMP, ecc.)
-            if ((insn & 0x0C000000) == 0x00000000) {
-                uint32_t opcode = (insn >> 21) & 0xF;
-                uint32_t rn = (insn >> 16) & 0xF;
-                uint32_t rd = (insn >> 12) & 0xF;
-                bool setFlags = (insn & (1 << 20)) != 0;
-                bool isImm = (insn & (1 << 25)) != 0;
+            if ((insn & 0x0C000000U) == 0x00000000U) {
+                bool isImm = (insn & (1U << 25)) != 0;
 
-                uint32_t op2 = 0;
-                if (isImm) {
-                    uint32_t imm8 = insn & 0xFF;
-                    uint32_t rot = ((insn >> 8) & 0xF) * 2;
-                    op2 = (rot == 0) ? imm8 : ((imm8 >> rot) | (imm8 << (32 - rot)));
-                } else {
-                    op2 = inst->regs[insn & 0xF];
+                if (!isImm && (insn & 0x00000090U) == 0x00000090U) {
+                    uint32_t shBits = (insn >> 5) & 3U;
+                    if (shBits == 0) {
+                        if ((insn & 0x01000000U) != 0) { // LDREX / STREX / SWP
+                            uint32_t opSync = (insn >> 20) & 0xFU, rn = (insn >> 16) & 0xFU, rd = (insn >> 12) & 0xFU, rt = insn & 0xFU;
+                            uint32_t addr = inst->regs[rn];
+                            if (opSync == 0x0 || opSync == 0x4) {
+                                if (opSync == 0x4) { uint8_t oldV = inst->readU8(addr); inst->writeU8(addr, static_cast<uint8_t>(inst->regs[rt])); inst->regs[rd] = oldV; }
+                                else { uint32_t oldV = inst->readU32(addr); inst->writeU32(addr, inst->regs[rt]); inst->regs[rd] = oldV; }
+                            } else if ((opSync & 1U) != 0) {
+                                if (opSync == 0x9) inst->regs[rd] = inst->readU32(addr);
+                                else if (opSync == 0xB) { inst->regs[rd] = inst->readU32(addr); if (rd + 1 < 15) inst->regs[rd + 1] = inst->readU32(addr + 4); }
+                                else if (opSync == 0xD) inst->regs[rd] = inst->readU8(addr);
+                                else if (opSync == 0xF) inst->regs[rd] = inst->readU16(addr);
+                            } else {
+                                if (opSync == 0x8) inst->writeU32(addr, inst->regs[rt]);
+                                else if (opSync == 0xA) { inst->writeU32(addr, inst->regs[rt]); if (rt + 1 < 15) inst->writeU32(addr + 4, inst->regs[rt + 1]); }
+                                else if (opSync == 0xC) inst->writeU8(addr, static_cast<uint8_t>(inst->regs[rt]));
+                                else if (opSync == 0xE) inst->writeU16(addr, static_cast<uint16_t>(inst->regs[rt]));
+                                inst->regs[rd] = 0;
+                            }
+                            inst->regs[15] = pc + 4;
+                            instructionsExecuted++;
+                            continue;
+                        }
+
+                        uint32_t mulOp = (insn >> 21) & 7U;
+                        bool setFlags = (insn & (1U << 20)) != 0;
+                        uint32_t rdHi = (insn >> 16) & 0xFU, rdLo = (insn >> 12) & 0xFU, rs = (insn >> 8) & 0xFU, rm = insn & 0xFU;
+                        if (mulOp == 0) {
+                            uint32_t res = inst->regs[rm] * inst->regs[rs];
+                            inst->regs[rdHi] = res;
+                            if (setFlags) inst->setFlagsNZ(res);
+                        } else if (mulOp == 1) {
+                            uint32_t res = inst->regs[rm] * inst->regs[rs] + inst->regs[rdLo];
+                            inst->regs[rdHi] = res;
+                            if (setFlags) inst->setFlagsNZ(res);
+                        } else if (mulOp == 3) {
+                            inst->regs[rdHi] = inst->regs[rdLo] - (inst->regs[rm] * inst->regs[rs]);
+                        } else if (mulOp >= 4) {
+                            uint64_t prod = 0;
+                            if (mulOp == 4 || mulOp == 5) {
+                                prod = static_cast<uint64_t>(inst->regs[rm]) * static_cast<uint64_t>(inst->regs[rs]);
+                                if (mulOp == 5) prod += (static_cast<uint64_t>(inst->regs[rdHi]) << 32) | inst->regs[rdLo];
+                            } else {
+                                int64_t sprod = static_cast<int64_t>(static_cast<int32_t>(inst->regs[rm])) *
+                                                static_cast<int64_t>(static_cast<int32_t>(inst->regs[rs]));
+                                if (mulOp == 7) sprod += static_cast<int64_t>((static_cast<uint64_t>(inst->regs[rdHi]) << 32) | inst->regs[rdLo]);
+                                prod = static_cast<uint64_t>(sprod);
+                            }
+                            inst->regs[rdLo] = static_cast<uint32_t>(prod);
+                            inst->regs[rdHi] = static_cast<uint32_t>(prod >> 32);
+                            if (setFlags) {
+                                if (prod == 0) inst->cpsr |= FLAG_Z; else inst->cpsr &= ~FLAG_Z;
+                                if (prod & (1ULL << 63)) inst->cpsr |= FLAG_N; else inst->cpsr &= ~FLAG_N;
+                            }
+                        }
+                        inst->regs[15] = pc + 4;
+                        instructionsExecuted++;
+                        continue;
+                    } else { // Extra Load/Store: STRH, LDRH, LDRD, STRD, LDRSB, LDRSH
+                        bool preIndex = (insn & (1U << 24)) != 0, up = (insn & (1U << 23)) != 0;
+                        bool immForm = (insn & (1U << 22)) != 0, writeBack = (insn & (1U << 21)) != 0, isLoad = (insn & (1U << 20)) != 0;
+                        uint32_t rn = (insn >> 16) & 0xFU, rt = (insn >> 12) & 0xFU;
+                        uint32_t offset = immForm ? (((insn >> 4) & 0xF0U) | (insn & 0xFU)) : inst->regs[insn & 0xFU];
+                        uint32_t base = (rn == 15) ? (pc + 8) : inst->regs[rn];
+                        uint32_t modAddr = up ? (base + offset) : (base - offset);
+                        uint32_t effAddr = preIndex ? modAddr : base;
+
+                        if (!isLoad && shBits == 1) inst->writeU16(effAddr, static_cast<uint16_t>(inst->regs[rt]));
+                        else if (isLoad && shBits == 1) inst->regs[rt] = inst->readU16(effAddr);
+                        else if (!isLoad && shBits == 2) { inst->regs[rt] = inst->readU32(effAddr); if (rt + 1 < 15) inst->regs[rt + 1] = inst->readU32(effAddr + 4); }
+                        else if (!isLoad && shBits == 3) { inst->writeU32(effAddr, inst->regs[rt]); if (rt + 1 < 15) inst->writeU32(effAddr + 4, inst->regs[rt + 1]); }
+                        else if (isLoad && shBits == 2) inst->regs[rt] = static_cast<uint32_t>(static_cast<int32_t>(static_cast<int8_t>(inst->readU8(effAddr))));
+                        else if (isLoad && shBits == 3) inst->regs[rt] = static_cast<uint32_t>(static_cast<int32_t>(static_cast<int16_t>(inst->readU16(effAddr))));
+
+                        if ((!preIndex || writeBack) && rn < 15 && !(isLoad && rn == rt)) inst->regs[rn] = modAddr;
+                        inst->regs[15] = pc + 4;
+                        instructionsExecuted++;
+                        continue;
+                    }
                 }
 
-                uint32_t val1 = (rn == 15) ? (pc + 8) : inst->regs[rn];
-                uint32_t res = 0;
-
-                switch (opcode) {
-                    case 0x0: res = val1 & op2; break;         // AND
-                    case 0x1: res = val1 ^ op2; break;         // EOR
-                    case 0x2: res = val1 - op2; break;         // SUB
-                    case 0x4: res = val1 + op2; break;         // ADD
-                    case 0xA: res = val1 - op2; setFlags = true; break; // CMP
-                    case 0xB: res = val1 + op2; setFlags = true; break; // CMN
-                    case 0xC: res = val1 | op2; break;         // ORR
-                    case 0xD: res = op2; break;                // MOV
-                    case 0xE: res = val1 & ~op2; break;        // BIC
-                    case 0xF: res = ~op2; break;               // MVN
-                    default: res = op2; break;
-                }
-
-                if (opcode != 0xA && opcode != 0xB) {
-                    inst->regs[rd] = res;
-                }
-
-                if (setFlags) {
-                    if (res == 0) inst->cpsr |= FLAG_Z; else inst->cpsr &= ~FLAG_Z;
-                    if (res & 0x80000000U) inst->cpsr |= FLAG_N; else inst->cpsr &= ~FLAG_N;
-                }
-
-                if (rd == 15 && opcode != 0xA && opcode != 0xB) {
+                if (!isImm && (insn & 0x01900000U) == 0x01000000U) { // BX, BLX, CLZ, MRS, SMULxy
+                    if ((insn & 0x0FFFFFF0U) == 0x012FFF10U) {
+                        inst->branchWritePC(inst->regs[insn & 0xFU]);
+                        instructionsExecuted++;
+                        continue;
+                    }
+                    if ((insn & 0x0FFFFFF0U) == 0x012FFF30U) {
+                        uint32_t target = inst->regs[insn & 0xFU];
+                        inst->regs[14] = pc + 4;
+                        inst->branchWritePC(target);
+                        instructionsExecuted++;
+                        continue;
+                    }
+                    if ((insn & 0x0FFF0FF0U) == 0x016F0F10U) {
+                        inst->regs[(insn >> 12) & 0xFU] = clz32(inst->regs[insn & 0xFU]);
+                        inst->regs[15] = pc + 4;
+                        instructionsExecuted++;
+                        continue;
+                    }
+                    if ((insn & 0x0FBF0FFFU) == 0x010F0000U) {
+                        inst->regs[(insn >> 12) & 0xFU] = inst->cpsr;
+                        inst->regs[15] = pc + 4;
+                        instructionsExecuted++;
+                        continue;
+                    }
+                    if ((insn & 0x01900090U) == 0x01000080U) {
+                        uint32_t subOp = (insn >> 21) & 3U, rd = (insn >> 16) & 0xFU, ra = (insn >> 12) & 0xFU, rm = (insn >> 8) & 0xFU, rn = insn & 0xFU;
+                        int16_t opN = static_cast<int16_t>((insn & 0x20U) ? (inst->regs[rn] >> 16) : (inst->regs[rn] & 0xFFFFU));
+                        int16_t opM = static_cast<int16_t>((insn & 0x40U) ? (inst->regs[rm] >> 16) : (inst->regs[rm] & 0xFFFFU));
+                        if (subOp == 0) inst->regs[rd] = static_cast<uint32_t>(static_cast<int32_t>(opN) * static_cast<int32_t>(opM) + static_cast<int32_t>(inst->regs[ra]));
+                        else if (subOp == 3) inst->regs[rd] = static_cast<uint32_t>(static_cast<int32_t>(opN) * static_cast<int32_t>(opM));
+                    }
+                    inst->regs[15] = pc + 4;
                     instructionsExecuted++;
                     continue;
                 }
 
-                inst->regs[15] += 4;
-                instructionsExecuted++;
-                continue;
-            }
-
-            // 7. VFP / NEON Instructions (CP10 e CP11)
-            // 7a. VMRS / VMSR
-            if ((insn & 0x0FFF0FFF) == 0x0EF10A10) {
-                // VMRS APSR_nzcv, FPSCR (0xEEF1FA10)
-                inst->cpsr = (inst->cpsr & ~0xF0000000U) | (inst->fpscr & 0xF0000000U);
-                inst->regs[15] += 4;
-                instructionsExecuted++;
-                continue;
-            }
-            if ((insn & 0x0FF00FFF) == 0x0EF00A10) { // VMRS Rt, FPSCR
-                uint32_t rt = (insn >> 12) & 0xF;
-                if (rt != 15) inst->regs[rt] = inst->fpscr;
-                inst->regs[15] += 4;
-                instructionsExecuted++;
-                continue;
-            }
-            if ((insn & 0x0FF00FFF) == 0x0EE00A10) { // VMSR FPSCR, Rt
-                uint32_t rt = (insn >> 12) & 0xF;
-                inst->fpscr = inst->regs[rt];
-                inst->regs[15] += 4;
-                instructionsExecuted++;
-                continue;
-            }
-
-            // 7b. VMOV core <-> single
-            if ((insn & 0x0FE00FD0) == 0x0E000A10) {
-                bool isToCore = (insn & (1 << 20)) != 0;
-                uint32_t vn = (insn >> 16) & 0xF;
-                uint32_t rt = (insn >> 12) & 0xF;
-                uint32_t n = (insn >> 7) & 1;
-                uint32_t sn = (vn << 1) | n;
-                if (isToCore) {
-                    inst->regs[rt] = inst->vfp_s[sn];
-                } else {
-                    inst->vfp_s[sn] = inst->regs[rt];
+                if (isImm && (insn & 0x01900000U) == 0x01000000U) { // MOVW / MOVT
+                    uint32_t sub = (insn >> 20) & 0xFU, rd = (insn >> 12) & 0xFU;
+                    uint32_t imm16 = ((insn >> 4) & 0xF000U) | (insn & 0xFFFU);
+                    if (sub == 0x0) inst->regs[rd] = imm16;
+                    else if (sub == 0x4) inst->regs[rd] = (inst->regs[rd] & 0x0000FFFFU) | (imm16 << 16);
+                    inst->regs[15] = pc + 4;
+                    instructionsExecuted++;
+                    continue;
                 }
-                inst->regs[15] += 4;
-                instructionsExecuted++;
-                continue;
-            }
 
-            // 7c. VMOV core pair <-> double / two singles
-            if ((insn & 0x0FE00FD0) == 0x0C400A10 || (insn & 0x0FE00FD0) == 0x0C400B10) {
-                bool isToCore = (insn & (1 << 20)) != 0;
-                uint32_t rt = (insn >> 12) & 0xF;
-                uint32_t rt2 = (insn >> 16) & 0xF;
-                uint32_t vm = insn & 0xF;
-                uint32_t sBase = vm * 2;
-                if (isToCore) {
-                    inst->regs[rt] = inst->vfp_s[sBase];
-                    inst->regs[rt2] = inst->vfp_s[sBase + 1];
+                uint32_t opcode = (insn >> 21) & 0xFU, rn = (insn >> 16) & 0xFU, rd = (insn >> 12) & 0xFU;
+                bool setFlags = (insn & (1U << 20)) != 0;
+                bool carryIn = (inst->cpsr & FLAG_C) != 0;
+                bool shifterCarry = carryIn;
+                uint32_t op2 = 0;
+
+                if (isImm) {
+                    uint32_t imm8 = insn & 0xFFU, rot = ((insn >> 8) & 0xFU) * 2U;
+                    if (rot == 0) op2 = imm8;
+                    else { op2 = ror32(imm8, rot); shifterCarry = (op2 & 0x80000000U) != 0; }
                 } else {
-                    inst->vfp_s[sBase] = inst->regs[rt];
-                    inst->vfp_s[sBase + 1] = inst->regs[rt2];
+                    uint32_t rm = insn & 0xFU, shiftType = (insn >> 5) & 3U;
+                    bool regShift = (insn & (1U << 4)) != 0;
+                    uint32_t rmVal = (rm == 15) ? (pc + (regShift ? 12U : 8U)) : inst->regs[rm];
+                    if (regShift) op2 = barrelShiftReg(rmVal, shiftType, inst->regs[(insn >> 8) & 0xFU] & 0xFFU, carryIn, shifterCarry);
+                    else op2 = barrelShiftImm(rmVal, shiftType, (insn >> 7) & 0x1FU, carryIn, shifterCarry);
                 }
-                inst->regs[15] += 4;
-                instructionsExecuted++;
-                continue;
-            }
 
-            // 7d. VLDR / VSTR (Single / Double) & VPUSH / VPOP
-            if (((insn & 0x0E200F00) == 0x0D000A00) || ((insn & 0x0E200F00) == 0x0D000B00)) {
-                bool isDouble = ((insn >> 8) & 1) != 0;
-                bool isLoad = (insn & (1 << 20)) != 0;
-                bool writeBack = (insn & (1 << 21)) != 0;
-                bool up = (insn & (1 << 23)) != 0;
-                uint32_t rn = (insn >> 16) & 0xF;
-                uint32_t vd = (insn >> 12) & 0xF;
-                uint32_t d = (insn >> 22) & 1;
-                uint32_t imm8 = insn & 0xFF;
+                uint32_t val1 = (rn == 15) ? (pc + ((!isImm && (insn & (1U << 4))) ? 12U : 8U)) : inst->regs[rn];
+                uint32_t res = 0;
+                bool writeDest = true;
 
-                uint32_t base = (rn == 15) ? (pc + 8) : inst->regs[rn];
+                switch (opcode) {
+                    case 0x0: res = val1 & op2; if (setFlags && rd != 15) inst->setFlagsNZC(res, shifterCarry); break;
+                    case 0x1: res = val1 ^ op2; if (setFlags && rd != 15) inst->setFlagsNZC(res, shifterCarry); break;
+                    case 0x2: res = inst->subWithBorrow(val1, op2, true, setFlags && rd != 15); break;
+                    case 0x3: res = inst->subWithBorrow(op2, val1, true, setFlags && rd != 15); break;
+                    case 0x4: res = inst->addWithCarry(val1, op2, false, setFlags && rd != 15); break;
+                    case 0x5: res = inst->addWithCarry(val1, op2, carryIn, setFlags && rd != 15); break;
+                    case 0x6: res = inst->subWithBorrow(val1, op2, carryIn, setFlags && rd != 15); break;
+                    case 0x7: res = inst->subWithBorrow(op2, val1, carryIn, setFlags && rd != 15); break;
+                    case 0x8: inst->setFlagsNZC(val1 & op2, shifterCarry); writeDest = false; break;
+                    case 0x9: inst->setFlagsNZC(val1 ^ op2, shifterCarry); writeDest = false; break;
+                    case 0xA: inst->subWithBorrow(val1, op2, true, true); writeDest = false; break;
+                    case 0xB: inst->addWithCarry(val1, op2, false, true); writeDest = false; break;
+                    case 0xC: res = val1 | op2; if (setFlags && rd != 15) inst->setFlagsNZC(res, shifterCarry); break;
+                    case 0xD: res = op2; if (setFlags && rd != 15) inst->setFlagsNZC(res, shifterCarry); break;
+                    case 0xE: res = val1 & ~op2; if (setFlags && rd != 15) inst->setFlagsNZC(res, shifterCarry); break;
+                    case 0xF: res = ~op2; if (setFlags && rd != 15) inst->setFlagsNZC(res, shifterCarry); break;
+                }
 
-                if (writeBack) {
-                    // VPUSH / VPOP (VSTM / VLDM)
-                    uint32_t count = imm8; // numero di registri 32-bit
-                    if (isDouble) count /= 2;
-                    uint32_t bytesTotal = count * (isDouble ? 8 : 4);
-                    uint32_t curAddr = up ? base : (base - bytesTotal);
-
-                    for (uint32_t idx = 0; idx < count; ++idx) {
-                        if (!isDouble) {
-                            uint32_t regIdx = ((vd << 1) | d) + idx;
-                            if (regIdx < 32) {
-                                if (isLoad) inst->vfp_s[regIdx] = inst->readU32(curAddr);
-                                else inst->writeU32(curAddr, inst->vfp_s[regIdx]);
-                            }
-                            curAddr += 4;
-                        } else {
-                            uint32_t regIdx = ((d << 4) | vd) + idx;
-                            if (regIdx < 32) {
-                                if (isLoad) {
-                                    uint32_t lo = inst->readU32(curAddr);
-                                    uint32_t hi = inst->readU32(curAddr + 4);
-                                    uint64_t raw = (static_cast<uint64_t>(hi) << 32) | lo;
-                                    inst->setVfpD(regIdx, *reinterpret_cast<double*>(&raw));
-                                } else {
-                                    double dval = inst->getVfpD(regIdx);
-                                    uint64_t raw = *reinterpret_cast<uint64_t*>(&dval);
-                                    inst->writeU32(curAddr, static_cast<uint32_t>(raw & 0xFFFFFFFFU));
-                                    inst->writeU32(curAddr + 4, static_cast<uint32_t>(raw >> 32));
-                                }
-                            }
-                            curAddr += 8;
-                        }
+                if (writeDest) {
+                    if (rd == 15) {
+                        inst->branchWritePC(res);
+                        instructionsExecuted++;
+                        continue;
                     }
-
-                    if (up) inst->regs[rn] += bytesTotal;
-                    else inst->regs[rn] -= bytesTotal;
-                } else {
-                    // VLDR / VSTR singolo
-                    uint32_t offset = imm8 * 4;
-                    uint32_t effAddr = up ? (base + offset) : (base - offset);
-
-                    if (!isDouble) {
-                        uint32_t regIdx = (vd << 1) | d;
-                        if (regIdx < 32) {
-                            if (isLoad) inst->vfp_s[regIdx] = inst->readU32(effAddr);
-                            else inst->writeU32(effAddr, inst->vfp_s[regIdx]);
-                        }
-                    } else {
-                        uint32_t regIdx = (d << 4) | vd;
-                        if (regIdx < 32) {
-                            if (isLoad) {
-                                uint32_t lo = inst->readU32(effAddr);
-                                uint32_t hi = inst->readU32(effAddr + 4);
-                                uint64_t raw = (static_cast<uint64_t>(hi) << 32) | lo;
-                                inst->setVfpD(regIdx, *reinterpret_cast<double*>(&raw));
-                            } else {
-                                double dval = inst->getVfpD(regIdx);
-                                uint64_t raw = *reinterpret_cast<uint64_t*>(&dval);
-                                inst->writeU32(effAddr, static_cast<uint32_t>(raw & 0xFFFFFFFFU));
-                                inst->writeU32(effAddr + 4, static_cast<uint32_t>(raw >> 32));
-                            }
-                        }
-                    }
+                    inst->regs[rd] = res;
                 }
-
-                inst->regs[15] += 4;
+                inst->regs[15] = pc + 4;
                 instructionsExecuted++;
                 continue;
             }
 
-            // 7e. VADD.F32, VSUB.F32, VMUL.F32, VDIV.F32
-            if ((insn & 0x0E000E00) == 0x0E000A00) {
-                uint32_t d = (insn >> 22) & 1;
-                uint32_t n = (insn >> 7) & 1;
-                uint32_t m = (insn >> 5) & 1;
-                uint32_t sd = (((insn >> 12) & 0xF) << 1) | d;
-                uint32_t sn = (((insn >> 16) & 0xF) << 1) | n;
-                uint32_t sm = ((insn & 0xF) << 1) | m;
-
-                float a = inst->getVfpS(sn);
-                float b = inst->getVfpS(sm);
-                float res = 0.0f;
-
-                if ((insn & 0x0F300F50) == 0x0E300A00) res = a + b;           // VADD.F32
-                else if ((insn & 0x0F300F50) == 0x0E300A40) res = a - b;      // VSUB.F32
-                else if ((insn & 0x0F300F50) == 0x0E200A00) res = a * b;      // VMUL.F32
-                else if ((insn & 0x0F300F50) == 0x0E800A00) res = (b != 0.0f) ? (a / b) : 0.0f; // VDIV.F32
-                else res = a;
-
-                inst->setVfpS(sd, res);
-                inst->regs[15] += 4;
-                instructionsExecuted++;
-                continue;
-            }
-
-            // 7f. VCMP.F32
-            if ((insn & 0x0FF00FD0) == 0x0EB40A40 || (insn & 0x0FF00FD0) == 0x0EB50A40) {
-                bool withZero = (insn & (1 << 16)) != 0;
-                uint32_t d = (insn >> 22) & 1;
-                uint32_t m = (insn >> 5) & 1;
-                uint32_t sd = (((insn >> 12) & 0xF) << 1) | d;
-                uint32_t sm = ((insn & 0xF) << 1) | m;
-
-                float fa = inst->getVfpS(sd);
-                float fb = withZero ? 0.0f : inst->getVfpS(sm);
-
-                inst->fpscr &= ~0xF0000000U;
-                if (fa == fb) inst->fpscr |= (FLAG_Z | FLAG_C);
-                else if (fa < fb) inst->fpscr |= FLAG_N;
-                else inst->fpscr |= FLAG_C;
-
-                inst->regs[15] += 4;
-                instructionsExecuted++;
-                continue;
-            }
-
-            // 8. MUL / MLA
-            if ((insn & 0x0FC000F0) == 0x00000090) { // MUL Rd, Rm, Rs
-                uint32_t rd = (insn >> 16) & 0xF;
-                uint32_t rs = (insn >> 8) & 0xF;
-                uint32_t rm = insn & 0xF;
-                inst->regs[rd] = inst->regs[rm] * inst->regs[rs];
-                inst->regs[15] += 4;
-                instructionsExecuted++;
-                continue;
-            }
-            if ((insn & 0x0FC000F0) == 0x00200090) { // MLA Rd, Rm, Rs, Rn
-                uint32_t rd = (insn >> 16) & 0xF;
-                uint32_t rn = (insn >> 12) & 0xF;
-                uint32_t rs = (insn >> 8) & 0xF;
-                uint32_t rm = insn & 0xF;
-                inst->regs[rd] = (inst->regs[rm] * inst->regs[rs]) + inst->regs[rn];
-                inst->regs[15] += 4;
-                instructionsExecuted++;
-                continue;
-            }
-
-            // Fallback avanzamento PC ARM standard
-            inst->regs[15] += 4;
+            inst->regs[15] = pc + 4;
             instructionsExecuted++;
         } else {
-            // ==================== DECODIFICA & ESECUZIONE THUMB ====================
+            // ==================== DECODIFICA & ESECUZIONE THUMB / THUMB-2 ====================
             uint16_t tInsn = 0;
             uc_err tReadErr = inst->readMem(pc, &tInsn, 2);
             if (tReadErr != UC_ERR_OK) {
-                LOGE("uc_emu_start [Thumb]: Fault lettura istruzione al PC=0x%08x", pc);
+                LOGE("uc_emu_start [Thumb]: Fault lettura PC=0x%08x (LR=0x%08x)", pc, inst->regs[14]);
+                if (inst->regs[14] >= 0x1000U && inst->regs[14] != 0xDEADBEEFU && nullRecoveries < 32) {
+                    nullRecoveries++;
+                    inst->regs[0] = 0;
+                    inst->branchWritePC(inst->regs[14]);
+                    continue;
+                }
                 inst->is_running.store(false);
                 return tReadErr;
             }
 
-            // Verifica istruzione Thumb a 32-bit (Thumb-2)
-            bool isThumb32 = ((tInsn & 0xF800) == 0xE800) || ((tInsn & 0xF000) == 0xF000);
+            bool isThumb32 = ((tInsn & 0xF800U) == 0xE800U) || ((tInsn & 0xF000U) == 0xF000U);
+            uint32_t insnLen = isThumb32 ? 4U : 2U;
+
+            bool inItBlock = (inst->itstate & 0x0FU) != 0;
+            if (inItBlock) {
+                uint32_t itCond = (inst->itstate >> 4) & 0xFU;
+                if ((inst->itstate & 0x07U) == 0) inst->itstate = 0;
+                else inst->itstate = static_cast<uint8_t>((inst->itstate & 0xE0U) | ((inst->itstate << 1) & 0x1FU));
+                if (!checkCondition(inst->cpsr, itCond)) {
+                    inst->regs[15] = pc + insnLen;
+                    instructionsExecuted++;
+                    continue;
+                }
+            }
+
             if (isThumb32) {
                 uint16_t tInsn2 = 0;
                 inst->readMem(pc + 2, &tInsn2, 2);
+                uint32_t insn32 = (static_cast<uint32_t>(tInsn) << 16) | tInsn2;
 
-                // Thumb-2 BL / BLX
-                if ((tInsn & 0xF800) == 0xF000 && (tInsn2 & 0xD000) == 0xD000) {
-                    uint32_t s = (tInsn >> 10) & 1;
-                    uint32_t imm10 = tInsn & 0x3FF;
-                    uint32_t j1 = (tInsn2 >> 13) & 1;
-                    uint32_t j2 = (tInsn2 >> 11) & 1;
-                    uint32_t imm11 = tInsn2 & 0x7FF;
-
-                    uint32_t i1 = !(j1 ^ s);
-                    uint32_t i2 = !(j2 ^ s);
-                    int32_t offset = (s << 24) | (i1 << 23) | (i2 << 22) | (imm10 << 12) | (imm11 << 1);
-                    if (s) offset |= 0xFE000000;
-
-                    bool isBlx = (tInsn2 & (1 << 12)) == 0;
-                    inst->regs[14] = (pc + 4) | 1U;
-
-                    uint32_t target = pc + 4 + offset;
-                    if (isBlx) {
-                        inst->cpsr &= ~FLAG_T;
-                        inst->regs[15] = target & ~3U;
-                    } else {
-                        inst->cpsr |= FLAG_T;
-                        inst->regs[15] = target & ~1U;
-                    }
+                if ((tInsn & 0xFC00U) == 0xEC00U) { // VFP / CP15
+                    executeCoprocessorInsn(inst, 0xE0000000U | (insn32 & 0x0FFFFFFFU), (pc + 4U) & ~3U);
+                    inst->regs[15] = pc + 4;
                     instructionsExecuted++;
                     continue;
                 }
 
-                // Per qualsiasi altra istruzione Thumb-2 (inclusi VFP a 32-bit), avanziamo di 4 byte
-                inst->regs[15] += 4;
-                instructionsExecuted++;
-                continue;
-            }
+                if ((tInsn & 0xF800U) == 0xF000U && (tInsn2 & 0x8000U) != 0) { // B.W, B<cond>.W, BL, BLX
+                    uint32_t op1 = (tInsn2 >> 12) & 7U;
+                    if ((op1 & 4U) != 0 || (op1 & 1U) != 0) {
+                        uint32_t s = (tInsn >> 10) & 1U, imm10 = tInsn & 0x3FFU;
+                        uint32_t j1 = (tInsn2 >> 13) & 1U, j2 = (tInsn2 >> 11) & 1U, imm11 = tInsn2 & 0x7FFU;
+                        uint32_t i1 = !(j1 ^ s), i2 = !(j2 ^ s);
+                        int32_t offset = static_cast<int32_t>((s << 24) | (i1 << 23) | (i2 << 22) | (imm10 << 12) | (imm11 << 1));
+                        if (s) offset |= static_cast<int32_t>(0xFE000000U);
 
-            // 1. Thumb PUSH (0xB400 / 0xB500) & POP (0xBC00 / 0xBD00)
-            if ((tInsn & 0xFE00) == 0xB400) { // PUSH {rlist, lr}
-                bool hasLr = (tInsn & (1 << 8)) != 0;
-                uint8_t rlist = tInsn & 0xFF;
-                std::vector<int> regsToPush;
-                for (int i = 0; i < 8; ++i) if (rlist & (1 << i)) regsToPush.push_back(i);
-                if (hasLr) regsToPush.push_back(14);
-
-                inst->regs[13] -= static_cast<uint32_t>(regsToPush.size() * 4);
-                uint32_t sp = inst->regs[13];
-                for (int regIdx : regsToPush) {
-                    inst->writeU32(sp, inst->regs[regIdx]);
-                    sp += 4;
-                }
-                inst->regs[15] += 2;
-                instructionsExecuted++;
-                continue;
-            }
-
-            if ((tInsn & 0xFE00) == 0xBC00) { // POP {rlist, pc}
-                bool hasPc = (tInsn & (1 << 8)) != 0;
-                uint8_t rlist = tInsn & 0xFF;
-                std::vector<int> regsToPop;
-                for (int i = 0; i < 8; ++i) if (rlist & (1 << i)) regsToPop.push_back(i);
-                if (hasPc) regsToPop.push_back(15);
-
-                uint32_t sp = inst->regs[13];
-                for (int regIdx : regsToPop) {
-                    inst->regs[regIdx] = inst->readU32(sp);
-                    sp += 4;
-                }
-                inst->regs[13] = sp;
-
-                if (hasPc) {
-                    uint32_t newPc = inst->regs[15];
-                    if (newPc == 0xDEADBEEF || newPc == 0) {
-                        LOGI("uc_emu_start [Thumb]: Raggiunto return/trap address 0x%08x (Return Value in r0: 0x%08x)",
-                             newPc, inst->regs[0]);
+                        if ((op1 & 4U) != 0) {
+                            inst->regs[14] = (pc + 4U) | 1U;
+                            bool isBlx = (op1 & 1U) == 0;
+                            uint32_t target = (isBlx ? ((pc + 4U) & ~3U) : (pc + 4U)) + offset;
+                            if (isBlx) { inst->cpsr &= ~FLAG_T; inst->regs[15] = target & ~3U; }
+                            else { inst->cpsr |= FLAG_T; inst->regs[15] = target & ~1U; }
+                        } else {
+                            inst->regs[15] = (pc + 4U + offset) & ~1U;
+                        }
+                        inst->itstate = 0;
                         instructionsExecuted++;
-                        break;
+                        continue;
+                    } else if ((op1 & 5U) == 0U) {
+                        uint32_t bCond = (tInsn >> 6) & 0xFU;
+                        if (bCond < 14 && checkCondition(inst->cpsr, bCond)) {
+                            uint32_t s = (tInsn >> 10) & 1U, imm6 = tInsn & 0x3FU;
+                            uint32_t j1 = (tInsn2 >> 13) & 1U, j2 = (tInsn2 >> 11) & 1U, imm11 = tInsn2 & 0x7FFU;
+                            int32_t offset = static_cast<int32_t>((s << 20) | (j2 << 19) | (j1 << 18) | (imm6 << 12) | (imm11 << 1));
+                            if (s) offset |= static_cast<int32_t>(0xFFE00000U);
+                            inst->regs[15] = (pc + 4U + offset) & ~1U;
+                            inst->itstate = 0;
+                            instructionsExecuted++;
+                            continue;
+                        }
                     }
-                    if (newPc & 1) {
-                        inst->cpsr |= FLAG_T;
-                        inst->regs[15] = newPc & ~1U;
-                    } else {
-                        inst->cpsr &= ~FLAG_T;
-                        inst->regs[15] = newPc & ~3U;
-                    }
+                    inst->regs[15] = pc + 4;
                     instructionsExecuted++;
                     continue;
                 }
 
-                inst->regs[15] += 2;
-                instructionsExecuted++;
-                continue;
-            }
-
-            // 2. Thumb BX Rm (0x4700) / BLX Rm (0x4780)
-            if ((tInsn & 0xFF87) == 0x4700) { // BX Rm
-                uint32_t rm = (tInsn >> 3) & 0xF;
-                uint32_t target = inst->regs[rm];
-                if (target == 0xDEADBEEF || target == 0) {
-                    LOGI("uc_emu_start [Thumb BX]: Raggiunto return/trap address 0x%08x (Return Value in r0: 0x%08x)",
-                         target, inst->regs[0]);
+                if ((tInsn & 0xFA00U) == 0xF200U && (tInsn2 & 0x8000U) == 0) { // MOVW, MOVT, ADDW, SUBW, UBFX, SBFX, BFI, BFC
+                    uint32_t op = (tInsn >> 4) & 0x1FU, rn = tInsn & 0xFU, rd = (tInsn2 >> 8) & 0xFU;
+                    uint32_t imm3 = (tInsn2 >> 12) & 7U, imm12 = (((tInsn >> 10) & 1U) << 11) | (imm3 << 8) | (tInsn2 & 0xFFU);
+                    if (op == 0x00) inst->regs[rd] = ((rn == 15) ? ((pc + 4U) & ~3U) : inst->regs[rn]) + imm12;
+                    else if (op == 0x04) inst->regs[rd] = (rn << 12) | imm12;
+                    else if (op == 0x0A) inst->regs[rd] = ((rn == 15) ? ((pc + 4U) & ~3U) : inst->regs[rn]) - imm12;
+                    else if (op == 0x0C) inst->regs[rd] = (inst->regs[rd] & 0x0000FFFFU) | (((rn << 12) | imm12) << 16);
+                    else if (op == 0x14 || op == 0x1C) {
+                        uint32_t lsb = (imm3 << 2) | ((tInsn2 >> 6) & 3U), width = (tInsn2 & 0x1FU) + 1U;
+                        uint32_t val = inst->regs[rn] >> lsb;
+                        if (width < 32U) {
+                            val &= (1U << width) - 1U;
+                            if (op == 0x14 && (val & (1U << (width - 1U)))) val |= ~((1U << width) - 1U);
+                        }
+                        inst->regs[rd] = val;
+                    } else if (op == 0x16) {
+                        uint32_t lsb = (imm3 << 2) | ((tInsn2 >> 6) & 3U), msb = tInsn2 & 0x1FU;
+                        if (msb >= lsb) {
+                            uint32_t width = msb - lsb + 1U;
+                            uint32_t mask = (width >= 32U) ? 0xFFFFFFFFU : ((1U << width) - 1U);
+                            uint32_t src = (rn == 15) ? 0U : (inst->regs[rn] & mask);
+                            inst->regs[rd] = (inst->regs[rd] & ~(mask << lsb)) | (src << lsb);
+                        }
+                    }
+                    inst->regs[15] = pc + 4;
                     instructionsExecuted++;
-                    break;
+                    continue;
                 }
-                if (target & 1) {
-                    inst->cpsr |= FLAG_T;
-                    inst->regs[15] = target & ~1U;
+
+                bool isT2ModImm = ((tInsn & 0xFA00U) == 0xF000U) && ((tInsn2 & 0x8000U) == 0);
+                bool isT2ShiftReg = ((tInsn & 0xFE00U) == 0xEA00U);
+                if (isT2ModImm || isT2ShiftReg) {
+                    uint32_t op = (tInsn >> 5) & 0xFU, rn = tInsn & 0xFU, rd = (tInsn2 >> 8) & 0xFU;
+                    bool setFlags = (tInsn & (1U << 4)) != 0, carryIn = (inst->cpsr & FLAG_C) != 0, shifterCarry = carryIn;
+                    uint32_t op2 = isT2ModImm
+                        ? thumbExpandImmC((((tInsn >> 10) & 1U) << 11) | (((tInsn2 >> 12) & 7U) << 8) | (tInsn2 & 0xFFU), carryIn, shifterCarry)
+                        : barrelShiftImm(inst->regs[tInsn2 & 0xFU], (tInsn2 >> 4) & 3U, (((tInsn2 >> 12) & 7U) << 2) | ((tInsn2 >> 6) & 3U), carryIn, shifterCarry);
+                    uint32_t val1 = inst->regs[rn], res = 0;
+                    bool writeRd = true;
+
+                    switch (op) {
+                        case 0x0: res = val1 & op2; if (rd == 15 && setFlags) { inst->setFlagsNZC(res, shifterCarry); writeRd = false; } else if (setFlags) inst->setFlagsNZC(res, shifterCarry); break;
+                        case 0x1: res = val1 & ~op2; if (setFlags) inst->setFlagsNZC(res, shifterCarry); break;
+                        case 0x2: res = (rn == 15) ? op2 : (val1 | op2); if (setFlags) inst->setFlagsNZC(res, shifterCarry); break;
+                        case 0x3: res = (rn == 15) ? ~op2 : (val1 | ~op2); if (setFlags) inst->setFlagsNZC(res, shifterCarry); break;
+                        case 0x4: res = val1 ^ op2; if (rd == 15 && setFlags) { inst->setFlagsNZC(res, shifterCarry); writeRd = false; } else if (setFlags) inst->setFlagsNZC(res, shifterCarry); break;
+                        case 0x8: if (rd == 15 && setFlags) { inst->addWithCarry(val1, op2, false, true); writeRd = false; } else res = inst->addWithCarry(val1, op2, false, setFlags); break;
+                        case 0xA: res = inst->addWithCarry(val1, op2, carryIn, setFlags); break;
+                        case 0xB: res = inst->subWithBorrow(val1, op2, carryIn, setFlags); break;
+                        case 0xD: if (rd == 15 && setFlags) { inst->subWithBorrow(val1, op2, true, true); writeRd = false; } else res = inst->subWithBorrow(val1, op2, true, setFlags); break;
+                        case 0xE: res = inst->subWithBorrow(op2, val1, true, setFlags); break;
+                        default: writeRd = false; break;
+                    }
+                    if (writeRd) {
+                        if (rd == 15) { inst->branchWritePC(res); instructionsExecuted++; continue; }
+                        inst->regs[rd] = res;
+                    }
+                    inst->regs[15] = pc + 4;
+                    instructionsExecuted++;
+                    continue;
+                }
+
+                if ((tInsn & 0xFE40U) == 0xE800U) { // LDM.W / STM.W
+                    bool up = (tInsn & (1U << 7)) != 0, writeBack = (tInsn & (1U << 5)) != 0, isLoad = (tInsn & (1U << 4)) != 0;
+                    uint32_t rn = tInsn & 0xFU, nRegs = 0;
+                    for (int i = 0; i < 16; ++i) if (tInsn2 & (1U << i)) nRegs++;
+                    uint32_t base = inst->regs[rn], totalBytes = nRegs * 4U, curAddr = up ? base : (base - totalBytes);
+                    bool loadedPcFlag = false;
+                    uint32_t loadedPc = 0;
+
+                    for (int i = 0; i < 16; ++i) {
+                        if (tInsn2 & (1U << i)) {
+                            if (isLoad) {
+                                uint32_t v = inst->readU32(curAddr);
+                                if (i == 15) { loadedPc = v; loadedPcFlag = true; }
+                                else inst->regs[i] = v;
+                            } else inst->writeU32(curAddr, inst->regs[i]);
+                            curAddr += 4;
+                        }
+                    }
+                    if (writeBack && rn < 15 && !(isLoad && (tInsn2 & (1U << rn)))) inst->regs[rn] = up ? (base + totalBytes) : (base - totalBytes);
+                    if (loadedPcFlag) inst->branchWritePC(loadedPc);
+                    else inst->regs[15] = pc + 4;
+                    instructionsExecuted++;
+                    continue;
+                }
+
+                if ((tInsn & 0xFE40U) == 0xE840U) { // TBB, TBH, LDREX/STREX, LDRD/STRD
+                    uint32_t rn = tInsn & 0xFU;
+                    if ((tInsn & 0xFFF0U) == 0xE8D0U && (tInsn2 & 0xFFE0U) == 0xF000U) {
+                        bool isTbh = (tInsn2 & 0x0010U) != 0;
+                        uint32_t rm = tInsn2 & 0xFU, base = (rn == 15) ? (pc + 4U) : inst->regs[rn];
+                        uint32_t hw = isTbh ? inst->readU16(base + (inst->regs[rm] << 1)) : inst->readU8(base + inst->regs[rm]);
+                        inst->regs[15] = (pc + 4U + (hw * 2U)) & ~1U;
+                        inst->itstate = 0;
+                        instructionsExecuted++;
+                        continue;
+                    }
+                    if ((tInsn & 0xFFE0U) == 0xE840U) {
+                        bool isLoad = (tInsn & (1U << 4)) != 0;
+                        uint32_t rt = (tInsn2 >> 12) & 0xFU, rd = (tInsn2 >> 8) & 0xFU, addr = inst->regs[rn] + (tInsn2 & 0xFFU) * 4U;
+                        if (isLoad) inst->regs[rt] = inst->readU32(addr);
+                        else { inst->writeU32(addr, inst->regs[rt]); inst->regs[rd] = 0; }
+                        inst->regs[15] = pc + 4;
+                        instructionsExecuted++;
+                        continue;
+                    }
+                    if ((tInsn & 0xFFE0U) == 0xE8C0U) {
+                        bool isLoad = (tInsn & (1U << 4)) != 0;
+                        uint32_t rt = (tInsn2 >> 12) & 0xFU, rt2 = (tInsn2 >> 8) & 0xFU, opEx = (tInsn2 >> 4) & 0xFU, rd = tInsn2 & 0xFU;
+                        uint32_t addr = inst->regs[rn];
+                        if (isLoad) {
+                            if (opEx == 4) inst->regs[rt] = inst->readU8(addr);
+                            else if (opEx == 5) inst->regs[rt] = inst->readU16(addr);
+                            else if (opEx == 7) { inst->regs[rt] = inst->readU32(addr); inst->regs[rt2] = inst->readU32(addr + 4); }
+                        } else {
+                            if (opEx == 4) inst->writeU8(addr, static_cast<uint8_t>(inst->regs[rt]));
+                            else if (opEx == 5) inst->writeU16(addr, static_cast<uint16_t>(inst->regs[rt]));
+                            else if (opEx == 7) { inst->writeU32(addr, inst->regs[rt]); inst->writeU32(addr + 4, inst->regs[rt2]); }
+                            inst->regs[rd] = 0;
+                        }
+                        inst->regs[15] = pc + 4;
+                        instructionsExecuted++;
+                        continue;
+                    }
+                    bool preIndex = (tInsn & (1U << 8)) != 0, up = (tInsn & (1U << 7)) != 0, writeBack = (tInsn & (1U << 5)) != 0, isLoad = (tInsn & (1U << 4)) != 0;
+                    uint32_t rt = (tInsn2 >> 12) & 0xFU, rt2 = (tInsn2 >> 8) & 0xFU, offset = (tInsn2 & 0xFFU) * 4U;
+                    uint32_t base = (rn == 15) ? ((pc + 4U) & ~3U) : inst->regs[rn];
+                    uint32_t modAddr = up ? (base + offset) : (base - offset);
+                    uint32_t effAddr = preIndex ? modAddr : base;
+                    if (isLoad) { inst->regs[rt] = inst->readU32(effAddr); inst->regs[rt2] = inst->readU32(effAddr + 4); }
+                    else { inst->writeU32(effAddr, inst->regs[rt]); inst->writeU32(effAddr + 4, inst->regs[rt2]); }
+                    if (writeBack && rn < 15) inst->regs[rn] = modAddr;
+                    inst->regs[15] = pc + 4;
+                    instructionsExecuted++;
+                    continue;
+                }
+
+                if ((tInsn & 0xFE00U) == 0xF800U) { // LDR.W / STR.W / LDRB.W / LDRH.W / LDRSB.W / LDRSH.W
+                    bool signExt = (tInsn & (1U << 8)) != 0, imm12Form = (tInsn & (1U << 7)) != 0;
+                    uint32_t sizeCode = (tInsn >> 5) & 3U;
+                    bool isLoad = (tInsn & (1U << 4)) != 0;
+                    uint32_t rn = tInsn & 0xFU, rt = (tInsn2 >> 12) & 0xFU;
+                    if (isLoad && rt == 15 && sizeCode != 2) { inst->regs[15] = pc + 4; instructionsExecuted++; continue; }
+
+                    uint32_t effAddr = 0;
+                    if (rn == 15) {
+                        uint32_t base = (pc + 4U) & ~3U;
+                        effAddr = (tInsn & (1U << 7)) ? (base + (tInsn2 & 0xFFFU)) : (base - (tInsn2 & 0xFFFU));
+                    } else if (imm12Form) {
+                        effAddr = inst->regs[rn] + (tInsn2 & 0xFFFU);
+                    } else if ((tInsn2 & 0x0800U) != 0) {
+                        bool pre = (tInsn2 & (1U << 10)) != 0, up = (tInsn2 & (1U << 9)) != 0, wb = (tInsn2 & (1U << 8)) != 0;
+                        uint32_t base = inst->regs[rn], modAddr = up ? (base + (tInsn2 & 0xFFU)) : (base - (tInsn2 & 0xFFU));
+                        effAddr = pre ? modAddr : base;
+                        if ((!pre || wb) && rn < 15 && !(isLoad && rn == rt)) inst->regs[rn] = modAddr;
+                    } else {
+                        effAddr = inst->regs[rn] + (inst->regs[tInsn2 & 0xFU] << ((tInsn2 >> 4) & 3U));
+                    }
+
+                    if (isLoad) {
+                        uint32_t val = 0;
+                        if (sizeCode == 0) { uint8_t b = inst->readU8(effAddr); val = signExt ? static_cast<uint32_t>(static_cast<int32_t>(static_cast<int8_t>(b))) : b; }
+                        else if (sizeCode == 1) { uint16_t h = inst->readU16(effAddr); val = signExt ? static_cast<uint32_t>(static_cast<int32_t>(static_cast<int16_t>(h))) : h; }
+                        else val = inst->readU32(effAddr);
+                        if (rt == 15) { inst->branchWritePC(val); instructionsExecuted++; continue; }
+                        inst->regs[rt] = val;
+                    } else {
+                        if (sizeCode == 0) inst->writeU8(effAddr, static_cast<uint8_t>(inst->regs[rt]));
+                        else if (sizeCode == 1) inst->writeU16(effAddr, static_cast<uint16_t>(inst->regs[rt]));
+                        else inst->writeU32(effAddr, inst->regs[rt]);
+                    }
+                    inst->regs[15] = pc + 4;
+                    instructionsExecuted++;
+                    continue;
+                }
+
+                if ((tInsn & 0xFE00U) == 0xFA00U) { // Reg shifts, extend, REV, CLZ, MUL/MLA/MLS/SMULL/UMULL/SDIV/UDIV
+                    uint32_t rn = tInsn & 0xFU, rd = (tInsn2 >> 8) & 0xFU, rm = tInsn2 & 0xFU;
+                    if ((tInsn & 0xFF00U) == 0xFA00U && (tInsn2 & 0xF000U) == 0xF000U) {
+                        uint32_t op1 = (tInsn >> 4) & 0xFU, op2 = (tInsn2 >> 4) & 0xFU;
+                        if ((op1 & 8U) == 0 && (op2 & 0xCU) == 0) {
+                            bool cOut = (inst->cpsr & FLAG_C) != 0;
+                            uint32_t res = barrelShiftReg(inst->regs[rn], (op1 >> 1) & 3U, inst->regs[rm] & 0xFFU, cOut, cOut);
+                            inst->regs[rd] = res;
+                            if (op1 & 1U) inst->setFlagsNZC(res, cOut);
+                        } else if ((op1 & 8U) == 0 && (op2 & 8U) != 0) {
+                            uint32_t v = ror32(inst->regs[rm], (op2 & 3U) * 8U), base = (rn == 15) ? 0U : inst->regs[rn], ext = v;
+                            if (op1 == 0) ext = static_cast<uint32_t>(static_cast<int32_t>(static_cast<int16_t>(v & 0xFFFFU)));
+                            else if (op1 == 1) ext = v & 0xFFFFU;
+                            else if (op1 == 4) ext = static_cast<uint32_t>(static_cast<int32_t>(static_cast<int8_t>(v & 0xFFU)));
+                            else if (op1 == 5) ext = v & 0xFFU;
+                            inst->regs[rd] = base + ext;
+                        } else if (op1 == 0x9 && (op2 & 0xCU) == 0x8U) {
+                            uint32_t v = inst->regs[rm];
+                            if ((op2 & 3U) == 0) inst->regs[rd] = __builtin_bswap32(v);
+                            else if ((op2 & 3U) == 1) inst->regs[rd] = ((v >> 8) & 0x00FF00FFU) | ((v & 0x00FF00FFU) << 8);
+                            else if ((op2 & 3U) == 2) inst->regs[rd] = bitrev32(v);
+                            else inst->regs[rd] = static_cast<uint32_t>(static_cast<int32_t>(static_cast<int16_t>(((v & 0xFFFFU) >> 8) | ((v & 0xFFU) << 8))));
+                        } else if (op1 == 0xB && op2 == 0x8) {
+                            inst->regs[rd] = clz32(inst->regs[rm]);
+                        }
+                    } else if ((tInsn & 0xFF80U) == 0xFB00U) {
+                        uint32_t op1 = (tInsn >> 4) & 7U, op2 = (tInsn2 >> 4) & 0xFU, ra = (tInsn2 >> 12) & 0xFU;
+                        if (op1 == 0 && op2 == 0) inst->regs[rd] = (ra == 15) ? (inst->regs[rn] * inst->regs[rm]) : (inst->regs[rn] * inst->regs[rm] + inst->regs[ra]);
+                        else if (op1 == 0 && op2 == 1) inst->regs[rd] = inst->regs[ra] - (inst->regs[rn] * inst->regs[rm]);
+                    } else if ((tInsn & 0xFF80U) == 0xFB80U) {
+                        uint32_t op1 = (tInsn >> 4) & 7U, op2 = (tInsn2 >> 4) & 0xFU, rdLo = (tInsn2 >> 12) & 0xFU, rdHi = rd;
+                        if (op1 == 1 && op2 == 0xF) {
+                            int32_t a = static_cast<int32_t>(inst->regs[rn]), b = static_cast<int32_t>(inst->regs[rm]);
+                            inst->regs[rd] = (b == 0) ? 0U : ((a == -2147483647 - 1 && b == -1) ? 0x80000000U : static_cast<uint32_t>(a / b));
+                        } else if (op1 == 3 && op2 == 0xF) {
+                            uint32_t a = inst->regs[rn], b = inst->regs[rm];
+                            inst->regs[rd] = (b == 0) ? 0U : (a / b);
+                        } else if (op1 == 0 && op2 == 0) {
+                            int64_t p = static_cast<int64_t>(static_cast<int32_t>(inst->regs[rn])) * static_cast<int64_t>(static_cast<int32_t>(inst->regs[rm]));
+                            inst->regs[rdLo] = static_cast<uint32_t>(static_cast<uint64_t>(p));
+                            inst->regs[rdHi] = static_cast<uint32_t>(static_cast<uint64_t>(p) >> 32);
+                        } else if (op1 == 2 && op2 == 0) {
+                            uint64_t p = static_cast<uint64_t>(inst->regs[rn]) * static_cast<uint64_t>(inst->regs[rm]);
+                            inst->regs[rdLo] = static_cast<uint32_t>(p);
+                            inst->regs[rdHi] = static_cast<uint32_t>(p >> 32);
+                        } else if (op1 == 4 && op2 == 0) {
+                            int64_t acc = static_cast<int64_t>((static_cast<uint64_t>(inst->regs[rdHi]) << 32) | inst->regs[rdLo]);
+                            acc += static_cast<int64_t>(static_cast<int32_t>(inst->regs[rn])) * static_cast<int64_t>(static_cast<int32_t>(inst->regs[rm]));
+                            inst->regs[rdLo] = static_cast<uint32_t>(static_cast<uint64_t>(acc));
+                            inst->regs[rdHi] = static_cast<uint32_t>(static_cast<uint64_t>(acc) >> 32);
+                        } else if (op1 == 6 && op2 == 0) {
+                            uint64_t acc = (static_cast<uint64_t>(inst->regs[rdHi]) << 32) | inst->regs[rdLo];
+                            acc += static_cast<uint64_t>(inst->regs[rn]) * static_cast<uint64_t>(inst->regs[rm]);
+                            inst->regs[rdLo] = static_cast<uint32_t>(acc);
+                            inst->regs[rdHi] = static_cast<uint32_t>(acc >> 32);
+                        }
+                    }
+                    inst->regs[15] = pc + 4;
+                    instructionsExecuted++;
+                    continue;
+                }
+
+                inst->regs[15] = pc + 4;
+                instructionsExecuted++;
+                continue;
+            }
+
+            // ==================== THUMB 16-BIT ====================
+            bool updateFlags16 = !inItBlock;
+
+            if ((tInsn & 0xE000U) == 0x0000U) {
+                uint32_t subOp = (tInsn >> 11) & 3U, rd = tInsn & 7U, rn = (tInsn >> 3) & 7U;
+                if (subOp != 3U) {
+                    bool cOut = (inst->cpsr & FLAG_C) != 0;
+                    uint32_t res = barrelShiftImm(inst->regs[rn], subOp, (tInsn >> 6) & 0x1FU, cOut, cOut);
+                    inst->regs[rd] = res;
+                    if (updateFlags16) inst->setFlagsNZC(res, cOut);
                 } else {
-                    inst->cpsr &= ~FLAG_T;
-                    inst->regs[15] = target & ~3U;
+                    bool isImm3 = (tInsn & (1U << 10)) != 0, isSub = (tInsn & (1U << 9)) != 0;
+                    uint32_t rmOrImm = (tInsn >> 6) & 7U, op2 = isImm3 ? rmOrImm : inst->regs[rmOrImm];
+                    inst->regs[rd] = isSub ? inst->subWithBorrow(inst->regs[rn], op2, true, updateFlags16)
+                                           : inst->addWithCarry(inst->regs[rn], op2, false, updateFlags16);
                 }
+                inst->regs[15] = pc + 2;
                 instructionsExecuted++;
                 continue;
             }
 
-            if ((tInsn & 0xFF87) == 0x4780) { // BLX Rm
-                uint32_t rm = (tInsn >> 3) & 0xF;
-                uint32_t target = inst->regs[rm];
-                inst->regs[14] = (pc + 2) | 1U;
-                if (target & 1) {
-                    inst->cpsr |= FLAG_T;
-                    inst->regs[15] = target & ~1U;
+            if ((tInsn & 0xE000U) == 0x2000U) {
+                uint32_t op = (tInsn >> 11) & 3U, rdn = (tInsn >> 8) & 7U, imm8 = tInsn & 0xFFU;
+                if (op == 0) { inst->regs[rdn] = imm8; if (updateFlags16) inst->setFlagsNZ(imm8); }
+                else if (op == 1) inst->subWithBorrow(inst->regs[rdn], imm8, true, true);
+                else if (op == 2) inst->regs[rdn] = inst->addWithCarry(inst->regs[rdn], imm8, false, updateFlags16);
+                else inst->regs[rdn] = inst->subWithBorrow(inst->regs[rdn], imm8, true, updateFlags16);
+                inst->regs[15] = pc + 2;
+                instructionsExecuted++;
+                continue;
+            }
+
+            if ((tInsn & 0xFC00U) == 0x4000U) {
+                uint32_t op = (tInsn >> 6) & 0xFU, rm = (tInsn >> 3) & 7U, rdn = tInsn & 7U;
+                uint32_t a = inst->regs[rdn], b = inst->regs[rm], res = 0;
+                bool cIn = (inst->cpsr & FLAG_C) != 0, cOut = cIn;
+                switch (op) {
+                    case 0x0: res = a & b; inst->regs[rdn] = res; if (updateFlags16) inst->setFlagsNZ(res); break;
+                    case 0x1: res = a ^ b; inst->regs[rdn] = res; if (updateFlags16) inst->setFlagsNZ(res); break;
+                    case 0x2: res = barrelShiftReg(a, 0, b & 0xFFU, cIn, cOut); inst->regs[rdn] = res; if (updateFlags16) inst->setFlagsNZC(res, cOut); break;
+                    case 0x3: res = barrelShiftReg(a, 1, b & 0xFFU, cIn, cOut); inst->regs[rdn] = res; if (updateFlags16) inst->setFlagsNZC(res, cOut); break;
+                    case 0x4: res = barrelShiftReg(a, 2, b & 0xFFU, cIn, cOut); inst->regs[rdn] = res; if (updateFlags16) inst->setFlagsNZC(res, cOut); break;
+                    case 0x5: inst->regs[rdn] = inst->addWithCarry(a, b, cIn, updateFlags16); break;
+                    case 0x6: inst->regs[rdn] = inst->subWithBorrow(a, b, cIn, updateFlags16); break;
+                    case 0x7: res = barrelShiftReg(a, 3, b & 0xFFU, cIn, cOut); inst->regs[rdn] = res; if (updateFlags16) inst->setFlagsNZC(res, cOut); break;
+                    case 0x8: inst->setFlagsNZ(a & b); break;
+                    case 0x9: inst->regs[rdn] = inst->subWithBorrow(0, b, true, updateFlags16); break;
+                    case 0xA: inst->subWithBorrow(a, b, true, true); break;
+                    case 0xB: inst->addWithCarry(a, b, false, true); break;
+                    case 0xC: res = a | b; inst->regs[rdn] = res; if (updateFlags16) inst->setFlagsNZ(res); break;
+                    case 0xD: res = a * b; inst->regs[rdn] = res; if (updateFlags16) inst->setFlagsNZ(res); break;
+                    case 0xE: res = a & ~b; inst->regs[rdn] = res; if (updateFlags16) inst->setFlagsNZ(res); break;
+                    case 0xF: res = ~b; inst->regs[rdn] = res; if (updateFlags16) inst->setFlagsNZ(res); break;
+                }
+                inst->regs[15] = pc + 2;
+                instructionsExecuted++;
+                continue;
+            }
+
+            if ((tInsn & 0xFC00U) == 0x4400U) {
+                uint32_t op = (tInsn >> 8) & 3U, rm = (tInsn >> 3) & 0xFU, rdn = ((tInsn >> 4) & 8U) | (tInsn & 7U);
+                uint32_t mVal = (rm == 15) ? (pc + 4U) : inst->regs[rm], dVal = (rdn == 15) ? (pc + 4U) : inst->regs[rdn];
+                if (op == 0) {
+                    uint32_t res = dVal + mVal;
+                    if (rdn == 15) { inst->regs[15] = res & ~1U; inst->itstate = 0; instructionsExecuted++; continue; }
+                    inst->regs[rdn] = res;
+                } else if (op == 1) {
+                    inst->subWithBorrow(dVal, mVal, true, true);
+                } else if (op == 2) {
+                    if (rdn == 15) { inst->regs[15] = mVal & ~1U; inst->itstate = 0; instructionsExecuted++; continue; }
+                    inst->regs[rdn] = mVal;
                 } else {
-                    inst->cpsr &= ~FLAG_T;
-                    inst->regs[15] = target & ~3U;
+                    if (tInsn & 0x0080U) inst->regs[14] = (pc + 2U) | 1U;
+                    inst->branchWritePC(mVal);
+                    instructionsExecuted++;
+                    continue;
                 }
+                inst->regs[15] = pc + 2;
                 instructionsExecuted++;
                 continue;
             }
 
-            // 3. Thumb Branch incondizionato B (0xE000)
-            if ((tInsn & 0xF800) == 0xE000) {
-                int32_t imm11 = static_cast<int32_t>((tInsn & 0x7FF) << 21) >> 20;
-                inst->regs[15] = pc + 4 + imm11;
+            if ((tInsn & 0xF800U) == 0x4800U) {
+                inst->regs[(tInsn >> 8) & 7U] = inst->readU32(((pc + 4U) & ~3U) + ((tInsn & 0xFFU) * 4U));
+                inst->regs[15] = pc + 2;
                 instructionsExecuted++;
                 continue;
             }
 
-            // 4. Thumb Supervisor Call: SVC #imm (0xDF00)
-            if ((tInsn & 0xFF00) == 0xDF00) {
-                uint32_t svcComment = tInsn & 0xFF;
-                std::vector<HookEntry> intrHooks;
-                {
-                    std::lock_guard<std::mutex> lock(inst->hook_mutex);
-                    for (const auto& h : inst->hooks) {
-                        if (h.type & UC_HOOK_INTR) intrHooks.push_back(h);
+            if ((tInsn & 0xF000U) == 0x5000U) {
+                uint32_t opB = (tInsn >> 9) & 7U, rm = (tInsn >> 6) & 7U, rn = (tInsn >> 3) & 7U, rt = tInsn & 7U;
+                uint32_t addr = inst->regs[rn] + inst->regs[rm];
+                switch (opB) {
+                    case 0: inst->writeU32(addr, inst->regs[rt]); break;
+                    case 1: inst->writeU16(addr, static_cast<uint16_t>(inst->regs[rt])); break;
+                    case 2: inst->writeU8(addr, static_cast<uint8_t>(inst->regs[rt])); break;
+                    case 3: inst->regs[rt] = static_cast<uint32_t>(static_cast<int32_t>(static_cast<int8_t>(inst->readU8(addr)))); break;
+                    case 4: inst->regs[rt] = inst->readU32(addr); break;
+                    case 5: inst->regs[rt] = inst->readU16(addr); break;
+                    case 6: inst->regs[rt] = inst->readU8(addr); break;
+                    case 7: inst->regs[rt] = static_cast<uint32_t>(static_cast<int32_t>(static_cast<int16_t>(inst->readU16(addr)))); break;
+                }
+                inst->regs[15] = pc + 2;
+                instructionsExecuted++;
+                continue;
+            }
+
+            if ((tInsn & 0xE000U) == 0x6000U) {
+                bool isByte = (tInsn & (1U << 12)) != 0, isLoad = (tInsn & (1U << 11)) != 0;
+                uint32_t imm5 = (tInsn >> 6) & 0x1FU, rn = (tInsn >> 3) & 7U, rt = tInsn & 7U;
+                uint32_t addr = inst->regs[rn] + (isByte ? imm5 : (imm5 * 4U));
+                if (isLoad) inst->regs[rt] = isByte ? static_cast<uint32_t>(inst->readU8(addr)) : inst->readU32(addr);
+                else { if (isByte) inst->writeU8(addr, static_cast<uint8_t>(inst->regs[rt])); else inst->writeU32(addr, inst->regs[rt]); }
+                inst->regs[15] = pc + 2;
+                instructionsExecuted++;
+                continue;
+            }
+
+            if ((tInsn & 0xF000U) == 0x8000U) {
+                bool isLoad = (tInsn & (1U << 11)) != 0;
+                uint32_t imm5 = (tInsn >> 6) & 0x1FU, rn = (tInsn >> 3) & 7U, rt = tInsn & 7U;
+                uint32_t addr = inst->regs[rn] + (imm5 * 2U);
+                if (isLoad) inst->regs[rt] = inst->readU16(addr);
+                else inst->writeU16(addr, static_cast<uint16_t>(inst->regs[rt]));
+                inst->regs[15] = pc + 2;
+                instructionsExecuted++;
+                continue;
+            }
+
+            if ((tInsn & 0xF000U) == 0x9000U) {
+                bool isLoad = (tInsn & (1U << 11)) != 0;
+                uint32_t rt = (tInsn >> 8) & 7U, addr = inst->regs[13] + ((tInsn & 0xFFU) * 4U);
+                if (isLoad) inst->regs[rt] = inst->readU32(addr);
+                else inst->writeU32(addr, inst->regs[rt]);
+                inst->regs[15] = pc + 2;
+                instructionsExecuted++;
+                continue;
+            }
+
+            if ((tInsn & 0xF000U) == 0xA000U) {
+                bool fromSp = (tInsn & (1U << 11)) != 0;
+                inst->regs[(tInsn >> 8) & 7U] = (fromSp ? inst->regs[13] : ((pc + 4U) & ~3U)) + ((tInsn & 0xFFU) * 4U);
+                inst->regs[15] = pc + 2;
+                instructionsExecuted++;
+                continue;
+            }
+
+            if ((tInsn & 0xF000U) == 0xB000U) {
+                if ((tInsn & 0xFF00U) == 0xB000U) {
+                    uint32_t imm = (tInsn & 0x7FU) * 4U;
+                    if (tInsn & 0x80U) inst->regs[13] -= imm; else inst->regs[13] += imm;
+                    inst->regs[15] = pc + 2;
+                    instructionsExecuted++;
+                    continue;
+                }
+                if ((tInsn & 0xF500U) == 0xB100U) {
+                    bool nonZero = (tInsn & 0x0800U) != 0;
+                    uint32_t rn = tInsn & 7U, imm = (((tInsn >> 9) & 1U) << 6) | (((tInsn >> 3) & 0x1FU) << 1);
+                    bool take = nonZero ? (inst->regs[rn] != 0) : (inst->regs[rn] == 0);
+                    inst->regs[15] = take ? (pc + 4U + imm) : (pc + 2U);
+                    instructionsExecuted++;
+                    continue;
+                }
+                if ((tInsn & 0xFF00U) == 0xB200U) {
+                    uint32_t opExt = (tInsn >> 6) & 3U, v = inst->regs[(tInsn >> 3) & 7U], rd = tInsn & 7U;
+                    if (opExt == 0) inst->regs[rd] = static_cast<uint32_t>(static_cast<int32_t>(static_cast<int16_t>(v & 0xFFFFU)));
+                    else if (opExt == 1) inst->regs[rd] = static_cast<uint32_t>(static_cast<int32_t>(static_cast<int8_t>(v & 0xFFU)));
+                    else if (opExt == 2) inst->regs[rd] = v & 0xFFFFU;
+                    else inst->regs[rd] = v & 0xFFU;
+                    inst->regs[15] = pc + 2;
+                    instructionsExecuted++;
+                    continue;
+                }
+                if ((tInsn & 0xFE00U) == 0xB400U) {
+                    bool hasLr = (tInsn & (1U << 8)) != 0;
+                    uint8_t rlist = static_cast<uint8_t>(tInsn & 0xFFU);
+                    uint32_t nRegs = hasLr ? 1U : 0U;
+                    for (int i = 0; i < 8; ++i) if (rlist & (1U << i)) nRegs++;
+                    inst->regs[13] -= nRegs * 4U;
+                    uint32_t sp = inst->regs[13];
+                    for (int i = 0; i < 8; ++i) if (rlist & (1U << i)) { inst->writeU32(sp, inst->regs[i]); sp += 4; }
+                    if (hasLr) inst->writeU32(sp, inst->regs[14]);
+                    inst->regs[15] = pc + 2;
+                    instructionsExecuted++;
+                    continue;
+                }
+                if ((tInsn & 0xFF00U) == 0xBA00U) {
+                    uint32_t opRev = (tInsn >> 6) & 3U, v = inst->regs[(tInsn >> 3) & 7U], rd = tInsn & 7U;
+                    if (opRev == 0) inst->regs[rd] = __builtin_bswap32(v);
+                    else if (opRev == 1) inst->regs[rd] = ((v >> 8) & 0x00FF00FFU) | ((v & 0x00FF00FFU) << 8);
+                    else if (opRev == 3) inst->regs[rd] = static_cast<uint32_t>(static_cast<int32_t>(static_cast<int16_t>(((v & 0xFFFFU) >> 8) | ((v & 0xFFU) << 8))));
+                    inst->regs[15] = pc + 2;
+                    instructionsExecuted++;
+                    continue;
+                }
+                if ((tInsn & 0xFE00U) == 0xBC00U) {
+                    bool hasPc = (tInsn & (1U << 8)) != 0;
+                    uint8_t rlist = static_cast<uint8_t>(tInsn & 0xFFU);
+                    uint32_t sp = inst->regs[13];
+                    for (int i = 0; i < 8; ++i) if (rlist & (1U << i)) { inst->regs[i] = inst->readU32(sp); sp += 4; }
+                    uint32_t newPc = 0;
+                    if (hasPc) { newPc = inst->readU32(sp); sp += 4; }
+                    inst->regs[13] = sp;
+                    if (hasPc) { inst->branchWritePC(newPc); instructionsExecuted++; continue; }
+                    inst->regs[15] = pc + 2;
+                    instructionsExecuted++;
+                    continue;
+                }
+                if ((tInsn & 0xFF00U) == 0xBF00U) {
+                    if ((tInsn & 0x0FU) != 0) inst->itstate = static_cast<uint8_t>(tInsn & 0xFFU);
+                    inst->regs[15] = pc + 2;
+                    instructionsExecuted++;
+                    continue;
+                }
+                inst->regs[15] = pc + 2;
+                instructionsExecuted++;
+                continue;
+            }
+
+            if ((tInsn & 0xF000U) == 0xC000U) {
+                bool isLoad = (tInsn & (1U << 11)) != 0;
+                uint32_t rn = (tInsn >> 8) & 7U, addr = inst->regs[rn];
+                uint8_t rlist = static_cast<uint8_t>(tInsn & 0xFFU);
+                for (int i = 0; i < 8; ++i) {
+                    if (rlist & (1U << i)) {
+                        if (isLoad) inst->regs[i] = inst->readU32(addr);
+                        else inst->writeU32(addr, inst->regs[i]);
+                        addr += 4;
                     }
                 }
-                for (const auto& h : intrHooks) {
-                    auto cb = reinterpret_cast<uc_cb_hookintr_t>(h.callback);
-                    uint32_t intnoToSend = (svcComment != 0) ? (0x80000000U | svcComment) : 2U;
-                    cb(uc, intnoToSend, h.user_data);
-                }
-                inst->regs[15] += 2;
+                if (!(isLoad && (rlist & (1U << rn)))) inst->regs[rn] = addr;
+                inst->regs[15] = pc + 2;
                 instructionsExecuted++;
                 continue;
             }
 
-            // Fallback avanzamento PC Thumb standard (2 byte)
-            inst->regs[15] += 2;
+            if ((tInsn & 0xF000U) == 0xD000U) {
+                uint32_t bCond = (tInsn >> 8) & 0xFU;
+                if (bCond == 0xFU) {
+                    inst->regs[15] = pc + 2;
+                    dispatchIntr(tInsn & 0xFFU);
+                    instructionsExecuted++;
+                    continue;
+                }
+                if (bCond < 14 && checkCondition(inst->cpsr, bCond)) {
+                    int32_t imm8 = static_cast<int32_t>(static_cast<int8_t>(tInsn & 0xFFU)) * 2;
+                    inst->regs[15] = (pc + 4U + imm8) & ~1U;
+                    inst->itstate = 0;
+                } else {
+                    inst->regs[15] = pc + 2;
+                }
+                instructionsExecuted++;
+                continue;
+            }
+
+            if ((tInsn & 0xF800U) == 0xE000U) {
+                int32_t imm11 = static_cast<int32_t>((tInsn & 0x7FFU) << 21) >> 20;
+                inst->regs[15] = (pc + 4U + imm11) & ~1U;
+                inst->itstate = 0;
+                instructionsExecuted++;
+                continue;
+            }
+
+            inst->regs[15] = pc + 2;
             instructionsExecuted++;
         }
     }
 
     inst->is_running.store(false);
-    LOGI("uc_emu_start: Emulazione completata al PC=0x%08x (Istruzioni eseguite: %zu, r0=0x%08x)",
-         inst->regs[15], instructionsExecuted, inst->regs[0]);
     return UC_ERR_OK;
 }
 
@@ -1150,7 +2147,6 @@ uc_err uc_emu_stop(uc_engine *uc) {
     auto* inst = reinterpret_cast<UnicornInstance*>(uc);
     inst->stop_requested.store(true);
     inst->is_running.store(false);
-    LOGI("uc_emu_stop: Richiesta terminazione emulazione inviata");
     return UC_ERR_OK;
 }
 

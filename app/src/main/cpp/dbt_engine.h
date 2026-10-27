@@ -11,12 +11,24 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <vector>
+#include <deque>
+#include <mutex>
+#include <condition_variable>
 #include <atomic>
 #include <chrono>
+#include <time.h>
 
 struct ANativeWindow;
 
 namespace emux {
+
+struct TouchEventItem {
+    int action{0};
+    float x{0.0f};
+    float y{0.0f};
+    int pointerId{0};
+};
 
 struct PerformanceGovernor {
     uint32_t targetFps{60};
@@ -33,12 +45,14 @@ struct PerformanceGovernor {
     inline void syncFrame(std::chrono::steady_clock::time_point frameStart) {
         if (!throttleGuardEnabled) return;
         auto now = std::chrono::steady_clock::now();
-        auto elapsedNs = std::chrono::duration_cast<std::chrono::nanoseconds>(now - frameStart).count();
+        auto elapsedNs = static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(now - frameStart).count()
+        );
         if (elapsedNs < frameTimeTargetNs) {
-            auto sleepNs = frameTimeTargetNs - elapsedNs;
-            struct timespec req;
-            req.tv_sec = sleepNs / 1000000000ULL;
-            req.tv_nsec = sleepNs % 1000000000ULL;
+            uint64_t sleepNs = frameTimeTargetNs - elapsedNs;
+            struct timespec req{};
+            req.tv_sec = static_cast<time_t>(sleepNs / 1000000000ULL);
+            req.tv_nsec = static_cast<long>(sleepNs % 1000000000ULL);
             nanosleep(&req, nullptr);
         }
     }
@@ -54,6 +68,7 @@ public:
     bool loadLibrary(const std::string& libraryPath);
     bool startEmulation();
     bool executeEntryPoint() { return startEmulation(); }
+    void requestStop();
 
     void onInterrupt(uint32_t intno);
     void setNativeSurface(ANativeWindow* window);
@@ -68,14 +83,25 @@ public:
 
 private:
     void setupGuestStack();
+    bool ensureWorkerEgl(bool waitIfNull);
+    void processPendingTouchEvents();
     static void hookInterruptCallback(uc_engine* uc, uint32_t intno, void* userData);
 
     uc_engine* uc_{nullptr};
     uc_hook intrHook_{0};
     std::shared_ptr<LoadedLibrary> currentLib_{nullptr};
+    std::vector<std::shared_ptr<LoadedLibrary>> loadedLibs_;
     Elf32Loader loader_;
     PerformanceGovernor governor_;
+
+    std::mutex surfaceMutex_;
+    std::condition_variable surfaceCv_;
     ANativeWindow* nativeWindow_{nullptr};
+    ANativeWindow* boundEglWindow_{nullptr};
+    std::atomic<bool> surfaceDirty_{false};
+
+    std::mutex touchMutex_;
+    std::deque<TouchEventItem> touchQueue_;
 
     EGLDisplay eglDisplay_{EGL_NO_DISPLAY};
     EGLSurface eglSurface_{EGL_NO_SURFACE};

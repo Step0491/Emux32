@@ -1,4 +1,5 @@
 #include "linker_hook.h"
+#include "elf_loader.h"
 #include "unicorn/arm.h"
 
 #include <EGL/egl.h>
@@ -16,9 +17,12 @@
 #include <time.h>
 #include <fcntl.h>
 #include <sys/mman.h>
+#include <zlib.h>
 #include <cstring>
 #include <cerrno>
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <mutex>
 #include <vector>
 #include <string>
@@ -34,12 +38,51 @@ namespace emux {
 
 static std::mutex gHandleMutex;
 static std::string sCustomStoragePath = "/sdcard/Emux32";
-static uint32_t sHeapCurrent = 0x65000000;
+static uint32_t sHeapCurrent = 0x58000000;
 
-// Tabella di mapping dei file aperti (FILE*) per la simulazione libc
 static std::unordered_map<uint32_t, FILE*> sFileTable;
 static uint32_t sNextFileHandle = 0x30000001;
 static std::mutex sFileMutex;
+
+static std::unordered_map<uint32_t, uint32_t> sPthreadTlsMap;
+static uint32_t sNextPthreadKey = 1;
+
+static std::unordered_map<uint32_t, z_stream*> sZlibStreamMap;
+static uint32_t sNextZlibHandle = 0x60000001;
+
+static inline std::string readGuestCString(uc_engine* uc, uint32_t addr, size_t maxLen = 512) {
+    if (!uc || addr == 0) return "";
+    std::string out;
+    out.reserve(64);
+    char chunk[64];
+    size_t readTotal = 0;
+    while (readTotal < maxLen) {
+        size_t toRead = std::min<size_t>(sizeof(chunk), maxLen - readTotal);
+        if (uc_mem_read(uc, addr + readTotal, chunk, toRead) != UC_ERR_OK) break;
+        for (size_t i = 0; i < toRead; ++i) {
+            if (chunk[i] == '\0') return out;
+            out.push_back(chunk[i]);
+        }
+        readTotal += toRead;
+    }
+    return out;
+}
+
+static inline uint32_t allocGuestHeap(uc_engine* uc, uint32_t size, uint32_t align = 16) {
+    if (size == 0) size = 16;
+    if (align < 8) align = 8;
+    uint32_t alignedStart = (sHeapCurrent + (align - 1U)) & ~(align - 1U);
+    uint32_t nextEnd = alignedStart + ((size + 15U) & ~15U);
+
+    // Mappa on-demand eventuali blocchi oltre i primi 128 MB
+    uint32_t pageStart = alignedStart & ~0xFFFU;
+    uint32_t pageEnd = (nextEnd + 0xFFFU) & ~0xFFFU;
+    if (uc && pageEnd > 0x60000000U) {
+        uc_mem_map(uc, pageStart, pageEnd - pageStart, UC_PROT_READ | UC_PROT_WRITE);
+    }
+    sHeapCurrent = nextEnd;
+    return alignedStart;
+}
 
 JniHandleTable& JniHandleTable::getInstance() {
     static JniHandleTable instance;
@@ -60,10 +103,7 @@ jobject JniHandleTable::getObject(jptr32_t handle) {
     if (handle == 0) return nullptr;
     std::lock_guard<std::mutex> lock(gHandleMutex);
     auto it = objectMap_.find(handle);
-    if (it != objectMap_.end()) {
-        return it->second;
-    }
-    return nullptr;
+    return (it != objectMap_.end()) ? it->second : nullptr;
 }
 
 void JniHandleTable::unregisterObject(jptr32_t handle) {
@@ -84,10 +124,7 @@ jmethodID JniHandleTable::getMethod(jptr32_t handle) {
     if (handle == 0) return nullptr;
     std::lock_guard<std::mutex> lock(gHandleMutex);
     auto it = methodMap_.find(handle);
-    if (it != methodMap_.end()) {
-        return it->second;
-    }
-    return nullptr;
+    return (it != methodMap_.end()) ? it->second : nullptr;
 }
 
 void SyscallDispatcher::setStoragePath(const std::string& path) {
@@ -95,34 +132,61 @@ void SyscallDispatcher::setStoragePath(const std::string& path) {
     LOGI("SyscallDispatcher: Percorso storage configurato a '%s'", path.c_str());
 }
 
+static void ensureParentDirs(const std::string& filePath) {
+    size_t pos = 1;
+    while ((pos = filePath.find('/', pos)) != std::string::npos) {
+        std::string dir = filePath.substr(0, pos);
+        mkdir(dir.c_str(), 0775);
+        pos++;
+    }
+}
+
 std::string SyscallDispatcher::resolveFilePath(const char* guestPath) {
     if (!guestPath || guestPath[0] == '\0') return "";
+    std::string pathStr(guestPath);
+    auto& env = GuestRuntimeEnvironment::getInstance();
 
-    // 1. Se il percorso esiste già direttamente sul filesystem host, usalo
-    if (access(guestPath, F_OK) == 0) {
-        return std::string(guestPath);
+    // Redirezione sandbox Android SDK 36 per percorsi dati privati del gioco (/data/data/<pkg> o /data/user/0/<pkg>)
+    const std::string& pkg = env.getPackageName();
+    if (!pkg.empty() && !env.getFilesDir().empty()) {
+        std::string p1 = "/data/data/" + pkg;
+        std::string p2 = "/data/user/0/" + pkg;
+        if (pathStr.rfind(p1, 0) == 0) {
+            std::string redirected = env.getFilesDir() + "/guest_data/" + pkg + pathStr.substr(p1.size());
+            ensureParentDirs(redirected);
+            return redirected;
+        }
+        if (pathStr.rfind(p2, 0) == 0) {
+            std::string redirected = env.getFilesDir() + "/guest_data/" + pkg + pathStr.substr(p2.size());
+            ensureParentDirs(redirected);
+            return redirected;
+        }
     }
 
-    std::string pathStr(guestPath);
+    if (access(guestPath, F_OK) == 0) {
+        return pathStr;
+    }
 
-    // 2. Estrai il nome del file base
     size_t lastSlash = pathStr.find_last_of('/');
     std::string filename = (lastSlash != std::string::npos) ? pathStr.substr(lastSlash + 1) : pathStr;
 
-    // 3. Elenco percorsi alternativi con priorità
-    std::vector<std::string> candidates = {
-        sCustomStoragePath + "/obb/" + filename,
-        sCustomStoragePath + "/apk/" + filename,
-        sCustomStoragePath + "/" + filename,
-        "/storage/emulated/0/Emux32/obb/" + filename,
-        "/storage/emulated/0/Emux32/apk/" + filename,
-        "/storage/emulated/0/Emux32/" + filename,
-        "/sdcard/Emux32/obb/" + filename,
-        "/sdcard/Emux32/apk/" + filename,
-        "/sdcard/Emux32/" + filename,
-        "/storage/emulated/0/Android/obb/" + filename,
-        "/sdcard/Android/obb/" + filename
-    };
+    std::vector<std::string> candidates;
+    if (!env.getObbDir().empty()) {
+        candidates.push_back(env.getObbDir() + "/" + filename);
+    }
+    if (!env.getFilesDir().empty() && !pkg.empty()) {
+        candidates.push_back(env.getFilesDir() + "/obb/" + pkg + "/" + filename);
+    }
+    if (!env.getNativeLibDir().empty()) {
+        candidates.push_back(env.getNativeLibDir() + "/" + filename);
+    }
+    candidates.push_back(sCustomStoragePath + "/obb/" + filename);
+    candidates.push_back(sCustomStoragePath + "/apk/" + filename);
+    candidates.push_back(sCustomStoragePath + "/" + filename);
+    candidates.push_back("/storage/emulated/0/Emux32/obb/" + filename);
+    candidates.push_back("/storage/emulated/0/Emux32/apk/" + filename);
+    candidates.push_back("/storage/emulated/0/Android/obb/" + pkg + "/" + filename);
+    candidates.push_back("/sdcard/Android/obb/" + pkg + "/" + filename);
 
     for (const auto& cand : candidates) {
         if (access(cand.c_str(), F_OK) == 0) {
@@ -134,7 +198,6 @@ std::string SyscallDispatcher::resolveFilePath(const char* guestPath) {
     return pathStr;
 }
 
-// Struttura standard stat64 su kernel Linux ARM a 32-bit (Bionic ABI)
 #pragma pack(push, 4)
 struct kernel_stat64_arm32 {
     uint64_t dev_val;
@@ -177,41 +240,49 @@ static inline void fillStat64(const struct stat& hostSt, kernel_stat64_arm32& st
     st32.ino_64 = hostSt.st_ino;
 }
 
-constexpr uint32_t ARM_NR_exit            = 1;
-constexpr uint32_t ARM_NR_read            = 3;
-constexpr uint32_t ARM_NR_write           = 4;
-constexpr uint32_t ARM_NR_open            = 5;
-constexpr uint32_t ARM_NR_close           = 6;
-constexpr uint32_t ARM_NR_lseek           = 19;
-constexpr uint32_t ARM_NR_getpid          = 20;
-constexpr uint32_t ARM_NR_getuid          = 24;
-constexpr uint32_t ARM_NR_access          = 33;
-constexpr uint32_t ARM_NR_brk             = 45;
-constexpr uint32_t ARM_NR_getgid          = 47;
-constexpr uint32_t ARM_NR_geteuid         = 49;
-constexpr uint32_t ARM_NR_getegid         = 50;
-constexpr uint32_t ARM_NR_ioctl           = 54;
-constexpr uint32_t ARM_NR_fcntl           = 55;
-constexpr uint32_t ARM_NR_gettimeofday    = 78;
-constexpr uint32_t ARM_NR_munmap          = 91;
-constexpr uint32_t ARM_NR_stat            = 106;
-constexpr uint32_t ARM_NR_fstat           = 108;
-constexpr uint32_t ARM_NR_mprotect        = 125;
-constexpr uint32_t ARM_NR__llseek         = 140;
-constexpr uint32_t ARM_NR_sched_yield     = 158;
-constexpr uint32_t ARM_NR_nanosleep       = 162;
-constexpr uint32_t ARM_NR_prctl           = 172;
-constexpr uint32_t ARM_NR_mmap2           = 192;
-constexpr uint32_t ARM_NR_stat64          = 195;
-constexpr uint32_t ARM_NR_lstat64         = 196;
-constexpr uint32_t ARM_NR_fstat64         = 197;
-constexpr uint32_t ARM_NR_fcntl64         = 221;
-constexpr uint32_t ARM_NR_gettid          = 224;
-constexpr uint32_t ARM_NR_futex           = 240;
-constexpr uint32_t ARM_NR_clock_gettime   = 263;
-constexpr uint32_t ARM_NR_openat          = 322;
-constexpr uint32_t ARM_NR_fstatat64       = 327;
-constexpr uint32_t ARM_NR_faccessat       = 334;
+constexpr uint32_t ARM_NR_exit          = 1;
+constexpr uint32_t ARM_NR_read          = 3;
+constexpr uint32_t ARM_NR_write         = 4;
+constexpr uint32_t ARM_NR_open          = 5;
+constexpr uint32_t ARM_NR_close         = 6;
+constexpr uint32_t ARM_NR_unlink        = 10;
+constexpr uint32_t ARM_NR_lseek         = 19;
+constexpr uint32_t ARM_NR_getpid        = 20;
+constexpr uint32_t ARM_NR_getuid        = 24;
+constexpr uint32_t ARM_NR_access        = 33;
+constexpr uint32_t ARM_NR_mkdir         = 39;
+constexpr uint32_t ARM_NR_brk           = 45;
+constexpr uint32_t ARM_NR_getgid        = 47;
+constexpr uint32_t ARM_NR_geteuid       = 49;
+constexpr uint32_t ARM_NR_getegid       = 50;
+constexpr uint32_t ARM_NR_ioctl         = 54;
+constexpr uint32_t ARM_NR_fcntl         = 55;
+constexpr uint32_t ARM_NR_gettimeofday  = 78;
+constexpr uint32_t ARM_NR_munmap        = 91;
+constexpr uint32_t ARM_NR_mprotect      = 125;
+constexpr uint32_t ARM_NR__llseek       = 140;
+constexpr uint32_t ARM_NR_sched_yield   = 158;
+constexpr uint32_t ARM_NR_nanosleep     = 162;
+constexpr uint32_t ARM_NR_prctl         = 172;
+constexpr uint32_t ARM_NR_mmap2         = 192;
+constexpr uint32_t ARM_NR_stat64        = 195;
+constexpr uint32_t ARM_NR_lstat64       = 196;
+constexpr uint32_t ARM_NR_fstat64       = 197;
+constexpr uint32_t ARM_NR_getuid32      = 199;
+constexpr uint32_t ARM_NR_getgid32      = 200;
+constexpr uint32_t ARM_NR_geteuid32     = 201;
+constexpr uint32_t ARM_NR_getegid32     = 202;
+constexpr uint32_t ARM_NR_fcntl64       = 221;
+constexpr uint32_t ARM_NR_gettid        = 224;
+constexpr uint32_t ARM_NR_futex         = 240;
+constexpr uint32_t ARM_NR_exit_group    = 248;
+constexpr uint32_t ARM_NR_clock_gettime = 263;
+constexpr uint32_t ARM_NR_openat        = 322;
+constexpr uint32_t ARM_NR_mkdirat       = 323;
+constexpr uint32_t ARM_NR_fstatat64     = 327;
+constexpr uint32_t ARM_NR_unlinkat      = 328;
+constexpr uint32_t ARM_NR_faccessat     = 334;
+constexpr uint32_t ARM_NR_set_tls       = 0xF0005;
 
 int32_t SyscallDispatcher::handleSyscall(
     uint32_t syscallNum,
@@ -224,294 +295,211 @@ int32_t SyscallDispatcher::handleSyscall(
     uc_engine* uc
 ) {
     switch (syscallNum) {
-        case ARM_NR_write: {
-            int fd = static_cast<int>(r0);
-            uint32_t bufAddr = r1;
-            size_t count = static_cast<size_t>(r2);
-            if (bufAddr == 0 || count == 0) return 0;
-
-            std::vector<char> tempBuf(count);
-            if (uc && uc_mem_read(uc, bufAddr, tempBuf.data(), count) == UC_ERR_OK) {
-                return static_cast<int32_t>(write(fd, tempBuf.data(), count));
-            }
-            return -EFAULT;
-        }
-
-        case ARM_NR_read: {
-            int fd = static_cast<int>(r0);
-            uint32_t bufAddr = r1;
-            size_t count = static_cast<size_t>(r2);
-            if (bufAddr == 0 || count == 0) return 0;
-
-            std::vector<char> tempBuf(count);
-            ssize_t bytesRead = read(fd, tempBuf.data(), count);
-            if (bytesRead > 0 && uc) {
-                uc_mem_write(uc, bufAddr, tempBuf.data(), static_cast<size_t>(bytesRead));
-            }
-            return (bytesRead >= 0) ? static_cast<int32_t>(bytesRead) : -errno;
-        }
-
-        case ARM_NR_open: {
-            uint32_t pathAddr = r0;
-            int flags = static_cast<int>(r1);
-            mode_t mode = static_cast<mode_t>(r2);
-            if (pathAddr == 0) return -EFAULT;
-
-            char pathBuffer[512] = {0};
-            if (uc && uc_mem_read(uc, pathAddr, pathBuffer, sizeof(pathBuffer) - 1) == UC_ERR_OK) {
-                pathBuffer[sizeof(pathBuffer) - 1] = '\0';
-                std::string resolved = resolveFilePath(pathBuffer);
-                int fd = open(resolved.c_str(), flags, mode);
-                return (fd >= 0) ? fd : -errno;
-            }
-            return -EFAULT;
-        }
-
-        case ARM_NR_openat: {
-            int dirfd = static_cast<int>(r0);
-            uint32_t pathAddr = r1;
-            int flags = static_cast<int>(r2);
-            mode_t mode = static_cast<mode_t>(r3);
-            if (pathAddr == 0) return -EFAULT;
-
-            char pathBuffer[512] = {0};
-            if (uc && uc_mem_read(uc, pathAddr, pathBuffer, sizeof(pathBuffer) - 1) == UC_ERR_OK) {
-                pathBuffer[sizeof(pathBuffer) - 1] = '\0';
-                std::string resolved = resolveFilePath(pathBuffer);
-                int fd = openat(dirfd, resolved.c_str(), flags, mode);
-                return (fd >= 0) ? fd : -errno;
-            }
-            return -EFAULT;
-        }
-
-        case ARM_NR_close: {
-            int fd = static_cast<int>(r0);
-            int ret = close(fd);
-            return (ret == 0) ? 0 : -errno;
-        }
-
-        case ARM_NR_lseek: {
-            int fd = static_cast<int>(r0);
-            off_t offset = static_cast<off_t>(static_cast<int32_t>(r1));
-            int whence = static_cast<int>(r2);
-            off_t res = lseek(fd, offset, whence);
-            return (res != (off_t)-1) ? static_cast<int32_t>(res) : -errno;
-        }
-
-        case ARM_NR__llseek: {
-            int fd = static_cast<int>(r0);
-            uint32_t offset_high = r1;
-            uint32_t offset_low = r2;
-            uint32_t resultAddr = r3;
-            uint32_t whence = r4;
-            int64_t offset = (static_cast<int64_t>(offset_high) << 32) | static_cast<int64_t>(offset_low);
-
-            off_t newOff = lseek(fd, static_cast<off_t>(offset), static_cast<int>(whence));
-            if (newOff == (off_t)-1) {
-                return -errno;
-            }
-            if (resultAddr != 0 && uc) {
-                int64_t res64 = static_cast<int64_t>(newOff);
-                uc_mem_write(uc, resultAddr, &res64, sizeof(res64));
+        case ARM_NR_set_tls: {
+            if (uc) {
+                uc_reg_write(uc, UC_ARM_REG_C13_C0_3, &r0);
+                uc_reg_write(uc, UC_ARM_REG_C13_C0_2, &r0);
             }
             return 0;
         }
-
+        case ARM_NR_write: {
+            int fd = static_cast<int>(r0);
+            if (r1 == 0 || r2 == 0) return 0;
+            std::vector<char> tempBuf(r2);
+            if (uc && uc_mem_read(uc, r1, tempBuf.data(), r2) == UC_ERR_OK) {
+                return static_cast<int32_t>(write(fd, tempBuf.data(), r2));
+            }
+            return -EFAULT;
+        }
+        case ARM_NR_read: {
+            int fd = static_cast<int>(r0);
+            if (r1 == 0 || r2 == 0) return 0;
+            std::vector<char> tempBuf(r2);
+            ssize_t bytesRead = read(fd, tempBuf.data(), r2);
+            if (bytesRead > 0 && uc) {
+                uc_mem_write(uc, r1, tempBuf.data(), static_cast<size_t>(bytesRead));
+            }
+            return (bytesRead >= 0) ? static_cast<int32_t>(bytesRead) : -errno;
+        }
+        case ARM_NR_open: {
+            std::string path = readGuestCString(uc, r0);
+            if (path.empty()) return -EFAULT;
+            std::string resolved = resolveFilePath(path.c_str());
+            int fd = open(resolved.c_str(), static_cast<int>(r1), static_cast<mode_t>(r2));
+            return (fd >= 0) ? fd : -errno;
+        }
+        case ARM_NR_openat: {
+            std::string path = readGuestCString(uc, r1);
+            if (path.empty()) return -EFAULT;
+            std::string resolved = resolveFilePath(path.c_str());
+            int fd = openat(static_cast<int>(r0), resolved.c_str(), static_cast<int>(r2), static_cast<mode_t>(r3));
+            return (fd >= 0) ? fd : -errno;
+        }
+        case ARM_NR_mkdir: {
+            std::string path = readGuestCString(uc, r0);
+            if (path.empty()) return -EFAULT;
+            std::string resolved = resolveFilePath(path.c_str());
+            int ret = mkdir(resolved.c_str(), static_cast<mode_t>(r1));
+            return (ret == 0 || errno == EEXIST) ? 0 : -errno;
+        }
+        case ARM_NR_mkdirat: {
+            std::string path = readGuestCString(uc, r1);
+            if (path.empty()) return -EFAULT;
+            std::string resolved = resolveFilePath(path.c_str());
+            int ret = mkdir(resolved.c_str(), static_cast<mode_t>(r2));
+            return (ret == 0 || errno == EEXIST) ? 0 : -errno;
+        }
+        case ARM_NR_unlink: {
+            std::string path = readGuestCString(uc, r0);
+            if (path.empty()) return -EFAULT;
+            std::string resolved = resolveFilePath(path.c_str());
+            return (unlink(resolved.c_str()) == 0) ? 0 : -errno;
+        }
+        case ARM_NR_unlinkat: {
+            std::string path = readGuestCString(uc, r1);
+            if (path.empty()) return -EFAULT;
+            std::string resolved = resolveFilePath(path.c_str());
+            return (unlink(resolved.c_str()) == 0) ? 0 : -errno;
+        }
+        case ARM_NR_close: {
+            int fd = static_cast<int>(r0);
+            if (fd <= 2) return 0;
+            return (close(fd) == 0) ? 0 : -errno;
+        }
+        case ARM_NR_lseek: {
+            off_t res = lseek(static_cast<int>(r0), static_cast<off_t>(static_cast<int32_t>(r1)), static_cast<int>(r2));
+            return (res != (off_t)-1) ? static_cast<int32_t>(res) : -errno;
+        }
+        case ARM_NR__llseek: {
+            int64_t offset = (static_cast<int64_t>(r1) << 32) | static_cast<int64_t>(r2);
+            off_t newOff = lseek(static_cast<int>(r0), static_cast<off_t>(offset), static_cast<int>(r4));
+            if (newOff == (off_t)-1) return -errno;
+            if (r3 != 0 && uc) {
+                int64_t res64 = static_cast<int64_t>(newOff);
+                uc_mem_write(uc, r3, &res64, sizeof(res64));
+            }
+            return 0;
+        }
         case ARM_NR_access: {
-            uint32_t pathAddr = r0;
-            int mode = static_cast<int>(r1);
-            if (pathAddr == 0) return -EFAULT;
-
-            char pathBuffer[512] = {0};
-            if (uc && uc_mem_read(uc, pathAddr, pathBuffer, sizeof(pathBuffer) - 1) == UC_ERR_OK) {
-                std::string resolved = resolveFilePath(pathBuffer);
-                int ret = access(resolved.c_str(), mode);
-                return (ret == 0) ? 0 : -errno;
-            }
-            return -EFAULT;
+            std::string path = readGuestCString(uc, r0);
+            if (path.empty()) return -EFAULT;
+            std::string resolved = resolveFilePath(path.c_str());
+            return (access(resolved.c_str(), static_cast<int>(r1)) == 0) ? 0 : -errno;
         }
-
         case ARM_NR_faccessat: {
-            uint32_t pathAddr = r1;
-            int mode = static_cast<int>(r2);
-            if (pathAddr == 0) return -EFAULT;
-
-            char pathBuffer[512] = {0};
-            if (uc && uc_mem_read(uc, pathAddr, pathBuffer, sizeof(pathBuffer) - 1) == UC_ERR_OK) {
-                std::string resolved = resolveFilePath(pathBuffer);
-                int ret = access(resolved.c_str(), mode);
-                return (ret == 0) ? 0 : -errno;
-            }
-            return -EFAULT;
+            std::string path = readGuestCString(uc, r1);
+            if (path.empty()) return -EFAULT;
+            std::string resolved = resolveFilePath(path.c_str());
+            return (access(resolved.c_str(), static_cast<int>(r2)) == 0) ? 0 : -errno;
         }
-
         case ARM_NR_stat64:
         case ARM_NR_lstat64: {
-            uint32_t pathAddr = r0;
-            uint32_t statBufAddr = r1;
-            if (pathAddr == 0 || statBufAddr == 0) return -EFAULT;
-
-            char pathBuffer[512] = {0};
-            if (uc && uc_mem_read(uc, pathAddr, pathBuffer, sizeof(pathBuffer) - 1) == UC_ERR_OK) {
-                std::string resolved = resolveFilePath(pathBuffer);
-                struct stat hostSt{};
-                int ret = stat(resolved.c_str(), &hostSt);
-                if (ret == 0) {
-                    kernel_stat64_arm32 st32{};
-                    fillStat64(hostSt, st32);
-                    uc_mem_write(uc, statBufAddr, &st32, sizeof(st32));
-                    return 0;
-                }
-                return -errno;
-            }
-            return -EFAULT;
-        }
-
-        case ARM_NR_fstat64: {
-            int fd = static_cast<int>(r0);
-            uint32_t statBufAddr = r1;
-            if (statBufAddr == 0) return -EFAULT;
-
+            std::string path = readGuestCString(uc, r0);
+            if (path.empty() || r1 == 0) return -EFAULT;
+            std::string resolved = resolveFilePath(path.c_str());
             struct stat hostSt{};
-            int ret = fstat(fd, &hostSt);
-            if (ret == 0 && uc) {
+            if (stat(resolved.c_str(), &hostSt) == 0) {
                 kernel_stat64_arm32 st32{};
                 fillStat64(hostSt, st32);
-                uc_mem_write(uc, statBufAddr, &st32, sizeof(st32));
+                uc_mem_write(uc, r1, &st32, sizeof(st32));
                 return 0;
             }
             return -errno;
         }
-
-        case ARM_NR_fstatat64: {
-            uint32_t pathAddr = r1;
-            uint32_t statBufAddr = r2;
-            if (pathAddr == 0 || statBufAddr == 0) return -EFAULT;
-
-            char pathBuffer[512] = {0};
-            if (uc && uc_mem_read(uc, pathAddr, pathBuffer, sizeof(pathBuffer) - 1) == UC_ERR_OK) {
-                std::string resolved = resolveFilePath(pathBuffer);
-                struct stat hostSt{};
-                int ret = stat(resolved.c_str(), &hostSt);
-                if (ret == 0) {
-                    kernel_stat64_arm32 st32{};
-                    fillStat64(hostSt, st32);
-                    uc_mem_write(uc, statBufAddr, &st32, sizeof(st32));
-                    return 0;
-                }
-                return -errno;
+        case ARM_NR_fstat64: {
+            if (r1 == 0) return -EFAULT;
+            struct stat hostSt{};
+            if (fstat(static_cast<int>(r0), &hostSt) == 0 && uc) {
+                kernel_stat64_arm32 st32{};
+                fillStat64(hostSt, st32);
+                uc_mem_write(uc, r1, &st32, sizeof(st32));
+                return 0;
             }
-            return -EFAULT;
+            return -errno;
         }
-
-        case ARM_NR_getpid:  return static_cast<int32_t>(getpid());
-        case ARM_NR_gettid:  return static_cast<int32_t>(getpid());
-        case ARM_NR_getuid:  return static_cast<int32_t>(getuid());
-        case ARM_NR_getgid:  return static_cast<int32_t>(getgid());
-        case ARM_NR_geteuid: return static_cast<int32_t>(geteuid());
-        case ARM_NR_getegid: return static_cast<int32_t>(getegid());
-
-        case ARM_NR_ioctl: {
-            int fd = static_cast<int>(r0);
-            int request = static_cast<int>(r1);
-            return ioctl(fd, request, nullptr);
+        case ARM_NR_fstatat64: {
+            std::string path = readGuestCString(uc, r1);
+            if (path.empty() || r2 == 0) return -EFAULT;
+            std::string resolved = resolveFilePath(path.c_str());
+            struct stat hostSt{};
+            if (stat(resolved.c_str(), &hostSt) == 0) {
+                kernel_stat64_arm32 st32{};
+                fillStat64(hostSt, st32);
+                uc_mem_write(uc, r2, &st32, sizeof(st32));
+                return 0;
+            }
+            return -errno;
         }
-
+        case ARM_NR_getpid:
+        case ARM_NR_gettid:    return static_cast<int32_t>(getpid());
+        case ARM_NR_getuid:
+        case ARM_NR_getuid32:  return static_cast<int32_t>(getuid());
+        case ARM_NR_getgid:
+        case ARM_NR_getgid32:  return static_cast<int32_t>(getgid());
+        case ARM_NR_geteuid:
+        case ARM_NR_geteuid32: return static_cast<int32_t>(geteuid());
+        case ARM_NR_getegid:
+        case ARM_NR_getegid32: return static_cast<int32_t>(getegid());
+        case ARM_NR_ioctl:     return ioctl(static_cast<int>(r0), static_cast<int>(r1), nullptr);
         case ARM_NR_fcntl:
-        case ARM_NR_fcntl64: {
-            return 0;
-        }
-
+        case ARM_NR_fcntl64:   return 0;
         case ARM_NR_brk: {
-            uint32_t newBrk = r0;
-            if (newBrk != 0 && newBrk > sHeapCurrent) {
-                sHeapCurrent = (newBrk + 0xFFFU) & ~0xFFFU;
+            if (r0 != 0 && r0 > sHeapCurrent) {
+                sHeapCurrent = (r0 + 0xFFFU) & ~0xFFFU;
             }
             return static_cast<int32_t>(sHeapCurrent);
         }
-
         case ARM_NR_mmap2: {
             uint32_t guestAddr = r0;
             size_t length = static_cast<size_t>(r1);
+            if (length == 0) length = 0x1000;
+            uint32_t alignedSize = ( static_cast<uint32_t>(length) + 0xFFFU ) & ~0xFFFU;
             if (guestAddr == 0) {
-                guestAddr = sHeapCurrent;
-                sHeapCurrent += (length + 0xFFFU) & ~0xFFFU;
+                guestAddr = (sHeapCurrent + 0xFFFU) & ~0xFFFU;
+                sHeapCurrent = guestAddr + alignedSize;
             }
             uint32_t alignedBase = guestAddr & ~0xFFFU;
-            uint32_t alignedSize = (length + 0xFFFU) & ~0xFFFU;
-
             if (uc) {
                 uc_mem_map(uc, alignedBase, alignedSize, UC_PROT_ALL);
             }
             return static_cast<int32_t>(alignedBase);
         }
-
-        case ARM_NR_munmap: {
+        case ARM_NR_munmap:
+        case ARM_NR_mprotect:
+        case ARM_NR_nanosleep:
+        case ARM_NR_prctl:
+        case ARM_NR_futex:
             return 0;
-        }
-
-        case ARM_NR_mprotect: {
-            return 0;
-        }
-
-        case ARM_NR_sched_yield: {
+        case ARM_NR_sched_yield:
             sched_yield();
             return 0;
-        }
-
-        case ARM_NR_nanosleep: {
-            return 0;
-        }
-
-        case ARM_NR_prctl: {
-            return 0;
-        }
-
-        case ARM_NR_futex: {
-            return 0;
-        }
-
         case ARM_NR_clock_gettime: {
-            clockid_t clk_id = static_cast<clockid_t>(r0);
-            uint32_t tpAddr = r1;
-            if (tpAddr == 0) return -EFAULT;
-
+            if (r1 == 0) return -EFAULT;
             struct timespec ts{};
-            int ret = clock_gettime(clk_id, &ts);
+            int ret = clock_gettime(static_cast<clockid_t>(r0), &ts);
             if (ret == 0 && uc) {
-                uint32_t tp32[2] = {
-                    static_cast<uint32_t>(ts.tv_sec),
-                    static_cast<uint32_t>(ts.tv_nsec)
-                };
-                uc_mem_write(uc, tpAddr, tp32, sizeof(tp32));
+                uint32_t tp32[2] = { static_cast<uint32_t>(ts.tv_sec), static_cast<uint32_t>(ts.tv_nsec) };
+                uc_mem_write(uc, r1, tp32, sizeof(tp32));
             }
             return ret;
         }
-
         case ARM_NR_gettimeofday: {
-            uint32_t tvAddr = r0;
-            if (tvAddr == 0) return -EFAULT;
-
+            if (r0 == 0) return -EFAULT;
             struct timeval tv{};
             int ret = gettimeofday(&tv, nullptr);
             if (ret == 0 && uc) {
-                uint32_t tv32[2] = {
-                    static_cast<uint32_t>(tv.tv_sec),
-                    static_cast<uint32_t>(tv.tv_usec)
-                };
-                uc_mem_write(uc, tvAddr, tv32, sizeof(tv32));
+                uint32_t tv32[2] = { static_cast<uint32_t>(tv.tv_sec), static_cast<uint32_t>(tv.tv_usec) };
+                uc_mem_write(uc, r0, tv32, sizeof(tv32));
             }
             return ret;
         }
-
-        case ARM_NR_exit: {
+        case ARM_NR_exit:
+        case ARM_NR_exit_group: {
             LOGI("Guest process invocato exit(%u)", r0);
             if (uc) uc_emu_stop(uc);
             return 0;
         }
-
         default:
-            LOGW("Syscall ARM32 non implementata: NR=%u (r0=0x%x, r1=0x%x)", syscallNum, r0, r1);
             return 0;
     }
 }
@@ -520,21 +508,13 @@ static void* sGlesHandle = nullptr;
 
 void* SymbolResolver::resolveHostSymbol(const char* symbolName) {
     if (!symbolName) return nullptr;
-
     if (!sGlesHandle) {
         sGlesHandle = dlopen("libGLESv2.so", RTLD_NOW | RTLD_GLOBAL);
-        if (!sGlesHandle) {
-            LOGE("Impossibile caricare libGLESv2.so host: %s", dlerror());
-        }
     }
-
     if (sGlesHandle) {
         void* sym = dlsym(sGlesHandle, symbolName);
-        if (sym) {
-            return sym;
-        }
+        if (sym) return sym;
     }
-
     return dlsym(RTLD_DEFAULT, symbolName);
 }
 
@@ -545,11 +525,46 @@ GuestRuntimeEnvironment& GuestRuntimeEnvironment::getInstance() {
 
 GuestRuntimeEnvironment::GuestRuntimeEnvironment() = default;
 
+void GuestRuntimeEnvironment::setGameContext(
+    const std::string& pkg,
+    const std::string& apkPath,
+    const std::string& obbDir,
+    const std::string& nativeLibDir,
+    const std::string& filesDir
+) {
+    if (!pkg.empty()) packageName_ = pkg;
+    if (!apkPath.empty()) apkPath_ = apkPath;
+    if (!obbDir.empty()) obbDir_ = obbDir;
+    if (!nativeLibDir.empty()) nativeLibDir_ = nativeLibDir;
+    if (!filesDir.empty()) filesDir_ = filesDir;
+    LOGI("GameContext configurato: pkg='%s', apk='%s', obbDir='%s', libDir='%s'",
+         packageName_.c_str(), apkPath_.c_str(), obbDir_.c_str(), nativeLibDir_.c_str());
+}
+
 bool GuestRuntimeEnvironment::initialize(uc_engine* uc) {
     if (!uc) return false;
 
-    // Reset dello stato runtime
-    sHeapCurrent = 0x65000000;
+    // Reset completo dello stato runtime per evitare puntatori di istanze uc_ precedenti
+    sHeapCurrent = 0x58000000;
+    nextTrampolineId_ = 1;
+    symbolToTrampolineMap_.clear();
+    trampolineToSymbolMap_.clear();
+    registeredMethods_.clear();
+    loadedLibraries_.clear();
+    dlopenHandleMap_.clear();
+    nextDlHandle_ = 0x50000010;
+
+    nextMockHandle_ = 0x2000;
+    classHandleMap_.clear();
+    methodHandleMap_.clear();
+    fieldHandleMap_.clear();
+    jstringMap_.clear();
+    jstringGuestPtrMap_.clear();
+    arrayHandleMap_.clear();
+
+    sPthreadTlsMap.clear();
+    sNextPthreadKey = 1;
+
     {
         std::lock_guard<std::mutex> lock(sFileMutex);
         for (auto& pair : sFileTable) {
@@ -558,64 +573,135 @@ bool GuestRuntimeEnvironment::initialize(uc_engine* uc) {
         sFileTable.clear();
         sNextFileHandle = 0x30000001;
     }
+    for (auto& zp : sZlibStreamMap) {
+        if (zp.second) {
+            inflateEnd(zp.second);
+            delete zp.second;
+        }
+    }
+    sZlibStreamMap.clear();
 
-    // 1. Alloca regione JNI (0x7D000000, 64KB allineata)
-    uc_mem_map(uc, guestJniBase_, 0x10000, UC_PROT_READ | UC_PROT_WRITE);
+    // 1. Mappa regione JNI + Bionic Globals (0x7D000000, 64KB, UC_PROT_ALL per stub eseguibili)
+    uc_mem_map(uc, guestJniBase_, 0x10000, UC_PROT_ALL);
 
-    // 2. Alloca regione Trampoline (0x70000000, 64KB allineata)
-    uc_mem_map(uc, guestTrampolineBase_, 0x10000, UC_PROT_ALL);
+    // 2. Mappa regione TLS Bionic (0x7D020000, 16KB) e imposta registro CP15 TPIDRURO
+    uc_mem_map(uc, guestTlsBase_, 0x4000, UC_PROT_READ | UC_PROT_WRITE);
+    uint32_t tlsSlots[16] = {0};
+    tlsSlots[0] = guestTlsBase_; // TLS_SLOT_SELF
+    tlsSlots[1] = guestTlsBase_; // TLS_SLOT_THREAD_ID
+    tlsSlots[6] = 0xDEADBEE0U;   // Stack guard
+    uc_mem_write(uc, guestTlsBase_, tlsSlots, sizeof(tlsSlots));
+    uc_reg_write(uc, UC_ARM_REG_C13_C0_3, &guestTlsBase_);
+    uc_reg_write(uc, UC_ARM_REG_C13_C0_2, &guestTlsBase_);
 
-    // 3. Mappa Heap guest a 0x65000000 (64MB) per allocazioni dinamiche (malloc, calloc, new)
-    uc_mem_map(uc, 0x65000000, 0x04000000, UC_PROT_READ | UC_PROT_WRITE);
+    // 3. Mappa regione Trampoline (0x70000000, 1MB -> fino a 131.072 simboli)
+    uc_mem_map(uc, guestTrampolineBase_, 0x100000, UC_PROT_ALL);
 
-    // 4. Inizializza struttura JavaVM32
+    // 4. Mappa Heap Guest iniziale a 0x58000000 (128MB, demand-paged)
+    uc_mem_map(uc, 0x58000000, 0x08000000, UC_PROT_READ | UC_PROT_WRITE);
+
+    // 5. Inizializza tabella _ctype_ Bionic a 0x7D002400
+    uint8_t ctypeTable[257] = {0};
+    for (int c = 0; c < 128; ++c) {
+        uint8_t flags = 0;
+        if (c >= 'A' && c <= 'Z') flags |= 0x01; // _U
+        if (c >= 'a' && c <= 'z') flags |= 0x02; // _L
+        if (c >= '0' && c <= '9') flags |= 0x04; // _N
+        if (c == ' ' || (c >= '\t' && c <= '\r')) flags |= 0x08; // _S
+        if ((c >= 0 && c < 32) || c == 127) flags |= 0x20; // _C
+        if ((c >= 'A' && c <= 'F') || (c >= 'a' && c <= 'f')) flags |= 0x40; // _X
+        if (c == ' ') flags |= 0x80; // _B
+        if (c > 32 && c < 127 && !flags) flags |= 0x10; // _P
+        ctypeTable[c + 1] = flags;
+    }
+    uc_mem_write(uc, getCtypePointer(), ctypeTable, sizeof(ctypeTable));
+    uint32_t stackGuard = 0xDEADBEE0U;
+    uc_mem_write(uc, getStackChkGuardPointer(), &stackGuard, 4);
+
+    // 6. Costruisci JavaVM32 e tutti gli 8 slot di JNIInvokeInterface32
     JavaVM32 vm32{};
-    vm32.functions = guestJniBase_ + 0x10;
+    vm32.functions = guestJniBase_ + 0x10U;
     uc_mem_write(uc, guestJavaVMAddr_, &vm32, sizeof(vm32));
 
-    // Inizializza tabella JNIInvokeInterface32
     JNIInvokeInterface32 vmVtable{};
-    vmVtable.GetEnv = guestJniBase_ + 0x100;
-    vmVtable.AttachCurrentThread = guestJniBase_ + 0x108;
-    vmVtable.DetachCurrentThread = guestJniBase_ + 0x110;
+    for (uint32_t i = 0; i < 8; ++i) {
+        uint32_t stubAddr = guestJniBase_ + 0x100U + (i * 8U);
+        vmVtable.slots[i] = stubAddr;
+        uint32_t stubInsn[2] = { 0xEF000000U | (0x3000U + i), 0xE12FFF1EU }; // SVC #(0x3000 + i); BX LR
+        uc_mem_write(uc, stubAddr, stubInsn, sizeof(stubInsn));
+    }
     uc_mem_write(uc, vm32.functions, &vmVtable, sizeof(vmVtable));
 
-    // Stub assembly ARM per GetEnv (ritorna JNI_OK e imposta *env = guestJNIEnvAddr_)
-    // Istruzioni ARM: SVC #0x3001, BX LR
-    uint32_t stubGetEnv[2] = {0xEF003001, 0xE12FFF1E};
-    uc_mem_write(uc, guestJniBase_ + 0x100, stubGetEnv, sizeof(stubGetEnv));
-
-    // 5. Inizializza struttura JNIEnv32
+    // 7. Costruisci JNIEnv32 e tutti i 256 slot standard di JNINativeInterface32
     JNIEnv32 env32{};
-    env32.functions = guestJniBase_ + 0x220;
+    env32.functions = guestJniBase_ + 0x220U;
     uc_mem_write(uc, guestJNIEnvAddr_, &env32, sizeof(env32));
 
-    // Inizializza tabella JNINativeInterface32
     JNINativeInterface32 envVtable{};
-    envVtable.GetVersion = guestJniBase_ + 0x300;
-    envVtable.FindClass = guestJniBase_ + 0x308;
-    envVtable.GetMethodID = guestJniBase_ + 0x310;
-    envVtable.GetStaticMethodID = guestJniBase_ + 0x318;
-    envVtable.RegisterNatives = guestJniBase_ + 0x320;
-
+    for (uint32_t i = 0; i < 256; ++i) {
+        uint32_t stubAddr = guestJniBase_ + 0x1000U + (i * 8U);
+        envVtable.slots[i] = stubAddr;
+        uint32_t stubInsn[2] = { 0xEF000000U | (0x4000U + i), 0xE12FFF1EU }; // SVC #(0x4000 + i); BX LR
+        uc_mem_write(uc, stubAddr, stubInsn, sizeof(stubInsn));
+    }
     uc_mem_write(uc, env32.functions, &envVtable, sizeof(envVtable));
 
-    // Stub assembly ARM: SVC #0x3002..#0x3006, BX LR
-    uint32_t stubGetVersion[2]        = {0xEF003002, 0xE12FFF1E};
-    uint32_t stubFindClass[2]         = {0xEF003003, 0xE12FFF1E};
-    uint32_t stubGetMethodID[2]       = {0xEF003004, 0xE12FFF1E};
-    uint32_t stubGetStaticMethodID[2] = {0xEF003005, 0xE12FFF1E};
-    uint32_t stubRegisterNatives[2]   = {0xEF003006, 0xE12FFF1E};
+    classHandleMap_[0x1001] = "android/content/Context";
+    classHandleMap_[0x1002] = "com/unity3d/player/UnityPlayer";
+    classHandleMap_[0x1003] = "android/view/Surface";
+    classHandleMap_[0x1050] = "android/view/MotionEvent";
 
-    uc_mem_write(uc, guestJniBase_ + 0x300, stubGetVersion, sizeof(stubGetVersion));
-    uc_mem_write(uc, guestJniBase_ + 0x308, stubFindClass, sizeof(stubFindClass));
-    uc_mem_write(uc, guestJniBase_ + 0x310, stubGetMethodID, sizeof(stubGetMethodID));
-    uc_mem_write(uc, guestJniBase_ + 0x318, stubGetStaticMethodID, sizeof(stubGetStaticMethodID));
-    uc_mem_write(uc, guestJniBase_ + 0x320, stubRegisterNatives, sizeof(stubRegisterNatives));
-
-    LOGI("GuestRuntimeEnvironment inizializzato: JavaVM32=0x%08x, JNIEnv32=0x%08x, Heap=0x65000000 (64MB)",
-         guestJavaVMAddr_, guestJNIEnvAddr_);
+    LOGI("GuestRuntimeEnvironment inizializzato: JavaVM32=0x%08x, JNIEnv32=0x%08x (256 slot ABI), TLS=0x%08x, Heap=0x58000000",
+         guestJavaVMAddr_, guestJNIEnvAddr_, guestTlsBase_);
     return true;
+}
+
+uint32_t GuestRuntimeEnvironment::createGuestString(uc_engine* uc, const std::string& str) {
+    uint32_t addr = allocGuestHeap(uc, static_cast<uint32_t>(str.size() + 1), 8);
+    if (uc) {
+        uc_mem_write(uc, addr, str.c_str(), str.size() + 1);
+    }
+    return addr;
+}
+
+uint32_t GuestRuntimeEnvironment::createGuestJString(uc_engine* uc, const std::string& str) {
+    uint32_t handle = nextMockHandle_++;
+    jstringMap_[handle] = str;
+    jstringGuestPtrMap_[handle] = createGuestString(uc, str);
+    return handle;
+}
+
+void GuestRuntimeEnvironment::registerLoadedLibrary(const std::shared_ptr<LoadedLibrary>& lib) {
+    if (!lib) return;
+    loadedLibraries_.push_back(lib);
+}
+
+uint32_t GuestRuntimeEnvironment::findExportedSymbol(const std::string& symbolName) const {
+    if (symbolName.empty()) return 0;
+    for (const auto& lib : loadedLibraries_) {
+        if (!lib) continue;
+        for (const auto& sym : lib->symbols) {
+            if (sym.name == symbolName && sym.vaddr != 0) {
+                return lib->load_bias + sym.vaddr;
+            }
+        }
+    }
+    return 0;
+}
+
+uint32_t GuestRuntimeEnvironment::resolveOrRegisterSymbol(const std::string& symbolName, uc_engine* uc) {
+    if (symbolName == "_ctype_") return getCtypePointer();
+    if (symbolName == "__sF") return getSFilePointer();
+    if (symbolName == "__stack_chk_guard") return getStackChkGuardPointer();
+
+    // Se il simbolo appartiene a una libreria guest gia' caricata (es. libc++_shared.so o libmono.so)
+    // ed e' un simbolo C++/Mono non intercettato dagli hook di sistema, usa l'indirizzo reale guest
+    if (symbolName.rfind("_Z", 0) == 0 || symbolName.rfind("mono_", 0) == 0) {
+        uint32_t exported = findExportedSymbol(symbolName);
+        if (exported != 0) return exported;
+    }
+
+    return registerSymbolTrampoline(symbolName, uc);
 }
 
 uint32_t GuestRuntimeEnvironment::registerSymbolTrampoline(const std::string& symbolName, uc_engine* uc) {
@@ -625,15 +711,14 @@ uint32_t GuestRuntimeEnvironment::registerSymbolTrampoline(const std::string& sy
     }
 
     uint32_t trampId = nextTrampolineId_++;
-    uint32_t trampAddr = guestTrampolineBase_ + (trampId * 8);
+    uint32_t trampAddr = guestTrampolineBase_ + (trampId * 8U);
 
     symbolToTrampolineMap_[symbolName] = trampAddr;
     trampolineToSymbolMap_[trampId] = symbolName;
 
-    // Scrive lo stub assembly ARM: SVC #(0x2000 + trampId), BX LR
     uint32_t stubInsn[2] = {
         0xEF000000U | (0x2000U + trampId),
-        0xE12FFF1EU // bx lr
+        0xE12FFF1EU
     };
 
     if (uc) {
@@ -643,1368 +728,2131 @@ uint32_t GuestRuntimeEnvironment::registerSymbolTrampoline(const std::string& sy
     return trampAddr;
 }
 
-void GuestRuntimeEnvironment::handleTrampolineCall(uint32_t trampolineId, uc_engine* uc) {
-    if (!uc) return;
-
-    // Gestione chiamate interne dell'interfaccia JavaVM e JNIEnv
-    if (trampolineId == 0x3001) { // GetEnv(vm, void** env, jint version)
+void GuestRuntimeEnvironment::handleJavaVmCall(uint32_t slotIndex, uc_engine* uc) {
+    // Slots: 3=DestroyJavaVM, 4=AttachCurrentThread, 5=DetachCurrentThread, 6=GetEnv, 7=AttachCurrentThreadAsDaemon
+    if (slotIndex == 4 || slotIndex == 6 || slotIndex == 7) {
         uint32_t envPtrAddr = 0;
         uc_reg_read(uc, UC_ARM_REG_R1, &envPtrAddr);
         if (envPtrAddr != 0) {
             uint32_t envVal = guestJNIEnvAddr_;
             uc_mem_write(uc, envPtrAddr, &envVal, sizeof(envVal));
         }
-        uint32_t ret = 0; // JNI_OK
+    }
+    uint32_t retOk = 0; // JNI_OK
+    uc_reg_write(uc, UC_ARM_REG_R0, &retOk);
+}
+
+void GuestRuntimeEnvironment::handleJniCall(uint32_t slotIndex, uc_engine* uc) {
+    uint32_t r1 = 0, r2 = 0, r3 = 0;
+    uc_reg_read(uc, UC_ARM_REG_R1, &r1);
+    uc_reg_read(uc, UC_ARM_REG_R2, &r2);
+    uc_reg_read(uc, UC_ARM_REG_R3, &r3);
+
+    auto setReturnU32 = [&](uint32_t val) {
+        uc_reg_write(uc, UC_ARM_REG_R0, &val);
+    };
+
+    switch (slotIndex) {
+        case 4: // GetVersion
+            setReturnU32(0x00010006U); // JNI_VERSION_1_6
+            return;
+
+        case 5: // DefineClass
+        case 6: { // FindClass(env, const char* name)
+            std::string clsName = readGuestCString(uc, r1);
+            uint32_t handle = nextMockHandle_++;
+            classHandleMap_[handle] = clsName;
+            LOGI("JNI FindClass('%s') -> handle=0x%x", clsName.c_str(), handle);
+            setReturnU32(handle);
+            return;
+        }
+
+        case 10: // GetSuperclass
+        case 31: { // GetObjectClass(env, jobject obj)
+            auto it = classHandleMap_.find(r1);
+            if (it != classHandleMap_.end()) {
+                setReturnU32(r1);
+            } else {
+                uint32_t handle = nextMockHandle_++;
+                classHandleMap_[handle] = "java/lang/Object";
+                setReturnU32(handle);
+            }
+            return;
+        }
+
+        case 11: // IsAssignableFrom
+        case 24: // IsSameObject
+        case 32: // IsInstanceOf
+            setReturnU32(1); // JNI_TRUE
+            return;
+
+        case 13: // Throw
+        case 14: // ThrowNew
+        case 15: // ExceptionOccurred
+        case 16: // ExceptionDescribe
+        case 17: // ExceptionClear
+        case 228: // ExceptionCheck
+            setReturnU32(0); // Nessuna eccezione Java pendente
+            return;
+
+        case 19: // PushLocalFrame
+        case 26: // EnsureLocalCapacity
+        case 216: // UnregisterNatives
+        case 217: // MonitorEnter
+        case 218: // MonitorExit
+            setReturnU32(0); // JNI_OK
+            return;
+
+        case 20: // PopLocalFrame(env, jobject result)
+        case 21: // NewGlobalRef(env, jobject obj)
+        case 25: // NewLocalRef(env, jobject obj)
+        case 226: // NewWeakGlobalRef
+            setReturnU32(r1 != 0 ? r1 : nextMockHandle_++);
+            return;
+
+        case 22: // DeleteGlobalRef
+        case 23: // DeleteLocalRef
+        case 227: // DeleteWeakGlobalRef
+            setReturnU32(0);
+            return;
+
+        case 27: // AllocObject
+        case 28: // NewObject
+        case 29: // NewObjectV
+        case 30: { // NewObjectA
+            uint32_t handle = nextMockHandle_++;
+            if (classHandleMap_.count(r1)) {
+                classHandleMap_[handle] = classHandleMap_[r1];
+            }
+            setReturnU32(handle);
+            return;
+        }
+
+        case 33: // GetMethodID(env, jclass clazz, const char* name, const char* sig)
+        case 113: { // GetStaticMethodID
+            std::string mName = readGuestCString(uc, r2);
+            std::string mSig = readGuestCString(uc, r3);
+            std::string cName = classHandleMap_.count(r1) ? classHandleMap_[r1] : "";
+            uint32_t handle = nextMockHandle_++;
+            methodHandleMap_[handle] = {cName, mName, mSig, slotIndex == 113};
+            LOGI("JNI %s('%s', '%s', '%s') -> 0x%x",
+                 (slotIndex == 113 ? "GetStaticMethodID" : "GetMethodID"),
+                 cName.c_str(), mName.c_str(), mSig.c_str(), handle);
+            setReturnU32(handle);
+            return;
+        }
+
+        case 94: // GetFieldID(env, jclass clazz, const char* name, const char* sig)
+        case 144: { // GetStaticFieldID
+            std::string fName = readGuestCString(uc, r2);
+            std::string fSig = readGuestCString(uc, r3);
+            std::string cName = classHandleMap_.count(r1) ? classHandleMap_[r1] : "";
+            uint32_t handle = nextMockHandle_++;
+            fieldHandleMap_[handle] = {cName, fName, fSig, slotIndex == 144};
+            setReturnU32(handle);
+            return;
+        }
+
+        // CallObjectMethod / CallNonvirtualObjectMethod / CallStaticObjectMethod
+        case 34: case 35: case 36:
+        case 64: case 65: case 66:
+        case 114: case 115: case 116: {
+            auto mit = methodHandleMap_.find(r2);
+            if (mit != methodHandleMap_.end()) {
+                const auto& info = mit->second;
+                if (info.name == "getPackageName") {
+                    setReturnU32(createGuestJString(uc, packageName_));
+                    return;
+                }
+                if (info.name == "getPackageCodePath" || info.name == "getResourcePath" || info.name == "getApkPath") {
+                    setReturnU32(createGuestJString(uc, apkPath_));
+                    return;
+                }
+                if (info.name == "getObbDir" || info.name == "getExternalStorageDirectory") {
+                    uint32_t dirObj = nextMockHandle_++;
+                    jstringMap_[dirObj] = obbDir_.empty() ? sCustomStoragePath : obbDir_;
+                    setReturnU32(dirObj);
+                    return;
+                }
+                if (info.name == "getFilesDir" || info.name == "getCacheDir" || info.name == "getExternalFilesDir") {
+                    uint32_t dirObj = nextMockHandle_++;
+                    jstringMap_[dirObj] = filesDir_;
+                    setReturnU32(dirObj);
+                    return;
+                }
+                if (info.name == "getAbsolutePath" || info.name == "getPath" || info.name == "toString") {
+                    std::string pathVal = jstringMap_.count(r1) ? jstringMap_[r1] : (obbDir_.empty() ? filesDir_ : obbDir_);
+                    setReturnU32(createGuestJString(uc, pathVal));
+                    return;
+                }
+                if (info.signature.find(")Ljava/lang/String;") != std::string::npos) {
+                    setReturnU32(createGuestJString(uc, ""));
+                    return;
+                }
+                if (info.signature.find(")[") != std::string::npos) {
+                    uint32_t arrH = nextMockHandle_++;
+                    uint32_t buf = allocGuestHeap(uc, 64, 8);
+                    arrayHandleMap_[arrH] = {buf, 0};
+                    setReturnU32(arrH);
+                    return;
+                }
+            }
+            setReturnU32(nextMockHandle_++);
+            return;
+        }
+
+        // CallBooleanMethod / CallStaticBooleanMethod
+        case 37: case 38: case 39:
+        case 67: case 68: case 69:
+        case 117: case 118: case 119:
+            setReturnU32(1);
+            return;
+
+        // CallIntMethod / CallStaticIntMethod (inclusi metodi MotionEvent)
+        case 49: case 50: case 51:
+        case 79: case 80: case 81:
+        case 129: case 130: case 131: {
+            auto mit = methodHandleMap_.find(r2);
+            if (mit != methodHandleMap_.end()) {
+                const std::string& mName = mit->second.name;
+                if (mName == "getAction" || mName == "getActionMasked") {
+                    setReturnU32(static_cast<uint32_t>(lastTouchAction_.load()));
+                    return;
+                }
+                if (mName == "getPointerCount") {
+                    setReturnU32(1);
+                    return;
+                }
+                if (mName == "getPointerId") {
+                    setReturnU32(static_cast<uint32_t>(lastTouchPointerId_.load()));
+                    return;
+                }
+                if (mName == "getSource") {
+                    setReturnU32(0x1002U); // SOURCE_TOUCHSCREEN
+                    return;
+                }
+                if (mName == "getWidth") { setReturnU32(1920); return; }
+                if (mName == "getHeight") { setReturnU32(1080); return; }
+                if (mName == "getRotation") { setReturnU32(1); return; }
+            }
+            setReturnU32(0);
+            return;
+        }
+
+        // CallFloatMethod / CallStaticFloatMethod (MotionEvent.getX / getY / getPressure)
+        case 55: case 56: case 57:
+        case 85: case 86: case 87:
+        case 135: case 136: case 137: {
+            float fVal = 0.0f;
+            auto mit = methodHandleMap_.find(r2);
+            if (mit != methodHandleMap_.end()) {
+                const std::string& mName = mit->second.name;
+                if (mName == "getX") fVal = lastTouchX_.load();
+                else if (mName == "getY") fVal = lastTouchY_.load();
+                else if (mName == "getPressure" || mName == "getSize") fVal = 1.0f;
+            }
+            uint32_t raw = 0;
+            std::memcpy(&raw, &fVal, 4);
+            setReturnU32(raw);
+            return;
+        }
+
+        // GetObjectField / GetStaticObjectField
+        case 95:
+        case 145: {
+            auto fit = fieldHandleMap_.find(r2);
+            if (fit != fieldHandleMap_.end()) {
+                const auto& f = fit->second;
+                if (f.name == "sourceDir" || f.name == "publicSourceDir") {
+                    setReturnU32(createGuestJString(uc, apkPath_));
+                    return;
+                }
+                if (f.name == "dataDir") {
+                    setReturnU32(createGuestJString(uc, filesDir_));
+                    return;
+                }
+                if (f.name == "nativeLibraryDir") {
+                    setReturnU32(createGuestJString(uc, nativeLibDir_));
+                    return;
+                }
+                if (f.name == "packageName") {
+                    setReturnU32(createGuestJString(uc, packageName_));
+                    return;
+                }
+                if (f.signature == "Ljava/lang/String;") {
+                    setReturnU32(createGuestJString(uc, ""));
+                    return;
+                }
+            }
+            setReturnU32(nextMockHandle_++);
+            return;
+        }
+
+        //GetStaticIntField (es. Build$VERSION.SDK_INT -> 27)
+        case 100:
+        case 150: {
+            auto fit = fieldHandleMap_.find(r2);
+            if (fit != fieldHandleMap_.end() && fit->second.name == "SDK_INT") {
+                setReturnU32(27);
+                return;
+            }
+            setReturnU32(0);
+            return;
+        }
+
+        // String Operations (163..170)
+        case 163: // NewString(env, const jchar*, jsize)
+        case 167: { // NewStringUTF(env, const char* bytes)
+            std::string s = (slotIndex == 167) ? readGuestCString(uc, r1) : "";
+            setReturnU32(createGuestJString(uc, s));
+            return;
+        }
+        case 164: // GetStringLength
+        case 168: { // GetStringUTFLength
+            auto it = jstringMap_.find(r1);
+            setReturnU32(it != jstringMap_.end() ? static_cast<uint32_t>(it->second.size()) : 0U);
+            return;
+        }
+        case 165: // GetStringChars
+        case 169: // GetStringUTFChars(env, jstring, jboolean* isCopy)
+        case 224: { // GetStringCritical
+            if (r2 != 0) {
+                uint8_t zero = 0;
+                uc_mem_write(uc, r2, &zero, 1);
+            }
+            auto it = jstringGuestPtrMap_.find(r1);
+            if (it != jstringGuestPtrMap_.end()) {
+                setReturnU32(it->second);
+            } else {
+                setReturnU32(createGuestString(uc, ""));
+            }
+            return;
+        }
+        case 166: // ReleaseStringChars
+        case 170: // ReleaseStringUTFChars
+        case 225: // ReleaseStringCritical
+            setReturnU32(0);
+            return;
+
+        // Array Operations (171..214)
+        case 171: { // GetArrayLength
+            auto it = arrayHandleMap_.find(r1);
+            setReturnU32(it != arrayHandleMap_.end() ? it->second.second : 0U);
+            return;
+        }
+        case 172: // NewObjectArray
+        case 175: case 176: case 177: case 178:
+        case 179: case 180: case 181: case 182: { // New<Primitive>Array(env, jsize len)
+            uint32_t len = (r1 < 0x100000U) ? r1 : 0U;
+            uint32_t arrH = nextMockHandle_++;
+            uint32_t buf = allocGuestHeap(uc, len * 8U + 16U, 16);
+            arrayHandleMap_[arrH] = {buf, len};
+            setReturnU32(arrH);
+            return;
+        }
+        case 173: { // GetObjectArrayElement(env, jobjectArray, jsize index)
+            uint32_t val = 0;
+            auto it = arrayHandleMap_.find(r1);
+            if (it != arrayHandleMap_.end() && r2 < it->second.second) {
+                uc_mem_read(uc, it->second.first + (r2 * 4U), &val, 4);
+            }
+            setReturnU32(val);
+            return;
+        }
+        case 174: { // SetObjectArrayElement(env, jobjectArray, jsize index, jobject val)
+            auto it = arrayHandleMap_.find(r1);
+            if (it != arrayHandleMap_.end() && r2 < it->second.second) {
+                uc_mem_write(uc, it->second.first + (r2 * 4U), &r3, 4);
+            }
+            setReturnU32(0);
+            return;
+        }
+        case 183: case 184: case 185: case 186:
+        case 187: case 188: case 189: case 190:
+        case 222: { // Get<Primitive>ArrayElements / GetPrimitiveArrayCritical
+            if (r2 != 0) {
+                uint8_t zero = 0;
+                uc_mem_write(uc, r2, &zero, 1);
+            }
+            auto it = arrayHandleMap_.find(r1);
+            if (it != arrayHandleMap_.end()) {
+                setReturnU32(it->second.first);
+            } else {
+                setReturnU32(allocGuestHeap(uc, 64, 16));
+            }
+            return;
+        }
+        case 191: case 192: case 193: case 194:
+        case 195: case 196: case 197: case 198:
+        case 223: // Release<Primitive>ArrayElements
+            setReturnU32(0);
+            return;
+
+        case 199: case 200: case 201: case 202:
+        case 203: case 204: case 205: case 206: { // Get<Primitive>ArrayRegion(env, array, start, len, buf)
+            uint32_t sp = 0, dstBuf = 0;
+            uc_reg_read(uc, UC_ARM_REG_SP, &sp);
+            uc_mem_read(uc, sp, &dstBuf, 4);
+            auto it = arrayHandleMap_.find(r1);
+            if (it != arrayHandleMap_.end() && dstBuf != 0 && r3 > 0 && r3 < 0x100000U) {
+                size_t elemSz = (slotIndex == 199 || slotIndex == 200) ? 1 : ((slotIndex == 201 || slotIndex == 202) ? 2 : ((slotIndex == 204 || slotIndex == 206) ? 8 : 4));
+                std::vector<uint8_t> tmp(r3 * elemSz, 0);
+                uc_mem_read(uc, it->second.first + (r2 * elemSz), tmp.data(), tmp.size());
+                uc_mem_write(uc, dstBuf, tmp.data(), tmp.size());
+            }
+            setReturnU32(0);
+            return;
+        }
+
+        case 207: case 208: case 209: case 210:
+        case 211: case 212: case 213: case 214: { // Set<Primitive>ArrayRegion(env, array, start, len, buf)
+            uint32_t sp = 0, srcBuf = 0;
+            uc_reg_read(uc, UC_ARM_REG_SP, &sp);
+            uc_mem_read(uc, sp, &srcBuf, 4);
+            auto it = arrayHandleMap_.find(r1);
+            if (it != arrayHandleMap_.end() && srcBuf != 0 && r3 > 0 && r3 < 0x100000U) {
+                size_t elemSz = (slotIndex == 207 || slotIndex == 208) ? 1 : ((slotIndex == 209 || slotIndex == 210) ? 2 : ((slotIndex == 212 || slotIndex == 214) ? 8 : 4));
+                std::vector<uint8_t> tmp(r3 * elemSz, 0);
+                uc_mem_read(uc, srcBuf, tmp.data(), tmp.size());
+                uc_mem_write(uc, it->second.first + (r2 * elemSz), tmp.data(), tmp.size());
+            }
+            setReturnU32(0);
+            return;
+        }
+
+        // SLOT 215 (offset 0x35C): RegisterNatives(JNIEnv* env, jclass clazz, const JNINativeMethod* methods, jint nMethods)
+        case 215: {
+            uint32_t methodsAddr = r2;
+            uint32_t nMethods = r3;
+            std::string clsName = classHandleMap_.count(r1) ? classHandleMap_[r1] : "UnknownClass";
+            LOGI("JNI RegisterNatives invocato per classe '%s': %u metodi (methodsAddr=0x%08x)",
+                 clsName.c_str(), nMethods, methodsAddr);
+
+            for (uint32_t i = 0; i < nMethods && i < 128; ++i) {
+                uint32_t entryAddr = methodsAddr + (i * 12U);
+                uint32_t namePtr = 0, sigPtr = 0, fnPtr = 0;
+                uc_mem_read(uc, entryAddr, &namePtr, 4);
+                uc_mem_read(uc, entryAddr + 4, &sigPtr, 4);
+                uc_mem_read(uc, entryAddr + 8, &fnPtr, 4);
+
+                std::string mName = readGuestCString(uc, namePtr, 128);
+                std::string mSig = readGuestCString(uc, sigPtr, 128);
+                LOGI("   -> Registrato JNINativeMethod[%u]: %s.%s %s -> Entry: 0x%08x",
+                     i, clsName.c_str(), mName.c_str(), mSig.c_str(), fnPtr);
+                addRegisteredMethod(clsName, mName, mSig, fnPtr);
+            }
+            setReturnU32(0); // JNI_OK
+            return;
+        }
+
+        case 219: { // GetJavaVM(JNIEnv* env, JavaVM** vm)
+            if (r1 != 0) {
+                uc_mem_write(uc, r1, &guestJavaVMAddr_, 4);
+            }
+            setReturnU32(0); // JNI_OK
+            return;
+        }
+
+        case 229: { // NewDirectByteBuffer(env, void* address, jlong capacity)
+            uint32_t h = nextMockHandle_++;
+            arrayHandleMap_[h] = {r1, r2};
+            setReturnU32(h);
+            return;
+        }
+        case 230: { // GetDirectBufferAddress
+            auto it = arrayHandleMap_.find(r1);
+            setReturnU32(it != arrayHandleMap_.end() ? it->second.first : 0U);
+            return;
+        }
+        case 231: { // GetDirectBufferCapacity
+            auto it = arrayHandleMap_.find(r1);
+            uint32_t cap = it != arrayHandleMap_.end() ? it->second.second : 0U;
+            uint32_t zero = 0;
+            uc_reg_write(uc, UC_ARM_REG_R0, &cap);
+            uc_reg_write(uc, UC_ARM_REG_R1, &zero);
+            return;
+        }
+
+        default:
+            setReturnU32(0);
+            return;
+    }
+}
+
+static std::string formatGuestPrintf(uc_engine* uc, const std::string& fmt, uint32_t firstArgRegIdx, uint32_t vaListGuestAddr) {
+    uint32_t rArgs[4] = {0};
+    uc_reg_read(uc, UC_ARM_REG_R0, &rArgs[0]);
+    uc_reg_read(uc, UC_ARM_REG_R1, &rArgs[1]);
+    uc_reg_read(uc, UC_ARM_REG_R2, &rArgs[2]);
+    uc_reg_read(uc, UC_ARM_REG_R3, &rArgs[3]);
+    uint32_t sp = 0;
+    uc_reg_read(uc, UC_ARM_REG_SP, &sp);
+
+    uint32_t regCursor = firstArgRegIdx;
+    uint32_t memCursor = (vaListGuestAddr != 0) ? vaListGuestAddr : sp;
+    bool useVaPtr = (vaListGuestAddr != 0);
+
+    auto nextU32 = [&]() -> uint32_t {
+        if (!useVaPtr && regCursor < 4) {
+            return rArgs[regCursor++];
+        }
+        uint32_t val = 0;
+        uc_mem_read(uc, memCursor, &val, 4);
+        memCursor += 4;
+        return val;
+    };
+
+    std::string out;
+    out.reserve(fmt.size() + 64);
+
+    for (size_t i = 0; i < fmt.size(); ++i) {
+        if (fmt[i] != '%') {
+            out.push_back(fmt[i]);
+            continue;
+        }
+        ++i;
+        if (i >= fmt.size()) break;
+        if (fmt[i] == '%') {
+            out.push_back('%');
+            continue;
+        }
+
+        // Salta flag, width, precision e length modifiers
+        bool isLongLong = false;
+        while (i < fmt.size() && (fmt[i] == '-' || fmt[i] == '+' || fmt[i] == ' ' || fmt[i] == '#' || fmt[i] == '0' ||
+               (fmt[i] >= '1' && fmt[i] <= '9') || fmt[i] == '.' || fmt[i] == '*')) {
+            if (fmt[i] == '*') (void)nextU32();
+            ++i;
+        }
+        while (i < fmt.size() && (fmt[i] == 'l' || fmt[i] == 'h' || fmt[i] == 'z' || fmt[i] == 't')) {
+            if (fmt[i] == 'l' && i + 1 < fmt.size() && fmt[i + 1] == 'l') {
+                isLongLong = true;
+                i += 2;
+                break;
+            }
+            ++i;
+        }
+        if (i >= fmt.size()) break;
+
+        char spec = fmt[i];
+        char buf[64] = {0};
+        switch (spec) {
+            case 's': {
+                uint32_t sPtr = nextU32();
+                out += (sPtr != 0) ? readGuestCString(uc, sPtr, 512) : "(null)";
+                break;
+            }
+            case 'd':
+            case 'i': {
+                if (isLongLong) {
+                    uint32_t lo = nextU32();
+                    uint32_t hi = nextU32();
+                    long long v = static_cast<long long>((static_cast<uint64_t>(hi) << 32) | lo);
+                    std::snprintf(buf, sizeof(buf), "%lld", v);
+                } else {
+                    std::snprintf(buf, sizeof(buf), "%d", static_cast<int32_t>(nextU32()));
+                }
+                out += buf;
+                break;
+            }
+            case 'u': {
+                if (isLongLong) {
+                    uint32_t lo = nextU32();
+                    uint32_t hi = nextU32();
+                    unsigned long long v = (static_cast<uint64_t>(hi) << 32) | lo;
+                    std::snprintf(buf, sizeof(buf), "%llu", v);
+                } else {
+                    std::snprintf(buf, sizeof(buf), "%u", nextU32());
+                }
+                out += buf;
+                break;
+            }
+            case 'x':
+            case 'X':
+            case 'p': {
+                std::snprintf(buf, sizeof(buf), (spec == 'X') ? "%X" : "%x", nextU32());
+                out += buf;
+                break;
+            }
+            case 'c': {
+                char c = static_cast<char>(nextU32() & 0xFFU);
+                out.push_back(c);
+                break;
+            }
+            case 'f':
+            case 'g':
+            case 'e': {
+                uint32_t lo = nextU32();
+                uint32_t hi = nextU32();
+                uint64_t raw = (static_cast<uint64_t>(hi) << 32) | lo;
+                double d = 0.0;
+                std::memcpy(&d, &raw, 8);
+                std::snprintf(buf, sizeof(buf), "%g", d);
+                out += buf;
+                break;
+            }
+            default:
+                break;
+        }
+    }
+    return out;
+}
+
+#pragma pack(push, 4)
+struct z_stream32 {
+    uint32_t next_in;
+    uint32_t avail_in;
+    uint32_t total_in;
+    uint32_t next_out;
+    uint32_t avail_out;
+    uint32_t total_out;
+    uint32_t msg;
+    uint32_t state;
+    uint32_t zalloc;
+    uint32_t zfree;
+    uint32_t opaque;
+    int32_t  data_type;
+    uint32_t adler;
+    uint32_t reserved;
+};
+#pragma pack(pop)
+
+void GuestRuntimeEnvironment::handleTrampolineCall(uint32_t trampolineId, uc_engine* uc) {
+    if (!uc) return;
+
+    // 1. Intercettazione vtable JavaVM32 (0x3000 .. 0x3007)
+    if (trampolineId >= 0x3000U && trampolineId < 0x3008U) {
+        handleJavaVmCall(trampolineId - 0x3000U, uc);
+        return;
+    }
+
+    // 2. Intercettazione vtable JNIEnv32 completa a 256 slot (0x4000 .. 0x40FF)
+    if (trampolineId >= 0x4000U && trampolineId < 0x4100U) {
+        handleJniCall(trampolineId - 0x4000U, uc);
+        return;
+    }
+
+    auto it = trampolineToSymbolMap_.find(trampolineId - 0x2000U);
+    if (it == trampolineToSymbolMap_.end()) {
+        uint32_t zero = 0;
+        uc_reg_write(uc, UC_ARM_REG_R0, &zero);
+        return;
+    }
+
+    const std::string& name = it->second;
+
+    // 1. Android Logcat
+    if (name == "__android_log_print" || name == "__android_log_vprint") {
+        uint32_t tagAddr = 0, fmtAddr = 0, vaAddr = 0;
+        uc_reg_read(uc, UC_ARM_REG_R1, &tagAddr);
+        uc_reg_read(uc, UC_ARM_REG_R2, &fmtAddr);
+        uc_reg_read(uc, UC_ARM_REG_R3, &vaAddr);
+        std::string tag = readGuestCString(uc, tagAddr, 64);
+        std::string fmt = readGuestCString(uc, fmtAddr, 512);
+        std::string formatted = (name == "__android_log_vprint")
+            ? formatGuestPrintf(uc, fmt, 4, vaAddr)
+            : formatGuestPrintf(uc, fmt, 3, 0);
+        LOGI("[GuestLog][%s] %s", tag.c_str(), formatted.c_str());
+        uint32_t ret = 1;
         uc_reg_write(uc, UC_ARM_REG_R0, &ret);
         return;
     }
 
-    if (trampolineId == 0x3002) { // GetVersion()
-        uint32_t version = 0x00010006; // JNI_VERSION_1_6
-        uc_reg_write(uc, UC_ARM_REG_R0, &version);
-        return;
-    }
-
-    if (trampolineId == 0x3003) { // FindClass(env, name)
-        uint32_t classHandle = 0x1001;
-        uc_reg_write(uc, UC_ARM_REG_R0, &classHandle);
-        return;
-    }
-
-    if (trampolineId == 0x3004 || trampolineId == 0x3005) { // GetMethodID / GetStaticMethodID
-        uint32_t methodHandle = 0x2001;
-        uc_reg_write(uc, UC_ARM_REG_R0, &methodHandle);
-        return;
-    }
-
-    if (trampolineId == 0x3006) { // RegisterNatives(env, class, methods, nMethods)
-        uint32_t methodsAddr = 0;
-        uint32_t nMethods = 0;
-        uc_reg_read(uc, UC_ARM_REG_R2, &methodsAddr);
-        uc_reg_read(uc, UC_ARM_REG_R3, &nMethods);
-        LOGI("JNI: RegisterNatives invocato per %u metodi nativi (methodsAddr=0x%08x)", nMethods, methodsAddr);
-
-        // Struttura JNINativeMethod su ARM32: const char* name (4B), const char* signature (4B), void* fnPtr (4B)
-        for (uint32_t i = 0; i < nMethods && i < 32; ++i) {
-            uint32_t entryAddr = methodsAddr + (i * 12);
-            uint32_t namePtr = 0, sigPtr = 0, fnPtr = 0;
-            uc_mem_read(uc, entryAddr, &namePtr, 4);
-            uc_mem_read(uc, entryAddr + 4, &sigPtr, 4);
-            uc_mem_read(uc, entryAddr + 8, &fnPtr, 4);
-
-            char mName[128] = {0};
-            char mSig[128] = {0};
-            if (namePtr) uc_mem_read(uc, namePtr, mName, sizeof(mName) - 1);
-            if (sigPtr) uc_mem_read(uc, sigPtr, mSig, sizeof(mSig) - 1);
-            LOGI("   -> Registrato JNINativeMethod[%u]: '%s' (%s) -> Entry Point: 0x%08x", i, mName, mSig, fnPtr);
-            addRegisteredMethod(mName, mSig, fnPtr);
-        }
-
-        uint32_t ret = 0; // JNI_OK
+    if (name == "__android_log_write" || name == "__android_log_assert") {
+        uint32_t r1 = 0, r2 = 0;
+        uc_reg_read(uc, UC_ARM_REG_R1, &r1);
+        uc_reg_read(uc, UC_ARM_REG_R2, &r2);
+        std::string tag = readGuestCString(uc, r1, 64);
+        std::string msg = readGuestCString(uc, r2, 512);
+        LOGI("[GuestLog][%s] %s", tag.c_str(), msg.c_str());
+        uint32_t ret = 1;
         uc_reg_write(uc, UC_ARM_REG_R0, &ret);
         return;
     }
 
-    // Gestione simboli esterni registrati (libc / OpenGL ES / Bionic)
-    auto it = trampolineToSymbolMap_.find(trampolineId - 0x2000);
-    if (it != trampolineToSymbolMap_.end()) {
-        const std::string& name = it->second;
-
-        // 1. Android Logcat
-        if (name == "__android_log_print" || name == "__android_log_vprint") {
-            char tag[64] = {0};
-            char msg[512] = {0};
-            uint32_t tagAddr = 0, msgAddr = 0;
-            uc_reg_read(uc, UC_ARM_REG_R1, &tagAddr);
-            uc_reg_read(uc, UC_ARM_REG_R2, &msgAddr);
-            if (tagAddr) uc_mem_read(uc, tagAddr, tag, sizeof(tag) - 1);
-            if (msgAddr) uc_mem_read(uc, msgAddr, msg, sizeof(msg) - 1);
-            LOGI("[GuestLog][%s] %s", tag, msg);
-            uint32_t ret = 1;
-            uc_reg_write(uc, UC_ARM_REG_R0, &ret);
-            return;
+    // 2. Bionic C++ ABI & System Globals
+    if (name == "__errno") {
+        uint32_t errnoAddr = guestJniBase_ + 0x2000U;
+        uc_reg_write(uc, UC_ARM_REG_R0, &errnoAddr);
+        return;
+    }
+    if (name == "__aeabi_atexit" || name == "__cxa_atexit" || name == "atexit" || name == "__cxa_finalize") {
+        uint32_t zero = 0;
+        uc_reg_write(uc, UC_ARM_REG_R0, &zero);
+        return;
+    }
+    if (name == "__gnu_Unwind_Find_exidx") {
+        uint32_t pcount = 0, zero = 0;
+        uc_reg_read(uc, UC_ARM_REG_R1, &pcount);
+        if (pcount) uc_mem_write(uc, pcount, &zero, 4);
+        uc_reg_write(uc, UC_ARM_REG_R0, &zero);
+        return;
+    }
+    if (name == "__system_property_get") {
+        uint32_t nameAddr = 0, valAddr = 0;
+        uc_reg_read(uc, UC_ARM_REG_R0, &nameAddr);
+        uc_reg_read(uc, UC_ARM_REG_R1, &valAddr);
+        std::string propName = readGuestCString(uc, nameAddr, 128);
+        std::string propVal;
+        if (propName == "ro.build.version.sdk") propVal = "27";
+        else if (propName == "ro.product.cpu.abi") propVal = "armeabi-v7a";
+        else if (propName == "ro.product.model" || propName == "ro.product.device") propVal = "Emux32";
+        else if (propName == "ro.opengles.version") propVal = "196608";
+        else if (propName == "ro.debuggable") propVal = "0";
+        if (valAddr != 0) {
+            uc_mem_write(uc, valAddr, propVal.c_str(), propVal.size() + 1);
         }
+        uint32_t len = static_cast<uint32_t>(propVal.size());
+        uc_reg_write(uc, UC_ARM_REG_R0, &len);
+        return;
+    }
+    if (name == "sysconf") {
+        uint32_t scName = 0;
+        uc_reg_read(uc, UC_ARM_REG_R0, &scName);
+        uint32_t ret = (scName == 96 || scName == 97) ? 4U : 4096U;
+        uc_reg_write(uc, UC_ARM_REG_R0, &ret);
+        return;
+    }
+    if (name == "getenv") {
+        uint32_t zero = 0;
+        uc_reg_write(uc, UC_ARM_REG_R0, &zero);
+        return;
+    }
 
-        if (name == "__android_log_write") {
-            char tag[64] = {0};
-            char msg[512] = {0};
-            uint32_t tagAddr = 0, msgAddr = 0;
-            uc_reg_read(uc, UC_ARM_REG_R1, &tagAddr);
-            uc_reg_read(uc, UC_ARM_REG_R2, &msgAddr);
-            if (tagAddr) uc_mem_read(uc, tagAddr, tag, sizeof(tag) - 1);
-            if (msgAddr) uc_mem_read(uc, msgAddr, msg, sizeof(msg) - 1);
-            LOGI("[GuestLog][%s] %s", tag, msg);
-            uint32_t ret = 1;
-            uc_reg_write(uc, UC_ARM_REG_R0, &ret);
-            return;
-        }
-
-        // 2. Gestione Memoria (Heap Guest)
-        if (name == "malloc") {
-            uint32_t size = 0;
-            uc_reg_read(uc, UC_ARM_REG_R0, &size);
-            uint32_t allocAddr = sHeapCurrent;
-            sHeapCurrent += (size + 15) & ~15U;
-            uc_reg_write(uc, UC_ARM_REG_R0, &allocAddr);
-            return;
-        }
-
-        if (name == "calloc") {
-            uint32_t num = 0, size = 0;
-            uc_reg_read(uc, UC_ARM_REG_R0, &num);
-            uc_reg_read(uc, UC_ARM_REG_R1, &size);
-            uint32_t total = num * size;
-            uint32_t allocAddr = sHeapCurrent;
-            sHeapCurrent += (total + 15) & ~15U;
-
+    // 3. Allocazione Memoria Heap (malloc, calloc, realloc, free, posix_memalign, memalign, operator new/delete)
+    if (name == "malloc" || name == "_Znwj" || name == "_Znaj" || name == "_ZnwjRKSt9nothrow_t" || name == "_ZnajRKSt9nothrow_t") {
+        uint32_t size = 0;
+        uc_reg_read(uc, UC_ARM_REG_R0, &size);
+        uint32_t allocAddr = allocGuestHeap(uc, size, 16);
+        uc_reg_write(uc, UC_ARM_REG_R0, &allocAddr);
+        return;
+    }
+    if (name == "calloc") {
+        uint32_t num = 0, size = 0;
+        uc_reg_read(uc, UC_ARM_REG_R0, &num);
+        uc_reg_read(uc, UC_ARM_REG_R1, &size);
+        uint32_t total = num * size;
+        uint32_t allocAddr = allocGuestHeap(uc, total, 16);
+        if (total > 0 && total < 0x04000000U) {
             std::vector<uint8_t> zeroes(total, 0);
             uc_mem_write(uc, allocAddr, zeroes.data(), total);
-            uc_reg_write(uc, UC_ARM_REG_R0, &allocAddr);
-            return;
         }
-
-        if (name == "realloc") {
-            uint32_t ptr = 0, size = 0;
-            uc_reg_read(uc, UC_ARM_REG_R0, &ptr);
-            uc_reg_read(uc, UC_ARM_REG_R1, &size);
-            uint32_t newAddr = sHeapCurrent;
-            sHeapCurrent += (size + 15) & ~15U;
-            if (ptr != 0 && size > 0) {
-                std::vector<uint8_t> buf(size, 0);
-                uc_mem_read(uc, ptr, buf.data(), size);
-                uc_mem_write(uc, newAddr, buf.data(), size);
-            }
-            uc_reg_write(uc, UC_ARM_REG_R0, &newAddr);
-            return;
+        uc_reg_write(uc, UC_ARM_REG_R0, &allocAddr);
+        return;
+    }
+    if (name == "realloc") {
+        uint32_t ptr = 0, size = 0;
+        uc_reg_read(uc, UC_ARM_REG_R0, &ptr);
+        uc_reg_read(uc, UC_ARM_REG_R1, &size);
+        uint32_t newAddr = allocGuestHeap(uc, size, 16);
+        if (ptr != 0 && size > 0 && size < 0x04000000U) {
+            std::vector<uint8_t> buf(size, 0);
+            uc_mem_read(uc, ptr, buf.data(), size);
+            uc_mem_write(uc, newAddr, buf.data(), size);
         }
-
-        if (name == "free") {
-            return;
+        uc_reg_write(uc, UC_ARM_REG_R0, &newAddr);
+        return;
+    }
+    if (name == "posix_memalign") {
+        uint32_t memptrAddr = 0, alignment = 0, size = 0;
+        uc_reg_read(uc, UC_ARM_REG_R0, &memptrAddr);
+        uc_reg_read(uc, UC_ARM_REG_R1, &alignment);
+        uc_reg_read(uc, UC_ARM_REG_R2, &size);
+        uint32_t allocAddr = allocGuestHeap(uc, size, alignment > 16 ? alignment : 16);
+        if (memptrAddr != 0) {
+            uc_mem_write(uc, memptrAddr, &allocAddr, 4);
         }
+        uint32_t zero = 0;
+        uc_reg_write(uc, UC_ARM_REG_R0, &zero);
+        return;
+    }
+    if (name == "memalign") {
+        uint32_t alignment = 0, size = 0;
+        uc_reg_read(uc, UC_ARM_REG_R0, &alignment);
+        uc_reg_read(uc, UC_ARM_REG_R1, &size);
+        uint32_t allocAddr = allocGuestHeap(uc, size, alignment > 16 ? alignment : 16);
+        uc_reg_write(uc, UC_ARM_REG_R0, &allocAddr);
+        return;
+    }
+    if (name == "free" || name == "_ZdlPv" || name == "_ZdaPv") {
+        return;
+    }
 
-        // 3. Operazioni di Memoria e Stringhe
-        if (name == "memcpy" || name == "memmove") {
-            uint32_t dst = 0, src = 0, count = 0;
-            uc_reg_read(uc, UC_ARM_REG_R0, &dst);
-            uc_reg_read(uc, UC_ARM_REG_R1, &src);
-            uc_reg_read(uc, UC_ARM_REG_R2, &count);
-            if (count > 0 && dst != 0 && src != 0) {
-                std::vector<uint8_t> tmp(count);
-                if (uc_mem_read(uc, src, tmp.data(), count) == UC_ERR_OK) {
-                    uc_mem_write(uc, dst, tmp.data(), count);
-                }
-            }
-            uc_reg_write(uc, UC_ARM_REG_R0, &dst);
-            return;
-        }
-
-        if (name == "memset") {
-            uint32_t dst = 0, val = 0, count = 0;
-            uc_reg_read(uc, UC_ARM_REG_R0, &dst);
-            uc_reg_read(uc, UC_ARM_REG_R1, &val);
-            uc_reg_read(uc, UC_ARM_REG_R2, &count);
-            if (count > 0 && dst != 0) {
-                std::vector<uint8_t> tmp(count, static_cast<uint8_t>(val));
+    // 4. Operazioni di Memoria, Stringhe e Formattazione (AEABI & Libc)
+    if (name == "memcpy" || name == "memmove" || name == "__aeabi_memcpy" || name == "__aeabi_memcpy4" ||
+        name == "__aeabi_memcpy8" || name == "__aeabi_memmove" || name == "__aeabi_memmove4" || name == "__aeabi_memmove8") {
+        uint32_t dst = 0, src = 0, count = 0;
+        uc_reg_read(uc, UC_ARM_REG_R0, &dst);
+        uc_reg_read(uc, UC_ARM_REG_R1, &src);
+        uc_reg_read(uc, UC_ARM_REG_R2, &count);
+        if (count > 0 && dst != 0 && src != 0 && count < 0x08000000U) {
+            std::vector<uint8_t> tmp(count);
+            if (uc_mem_read(uc, src, tmp.data(), count) == UC_ERR_OK) {
                 uc_mem_write(uc, dst, tmp.data(), count);
             }
-            uc_reg_write(uc, UC_ARM_REG_R0, &dst);
-            return;
         }
-
-        if (name == "memcmp") {
-            uint32_t s1 = 0, s2 = 0, count = 0;
-            uc_reg_read(uc, UC_ARM_REG_R0, &s1);
-            uc_reg_read(uc, UC_ARM_REG_R1, &s2);
-            uc_reg_read(uc, UC_ARM_REG_R2, &count);
-            int res = 0;
-            if (count > 0 && s1 != 0 && s2 != 0) {
-                std::vector<uint8_t> b1(count), b2(count);
-                uc_mem_read(uc, s1, b1.data(), count);
-                uc_mem_read(uc, s2, b2.data(), count);
-                res = std::memcmp(b1.data(), b2.data(), count);
-            }
-            uint32_t ret = static_cast<uint32_t>(res);
-            uc_reg_write(uc, UC_ARM_REG_R0, &ret);
-            return;
+        uc_reg_write(uc, UC_ARM_REG_R0, &dst);
+        return;
+    }
+    if (name == "memset" || name == "__aeabi_memset" || name == "__aeabi_memset4" || name == "__aeabi_memset8" ||
+        name == "__aeabi_memclr" || name == "__aeabi_memclr4" || name == "__aeabi_memclr8") {
+        uint32_t dst = 0, a1 = 0, a2 = 0;
+        uc_reg_read(uc, UC_ARM_REG_R0, &dst);
+        uc_reg_read(uc, UC_ARM_REG_R1, &a1);
+        uc_reg_read(uc, UC_ARM_REG_R2, &a2);
+        uint32_t count = a2;
+        uint8_t val = static_cast<uint8_t>(a1);
+        if (name.find("__aeabi_memclr") == 0) {
+            count = a1;
+            val = 0;
+        } else if (name.find("__aeabi_memset") == 0) {
+            // In __aeabi_memset(void *dest, size_t n, int c): r1 = n, r2 = c
+            count = a1;
+            val = static_cast<uint8_t>(a2);
         }
-
-        if (name == "strlen") {
-            uint32_t sAddr = 0;
-            uc_reg_read(uc, UC_ARM_REG_R0, &sAddr);
-            uint32_t len = 0;
-            if (sAddr != 0) {
-                char c = 0;
-                while (uc_mem_read(uc, sAddr + len, &c, 1) == UC_ERR_OK && c != '\0' && len < 4096) {
-                    len++;
-                }
-            }
-            uc_reg_write(uc, UC_ARM_REG_R0, &len);
-            return;
+        if (count > 0 && dst != 0 && count < 0x08000000U) {
+            std::vector<uint8_t> tmp(count, val);
+            uc_mem_write(uc, dst, tmp.data(), count);
         }
-
-        if (name == "strcpy") {
-            uint32_t dst = 0, src = 0;
-            uc_reg_read(uc, UC_ARM_REG_R0, &dst);
-            uc_reg_read(uc, UC_ARM_REG_R1, &src);
-            if (dst != 0 && src != 0) {
-                char c = 0;
-                uint32_t offset = 0;
-                while (uc_mem_read(uc, src + offset, &c, 1) == UC_ERR_OK && offset < 4096) {
-                    uc_mem_write(uc, dst + offset, &c, 1);
-                    if (c == '\0') break;
-                    offset++;
-                }
-            }
-            uc_reg_write(uc, UC_ARM_REG_R0, &dst);
-            return;
+        uc_reg_write(uc, UC_ARM_REG_R0, &dst);
+        return;
+    }
+    if (name == "memcmp") {
+        uint32_t s1 = 0, s2 = 0, count = 0;
+        uc_reg_read(uc, UC_ARM_REG_R0, &s1);
+        uc_reg_read(uc, UC_ARM_REG_R1, &s2);
+        uc_reg_read(uc, UC_ARM_REG_R2, &count);
+        int res = 0;
+        if (count > 0 && s1 != 0 && s2 != 0 && count < 0x04000000U) {
+            std::vector<uint8_t> b1(count), b2(count);
+            uc_mem_read(uc, s1, b1.data(), count);
+            uc_mem_read(uc, s2, b2.data(), count);
+            res = std::memcmp(b1.data(), b2.data(), count);
         }
-
-        if (name == "strncpy") {
-            uint32_t dst = 0, src = 0, n = 0;
-            uc_reg_read(uc, UC_ARM_REG_R0, &dst);
-            uc_reg_read(uc, UC_ARM_REG_R1, &src);
-            uc_reg_read(uc, UC_ARM_REG_R2, &n);
-            if (dst != 0 && src != 0 && n > 0) {
-                char c = 0;
-                bool padNull = false;
-                for (uint32_t i = 0; i < n; ++i) {
-                    if (!padNull) {
-                        if (uc_mem_read(uc, src + i, &c, 1) == UC_ERR_OK) {
-                            uc_mem_write(uc, dst + i, &c, 1);
-                            if (c == '\0') padNull = true;
-                        }
-                    } else {
-                        char z = 0;
-                        uc_mem_write(uc, dst + i, &z, 1);
-                    }
-                }
+        uint32_t ret = static_cast<uint32_t>(res);
+        uc_reg_write(uc, UC_ARM_REG_R0, &ret);
+        return;
+    }
+    if (name == "memchr") {
+        uint32_t sAddr = 0, cVal = 0, n = 0;
+        uc_reg_read(uc, UC_ARM_REG_R0, &sAddr);
+        uc_reg_read(uc, UC_ARM_REG_R1, &cVal);
+        uc_reg_read(uc, UC_ARM_REG_R2, &n);
+        uint32_t found = 0;
+        if (sAddr != 0 && n > 0 && n < 0x01000000U) {
+            std::vector<uint8_t> buf(n);
+            if (uc_mem_read(uc, sAddr, buf.data(), n) == UC_ERR_OK) {
+                const void* p = std::memchr(buf.data(), static_cast<int>(cVal & 0xFFU), n);
+                if (p) found = sAddr + static_cast<uint32_t>(static_cast<const uint8_t*>(p) - buf.data());
             }
-            uc_reg_write(uc, UC_ARM_REG_R0, &dst);
-            return;
         }
-
-        if (name == "strcmp") {
-            uint32_t s1 = 0, s2 = 0;
-            uc_reg_read(uc, UC_ARM_REG_R0, &s1);
-            uc_reg_read(uc, UC_ARM_REG_R1, &s2);
-            int res = 0;
-            if (s1 != 0 && s2 != 0) {
-                char c1 = 0, c2 = 0;
-                uint32_t offset = 0;
-                while (offset < 4096) {
-                    uc_mem_read(uc, s1 + offset, &c1, 1);
-                    uc_mem_read(uc, s2 + offset, &c2, 1);
-                    if (c1 != c2 || c1 == '\0') {
-                        res = static_cast<int>(c1) - static_cast<int>(c2);
-                        break;
-                    }
-                    offset++;
-                }
-            }
-            uint32_t ret = static_cast<uint32_t>(res);
-            uc_reg_write(uc, UC_ARM_REG_R0, &ret);
-            return;
+        uc_reg_write(uc, UC_ARM_REG_R0, &found);
+        return;
+    }
+    if (name == "strlen") {
+        uint32_t sAddr = 0;
+        uc_reg_read(uc, UC_ARM_REG_R0, &sAddr);
+        std::string s = readGuestCString(uc, sAddr, 65536);
+        uint32_t len = static_cast<uint32_t>(s.size());
+        uc_reg_write(uc, UC_ARM_REG_R0, &len);
+        return;
+    }
+    if (name == "strcpy" || name == "strcat") {
+        uint32_t dst = 0, src = 0;
+        uc_reg_read(uc, UC_ARM_REG_R0, &dst);
+        uc_reg_read(uc, UC_ARM_REG_R1, &src);
+        if (dst != 0 && src != 0) {
+            std::string sSrc = readGuestCString(uc, src, 16384);
+            uint32_t writeOff = (name == "strcat") ? static_cast<uint32_t>(readGuestCString(uc, dst, 16384).size()) : 0U;
+            uc_mem_write(uc, dst + writeOff, sSrc.c_str(), sSrc.size() + 1);
         }
-
-        if (name == "strncmp") {
-            uint32_t s1 = 0, s2 = 0, n = 0;
-            uc_reg_read(uc, UC_ARM_REG_R0, &s1);
-            uc_reg_read(uc, UC_ARM_REG_R1, &s2);
-            uc_reg_read(uc, UC_ARM_REG_R2, &n);
-            int res = 0;
-            if (s1 != 0 && s2 != 0 && n > 0) {
-                char c1 = 0, c2 = 0;
-                for (uint32_t i = 0; i < n; ++i) {
-                    uc_mem_read(uc, s1 + i, &c1, 1);
-                    uc_mem_read(uc, s2 + i, &c2, 1);
-                    if (c1 != c2 || c1 == '\0') {
-                        res = static_cast<int>(c1) - static_cast<int>(c2);
-                        break;
-                    }
-                }
-            }
-            uint32_t ret = static_cast<uint32_t>(res);
-            uc_reg_write(uc, UC_ARM_REG_R0, &ret);
-            return;
+        uc_reg_write(uc, UC_ARM_REG_R0, &dst);
+        return;
+    }
+    if (name == "strncpy") {
+        uint32_t dst = 0, src = 0, n = 0;
+        uc_reg_read(uc, UC_ARM_REG_R0, &dst);
+        uc_reg_read(uc, UC_ARM_REG_R1, &src);
+        uc_reg_read(uc, UC_ARM_REG_R2, &n);
+        if (dst != 0 && src != 0 && n > 0 && n < 65536) {
+            std::string sSrc = readGuestCString(uc, src, n);
+            std::vector<char> out(n, 0);
+            std::memcpy(out.data(), sSrc.data(), std::min<size_t>(n, sSrc.size()));
+            uc_mem_write(uc, dst, out.data(), n);
         }
-
-        if (name == "strdup") {
-            uint32_t sAddr = 0;
-            uc_reg_read(uc, UC_ARM_REG_R0, &sAddr);
-            uint32_t newAddr = 0;
-            if (sAddr != 0) {
-                std::string s;
-                char c = 0;
-                uint32_t off = 0;
-                while (uc_mem_read(uc, sAddr + off, &c, 1) == UC_ERR_OK && c != '\0' && off < 4096) {
-                    s.push_back(c);
-                    off++;
-                }
-                newAddr = sHeapCurrent;
-                sHeapCurrent += (s.size() + 16) & ~15U;
-                uc_mem_write(uc, newAddr, s.c_str(), s.size() + 1);
-            }
-            uc_reg_write(uc, UC_ARM_REG_R0, &newAddr);
-            return;
+        uc_reg_write(uc, UC_ARM_REG_R0, &dst);
+        return;
+    }
+    if (name == "strcmp" || name == "strcasecmp") {
+        uint32_t s1 = 0, s2 = 0;
+        uc_reg_read(uc, UC_ARM_REG_R0, &s1);
+        uc_reg_read(uc, UC_ARM_REG_R1, &s2);
+        std::string a = readGuestCString(uc, s1, 4096);
+        std::string b = readGuestCString(uc, s2, 4096);
+        int res = (name == "strcasecmp") ? strcasecmp(a.c_str(), b.c_str()) : std::strcmp(a.c_str(), b.c_str());
+        uint32_t ret = static_cast<uint32_t>(res);
+        uc_reg_write(uc, UC_ARM_REG_R0, &ret);
+        return;
+    }
+    if (name == "strncmp" || name == "strncasecmp") {
+        uint32_t s1 = 0, s2 = 0, n = 0;
+        uc_reg_read(uc, UC_ARM_REG_R0, &s1);
+        uc_reg_read(uc, UC_ARM_REG_R1, &s2);
+        uc_reg_read(uc, UC_ARM_REG_R2, &n);
+        std::string a = readGuestCString(uc, s1, 4096);
+        std::string b = readGuestCString(uc, s2, 4096);
+        int res = (name == "strncasecmp") ? strncasecmp(a.c_str(), b.c_str(), n) : std::strncmp(a.c_str(), b.c_str(), n);
+        uint32_t ret = static_cast<uint32_t>(res);
+        uc_reg_write(uc, UC_ARM_REG_R0, &ret);
+        return;
+    }
+    if (name == "strchr" || name == "strrchr") {
+        uint32_t sAddr = 0, cVal = 0;
+        uc_reg_read(uc, UC_ARM_REG_R0, &sAddr);
+        uc_reg_read(uc, UC_ARM_REG_R1, &cVal);
+        std::string s = readGuestCString(uc, sAddr, 8192);
+        const char* p = (name == "strrchr") ? std::strrchr(s.c_str(), static_cast<int>(cVal & 0xFFU))
+                                            : std::strchr(s.c_str(), static_cast<int>(cVal & 0xFFU));
+        uint32_t res = p ? (sAddr + static_cast<uint32_t>(p - s.c_str())) : 0U;
+        uc_reg_write(uc, UC_ARM_REG_R0, &res);
+        return;
+    }
+    if (name == "strstr") {
+        uint32_t hAddr = 0, nAddr = 0;
+        uc_reg_read(uc, UC_ARM_REG_R0, &hAddr);
+        uc_reg_read(uc, UC_ARM_REG_R1, &nAddr);
+        std::string h = readGuestCString(uc, hAddr, 8192);
+        std::string n = readGuestCString(uc, nAddr, 1024);
+        const char* p = std::strstr(h.c_str(), n.c_str());
+        uint32_t res = p ? (hAddr + static_cast<uint32_t>(p - h.c_str())) : 0U;
+        uc_reg_write(uc, UC_ARM_REG_R0, &res);
+        return;
+    }
+    if (name == "strdup") {
+        uint32_t sAddr = 0;
+        uc_reg_read(uc, UC_ARM_REG_R0, &sAddr);
+        uint32_t newAddr = (sAddr != 0) ? createGuestString(uc, readGuestCString(uc, sAddr, 8192)) : 0U;
+        uc_reg_write(uc, UC_ARM_REG_R0, &newAddr);
+        return;
+    }
+    if (name == "snprintf" || name == "vsnprintf") {
+        uint32_t dst = 0, size = 0, fmtAddr = 0, vaAddr = 0;
+        uc_reg_read(uc, UC_ARM_REG_R0, &dst);
+        uc_reg_read(uc, UC_ARM_REG_R1, &size);
+        uc_reg_read(uc, UC_ARM_REG_R2, &fmtAddr);
+        uc_reg_read(uc, UC_ARM_REG_R3, &vaAddr);
+        std::string fmt = readGuestCString(uc, fmtAddr, 2048);
+        std::string res = (name == "vsnprintf") ? formatGuestPrintf(uc, fmt, 4, vaAddr) : formatGuestPrintf(uc, fmt, 3, 0);
+        if (dst != 0 && size > 0) {
+            size_t copyLen = std::min<size_t>(res.size(), size - 1);
+            if (copyLen > 0) uc_mem_write(uc, dst, res.data(), copyLen);
+            char z = 0;
+            uc_mem_write(uc, dst + copyLen, &z, 1);
         }
-
-        // 4. File I/O Libc (fopen, fread, fwrite, fseek, ftell, fclose)
-        if (name == "fopen" || name == "fopen64") {
-            uint32_t pathAddr = 0, modeAddr = 0;
-            uc_reg_read(uc, UC_ARM_REG_R0, &pathAddr);
-            uc_reg_read(uc, UC_ARM_REG_R1, &modeAddr);
-            uint32_t fileHandle = 0;
-
-            if (pathAddr != 0 && modeAddr != 0) {
-                char pathBuf[512] = {0};
-                char modeBuf[32] = {0};
-                uc_mem_read(uc, pathAddr, pathBuf, sizeof(pathBuf) - 1);
-                uc_mem_read(uc, modeAddr, modeBuf, sizeof(modeBuf) - 1);
-
-                std::string resolved = SyscallDispatcher::resolveFilePath(pathBuf);
-                FILE* fp = fopen(resolved.c_str(), modeBuf);
-                if (fp) {
-                    std::lock_guard<std::mutex> lock(sFileMutex);
-                    fileHandle = sNextFileHandle++;
-                    sFileTable[fileHandle] = fp;
-                    LOGI("fopen riuscito: '%s' (Handle: 0x%08x)", resolved.c_str(), fileHandle);
-                } else {
-                    LOGW("fopen fallito: '%s' (mode: %s, errno: %d)", resolved.c_str(), modeBuf, errno);
-                }
-            }
-            uc_reg_write(uc, UC_ARM_REG_R0, &fileHandle);
-            return;
+        uint32_t len = static_cast<uint32_t>(res.size());
+        uc_reg_write(uc, UC_ARM_REG_R0, &len);
+        return;
+    }
+    if (name == "sprintf" || name == "vsprintf") {
+        uint32_t dst = 0, fmtAddr = 0, vaAddr = 0;
+        uc_reg_read(uc, UC_ARM_REG_R0, &dst);
+        uc_reg_read(uc, UC_ARM_REG_R1, &fmtAddr);
+        uc_reg_read(uc, UC_ARM_REG_R2, &vaAddr);
+        std::string fmt = readGuestCString(uc, fmtAddr, 2048);
+        std::string res = (name == "vsprintf") ? formatGuestPrintf(uc, fmt, 4, vaAddr) : formatGuestPrintf(uc, fmt, 2, 0);
+        if (dst != 0) {
+            uc_mem_write(uc, dst, res.c_str(), res.size() + 1);
         }
-
-        if (name == "fread") {
-            uint32_t ptr = 0, size = 0, nmemb = 0, handle = 0;
-            uc_reg_read(uc, UC_ARM_REG_R0, &ptr);
-            uc_reg_read(uc, UC_ARM_REG_R1, &size);
-            uc_reg_read(uc, UC_ARM_REG_R2, &nmemb);
-            uc_reg_read(uc, UC_ARM_REG_R3, &handle);
-            uint32_t readCount = 0;
-
-            FILE* fp = nullptr;
-            {
-                std::lock_guard<std::mutex> lock(sFileMutex);
-                auto fit = sFileTable.find(handle);
-                if (fit != sFileTable.end()) fp = fit->second;
-            }
-
-            if (fp && size > 0 && nmemb > 0 && ptr != 0) {
-                std::vector<uint8_t> buf(size * nmemb);
-                size_t r = fread(buf.data(), size, nmemb, fp);
-                if (r > 0) {
-                    uc_mem_write(uc, ptr, buf.data(), r * size);
-                }
-                readCount = static_cast<uint32_t>(r);
-            }
-            uc_reg_write(uc, UC_ARM_REG_R0, &readCount);
-            return;
+        uint32_t len = static_cast<uint32_t>(res.size());
+        uc_reg_write(uc, UC_ARM_REG_R0, &len);
+        return;
+    }
+    if (name == "atoi" || name == "atol" || name == "strtol" || name == "strtoul") {
+        uint32_t sAddr = 0, endPtr = 0, base = 10;
+        uc_reg_read(uc, UC_ARM_REG_R0, &sAddr);
+        uc_reg_read(uc, UC_ARM_REG_R1, &endPtr);
+        uc_reg_read(uc, UC_ARM_REG_R2, &base);
+        std::string s = readGuestCString(uc, sAddr, 128);
+        char* hostEnd = nullptr;
+        uint32_t val = (name == "strtoul")
+            ? static_cast<uint32_t>(std::strtoul(s.c_str(), &hostEnd, static_cast<int>(base)))
+            : static_cast<uint32_t>(std::strtol(s.c_str(), &hostEnd, (name == "strtol") ? static_cast<int>(base) : 10));
+        if ((name == "strtol" || name == "strtoul") && endPtr != 0 && hostEnd != nullptr) {
+            uint32_t guestEnd = sAddr + static_cast<uint32_t>(hostEnd - s.c_str());
+            uc_mem_write(uc, endPtr, &guestEnd, 4);
         }
+        uc_reg_write(uc, UC_ARM_REG_R0, &val);
+        return;
+    }
 
-        if (name == "fseek" || name == "fseeko" || name == "fseeko64") {
-            uint32_t handle = 0, offset = 0, whence = 0;
-            uc_reg_read(uc, UC_ARM_REG_R0, &handle);
-            uc_reg_read(uc, UC_ARM_REG_R1, &offset);
-            uc_reg_read(uc, UC_ARM_REG_R2, &whence);
-            int res = -1;
-
-            FILE* fp = nullptr;
-            {
-                std::lock_guard<std::mutex> lock(sFileMutex);
-                auto fit = sFileTable.find(handle);
-                if (fit != sFileTable.end()) fp = fit->second;
-            }
-
+    // 5. File I/O Libc
+    if (name == "fopen" || name == "fopen64") {
+        uint32_t pathAddr = 0, modeAddr = 0;
+        uc_reg_read(uc, UC_ARM_REG_R0, &pathAddr);
+        uc_reg_read(uc, UC_ARM_REG_R1, &modeAddr);
+        uint32_t fileHandle = 0;
+        if (pathAddr != 0 && modeAddr != 0) {
+            std::string pathStr = readGuestCString(uc, pathAddr, 512);
+            std::string modeStr = readGuestCString(uc, modeAddr, 32);
+            std::string resolved = SyscallDispatcher::resolveFilePath(pathStr.c_str());
+            FILE* fp = fopen(resolved.c_str(), modeStr.c_str());
             if (fp) {
-                res = fseek(fp, static_cast<long>(static_cast<int32_t>(offset)), static_cast<int>(whence));
-            }
-            uint32_t ret = static_cast<uint32_t>(res);
-            uc_reg_write(uc, UC_ARM_REG_R0, &ret);
-            return;
-        }
-
-        if (name == "ftell" || name == "ftello" || name == "ftello64") {
-            uint32_t handle = 0;
-            uc_reg_read(uc, UC_ARM_REG_R0, &handle);
-            long pos = -1;
-
-            FILE* fp = nullptr;
-            {
                 std::lock_guard<std::mutex> lock(sFileMutex);
-                auto fit = sFileTable.find(handle);
-                if (fit != sFileTable.end()) fp = fit->second;
+                fileHandle = sNextFileHandle++;
+                sFileTable[fileHandle] = fp;
+                LOGI("fopen riuscito: '%s' (Handle: 0x%08x)", resolved.c_str(), fileHandle);
             }
-
-            if (fp) {
-                pos = ftell(fp);
-            }
-            uint32_t ret = static_cast<uint32_t>(pos);
-            uc_reg_write(uc, UC_ARM_REG_R0, &ret);
-            return;
         }
-
-        if (name == "fclose") {
-            uint32_t handle = 0;
-            uc_reg_read(uc, UC_ARM_REG_R0, &handle);
-            int res = 0;
-
+        uc_reg_write(uc, UC_ARM_REG_R0, &fileHandle);
+        return;
+    }
+    if (name == "fread") {
+        uint32_t ptr = 0, size = 0, nmemb = 0, handle = 0;
+        uc_reg_read(uc, UC_ARM_REG_R0, &ptr);
+        uc_reg_read(uc, UC_ARM_REG_R1, &size);
+        uc_reg_read(uc, UC_ARM_REG_R2, &nmemb);
+        uc_reg_read(uc, UC_ARM_REG_R3, &handle);
+        uint32_t readCount = 0;
+        FILE* fp = nullptr;
+        {
             std::lock_guard<std::mutex> lock(sFileMutex);
             auto fit = sFileTable.find(handle);
-            if (fit != sFileTable.end()) {
-                if (fit->second) fclose(fit->second);
+            if (fit != sFileTable.end()) fp = fit->second;
+        }
+        if (fp && size > 0 && nmemb > 0 && ptr != 0 && (size * nmemb) < 0x08000000U) {
+            std::vector<uint8_t> buf(size * nmemb);
+            size_t r = fread(buf.data(), size, nmemb, fp);
+            if (r > 0) uc_mem_write(uc, ptr, buf.data(), r * size);
+            readCount = static_cast<uint32_t>(r);
+        }
+        uc_reg_write(uc, UC_ARM_REG_R0, &readCount);
+        return;
+    }
+    if (name == "fwrite") {
+        uint32_t ptr = 0, size = 0, nmemb = 0, handle = 0;
+        uc_reg_read(uc, UC_ARM_REG_R0, &ptr);
+        uc_reg_read(uc, UC_ARM_REG_R1, &size);
+        uc_reg_read(uc, UC_ARM_REG_R2, &nmemb);
+        uc_reg_read(uc, UC_ARM_REG_R3, &handle);
+        uint32_t writtenCount = nmemb;
+        FILE* fp = nullptr;
+        {
+            std::lock_guard<std::mutex> lock(sFileMutex);
+            auto fit = sFileTable.find(handle);
+            if (fit != sFileTable.end()) fp = fit->second;
+        }
+        if (fp && size > 0 && nmemb > 0 && ptr != 0 && (size * nmemb) < 0x04000000U) {
+            std::vector<uint8_t> buf(size * nmemb);
+            uc_mem_read(uc, ptr, buf.data(), buf.size());
+            writtenCount = static_cast<uint32_t>(fwrite(buf.data(), size, nmemb, fp));
+        }
+        uc_reg_write(uc, UC_ARM_REG_R0, &writtenCount);
+        return;
+    }
+    if (name == "fseek" || name == "fseeko" || name == "fseeko64") {
+        uint32_t handle = 0, offset = 0, whence = 0;
+        uc_reg_read(uc, UC_ARM_REG_R0, &handle);
+        uc_reg_read(uc, UC_ARM_REG_R1, &offset);
+        uc_reg_read(uc, UC_ARM_REG_R2, &whence);
+        int res = -1;
+        FILE* fp = nullptr;
+        {
+            std::lock_guard<std::mutex> lock(sFileMutex);
+            auto fit = sFileTable.find(handle);
+            if (fit != sFileTable.end()) fp = fit->second;
+        }
+        if (fp) res = fseek(fp, static_cast<long>(static_cast<int32_t>(offset)), static_cast<int>(whence));
+        uint32_t ret = static_cast<uint32_t>(res);
+        uc_reg_write(uc, UC_ARM_REG_R0, &ret);
+        return;
+    }
+    if (name == "ftell" || name == "ftello" || name == "ftello64") {
+        uint32_t handle = 0;
+        uc_reg_read(uc, UC_ARM_REG_R0, &handle);
+        long pos = -1;
+        FILE* fp = nullptr;
+        {
+            std::lock_guard<std::mutex> lock(sFileMutex);
+            auto fit = sFileTable.find(handle);
+            if (fit != sFileTable.end()) fp = fit->second;
+        }
+        if (fp) pos = ftell(fp);
+        uint32_t ret = static_cast<uint32_t>(pos);
+        uc_reg_write(uc, UC_ARM_REG_R0, &ret);
+        return;
+    }
+    if (name == "fclose" || name == "fflush") {
+        uint32_t handle = 0;
+        uc_reg_read(uc, UC_ARM_REG_R0, &handle);
+        std::lock_guard<std::mutex> lock(sFileMutex);
+        auto fit = sFileTable.find(handle);
+        if (fit != sFileTable.end() && fit->second) {
+            if (name == "fclose") {
+                fclose(fit->second);
                 sFileTable.erase(fit);
-            }
-            uint32_t ret = static_cast<uint32_t>(res);
-            uc_reg_write(uc, UC_ARM_REG_R0, &ret);
-            return;
-        }
-
-        // 5. Dynamic Linker
-        if (name == "dlopen") {
-            uint32_t handle = 0x50000001;
-            uc_reg_write(uc, UC_ARM_REG_R0, &handle);
-            return;
-        }
-
-        if (name == "dlsym") {
-            uint32_t symNameAddr = 0;
-            uc_reg_read(uc, UC_ARM_REG_R1, &symNameAddr);
-            uint32_t trampAddr = 0;
-
-            if (symNameAddr != 0) {
-                char symNameBuf[128] = {0};
-                uc_mem_read(uc, symNameAddr, symNameBuf, sizeof(symNameBuf) - 1);
-                trampAddr = registerSymbolTrampoline(symNameBuf, uc);
-                LOGI("dlsym('%s') risolto tramite Trampoline a 0x%08x", symNameBuf, trampAddr);
-            }
-            uc_reg_write(uc, UC_ARM_REG_R0, &trampAddr);
-            return;
-        }
-
-        if (name == "dlclose" || name == "dlerror") {
-            uint32_t zero = 0;
-            uc_reg_write(uc, UC_ARM_REG_R0, &zero);
-            return;
-        }
-
-        // 6. Concorrenza Pthread
-        if (name == "pthread_mutex_init" || name == "pthread_mutex_lock" ||
-            name == "pthread_mutex_unlock" || name == "pthread_mutex_destroy" ||
-            name == "pthread_once") {
-            uint32_t zero = 0;
-            uc_reg_write(uc, UC_ARM_REG_R0, &zero);
-            return;
-        }
-
-        if (name == "pthread_key_create") {
-            uint32_t keyAddr = 0;
-            uc_reg_read(uc, UC_ARM_REG_R0, &keyAddr);
-            if (keyAddr != 0) {
-                uint32_t dummyKey = 1;
-                uc_mem_write(uc, keyAddr, &dummyKey, sizeof(dummyKey));
-            }
-            uint32_t zero = 0;
-            uc_reg_write(uc, UC_ARM_REG_R0, &zero);
-            return;
-        }
-
-        if (name == "pthread_getspecific") {
-            uint32_t zero = 0;
-            uc_reg_write(uc, UC_ARM_REG_R0, &zero);
-            return;
-        }
-
-        if (name == "pthread_setspecific") {
-            uint32_t zero = 0;
-            uc_reg_write(uc, UC_ARM_REG_R0, &zero);
-            return;
-        }
-
-        // 7. OpenGL ES 2.0 / EGL Real Hardware Passthrough
-        if (name == "glViewport") {
-            uint32_t x = 0, y = 0, w = 0, h = 0;
-            uc_reg_read(uc, UC_ARM_REG_R0, &x);
-            uc_reg_read(uc, UC_ARM_REG_R1, &y);
-            uc_reg_read(uc, UC_ARM_REG_R2, &w);
-            uc_reg_read(uc, UC_ARM_REG_R3, &h);
-            ::glViewport(static_cast<GLint>(x), static_cast<GLint>(y), static_cast<GLsizei>(w), static_cast<GLsizei>(h));
-            return;
-        }
-
-        if (name == "glScissor") {
-            uint32_t x = 0, y = 0, w = 0, h = 0;
-            uc_reg_read(uc, UC_ARM_REG_R0, &x);
-            uc_reg_read(uc, UC_ARM_REG_R1, &y);
-            uc_reg_read(uc, UC_ARM_REG_R2, &w);
-            uc_reg_read(uc, UC_ARM_REG_R3, &h);
-            ::glScissor(static_cast<GLint>(x), static_cast<GLint>(y), static_cast<GLsizei>(w), static_cast<GLsizei>(h));
-            return;
-        }
-
-        if (name == "glClearColor") {
-            uint32_t r = 0, g = 0, b = 0, a = 0;
-            uc_reg_read(uc, UC_ARM_REG_R0, &r);
-            uc_reg_read(uc, UC_ARM_REG_R1, &g);
-            uc_reg_read(uc, UC_ARM_REG_R2, &b);
-            uc_reg_read(uc, UC_ARM_REG_R3, &a);
-            float fr, fg, fb, fa;
-            std::memcpy(&fr, &r, 4);
-            std::memcpy(&fg, &g, 4);
-            std::memcpy(&fb, &b, 4);
-            std::memcpy(&fa, &a, 4);
-            ::glClearColor(fr, fg, fb, fa);
-            return;
-        }
-
-        if (name == "glClear") {
-            uint32_t mask = 0;
-            uc_reg_read(uc, UC_ARM_REG_R0, &mask);
-            ::glClear(static_cast<GLbitfield>(mask));
-            return;
-        }
-
-        if (name == "glClearDepthf") {
-            uint32_t d = 0;
-            uc_reg_read(uc, UC_ARM_REG_R0, &d);
-            float fd;
-            std::memcpy(&fd, &d, 4);
-            ::glClearDepthf(fd);
-            return;
-        }
-
-        if (name == "glClearStencil") {
-            uint32_t s = 0;
-            uc_reg_read(uc, UC_ARM_REG_R0, &s);
-            ::glClearStencil(static_cast<GLint>(s));
-            return;
-        }
-
-        if (name == "glEnable") {
-            uint32_t cap = 0;
-            uc_reg_read(uc, UC_ARM_REG_R0, &cap);
-            ::glEnable(static_cast<GLenum>(cap));
-            return;
-        }
-
-        if (name == "glDisable") {
-            uint32_t cap = 0;
-            uc_reg_read(uc, UC_ARM_REG_R0, &cap);
-            ::glDisable(static_cast<GLenum>(cap));
-            return;
-        }
-
-        if (name == "glIsEnabled") {
-            uint32_t cap = 0;
-            uc_reg_read(uc, UC_ARM_REG_R0, &cap);
-            uint32_t res = ::glIsEnabled(static_cast<GLenum>(cap)) ? 1 : 0;
-            uc_reg_write(uc, UC_ARM_REG_R0, &res);
-            return;
-        }
-
-        if (name == "glBlendFunc") {
-            uint32_t s = 0, d = 0;
-            uc_reg_read(uc, UC_ARM_REG_R0, &s);
-            uc_reg_read(uc, UC_ARM_REG_R1, &d);
-            ::glBlendFunc(static_cast<GLenum>(s), static_cast<GLenum>(d));
-            return;
-        }
-
-        if (name == "glBlendFuncSeparate") {
-            uint32_t srcRGB = 0, dstRGB = 0, srcAlpha = 0, dstAlpha = 0;
-            uc_reg_read(uc, UC_ARM_REG_R0, &srcRGB);
-            uc_reg_read(uc, UC_ARM_REG_R1, &dstRGB);
-            uc_reg_read(uc, UC_ARM_REG_R2, &srcAlpha);
-            uc_reg_read(uc, UC_ARM_REG_R3, &dstAlpha);
-            ::glBlendFuncSeparate(srcRGB, dstRGB, srcAlpha, dstAlpha);
-            return;
-        }
-
-        if (name == "glBlendEquation") {
-            uint32_t mode = 0;
-            uc_reg_read(uc, UC_ARM_REG_R0, &mode);
-            ::glBlendEquation(static_cast<GLenum>(mode));
-            return;
-        }
-
-        if (name == "glBlendEquationSeparate") {
-            uint32_t modeRGB = 0, modeAlpha = 0;
-            uc_reg_read(uc, UC_ARM_REG_R0, &modeRGB);
-            uc_reg_read(uc, UC_ARM_REG_R1, &modeAlpha);
-            ::glBlendEquationSeparate(modeRGB, modeAlpha);
-            return;
-        }
-
-        if (name == "glDepthFunc") {
-            uint32_t func = 0;
-            uc_reg_read(uc, UC_ARM_REG_R0, &func);
-            ::glDepthFunc(static_cast<GLenum>(func));
-            return;
-        }
-
-        if (name == "glDepthMask") {
-            uint32_t flag = 0;
-            uc_reg_read(uc, UC_ARM_REG_R0, &flag);
-            ::glDepthMask(static_cast<GLboolean>(flag));
-            return;
-        }
-
-        if (name == "glCullFace") {
-            uint32_t mode = 0;
-            uc_reg_read(uc, UC_ARM_REG_R0, &mode);
-            ::glCullFace(static_cast<GLenum>(mode));
-            return;
-        }
-
-        if (name == "glFrontFace") {
-            uint32_t mode = 0;
-            uc_reg_read(uc, UC_ARM_REG_R0, &mode);
-            ::glFrontFace(static_cast<GLenum>(mode));
-            return;
-        }
-
-        if (name == "glColorMask") {
-            uint32_t r = 0, g = 0, b = 0, a = 0;
-            uc_reg_read(uc, UC_ARM_REG_R0, &r);
-            uc_reg_read(uc, UC_ARM_REG_R1, &g);
-            uc_reg_read(uc, UC_ARM_REG_R2, &b);
-            uc_reg_read(uc, UC_ARM_REG_R3, &a);
-            ::glColorMask(r, g, b, a);
-            return;
-        }
-
-        if (name == "glBindTexture") {
-            uint32_t target = 0, texture = 0;
-            uc_reg_read(uc, UC_ARM_REG_R0, &target);
-            uc_reg_read(uc, UC_ARM_REG_R1, &texture);
-            ::glBindTexture(static_cast<GLenum>(target), static_cast<GLuint>(texture));
-            return;
-        }
-
-        if (name == "glActiveTexture") {
-            uint32_t texture = 0;
-            uc_reg_read(uc, UC_ARM_REG_R0, &texture);
-            ::glActiveTexture(static_cast<GLenum>(texture));
-            return;
-        }
-
-        if (name == "glGenTextures") {
-            uint32_t count = 0, ptr = 0;
-            uc_reg_read(uc, UC_ARM_REG_R0, &count);
-            uc_reg_read(uc, UC_ARM_REG_R1, &ptr);
-            if (count > 0 && ptr != 0) {
-                std::vector<GLuint> ids(count);
-                ::glGenTextures(count, ids.data());
-                uc_mem_write(uc, ptr, ids.data(), count * sizeof(GLuint));
-            }
-            return;
-        }
-
-        if (name == "glDeleteTextures") {
-            uint32_t count = 0, ptr = 0;
-            uc_reg_read(uc, UC_ARM_REG_R0, &count);
-            uc_reg_read(uc, UC_ARM_REG_R1, &ptr);
-            if (count > 0 && ptr != 0) {
-                std::vector<GLuint> ids(count);
-                uc_mem_read(uc, ptr, ids.data(), count * sizeof(GLuint));
-                ::glDeleteTextures(count, ids.data());
-            }
-            return;
-        }
-
-        if (name == "glTexParameteri") {
-            uint32_t target = 0, pname = 0, param = 0;
-            uc_reg_read(uc, UC_ARM_REG_R0, &target);
-            uc_reg_read(uc, UC_ARM_REG_R1, &pname);
-            uc_reg_read(uc, UC_ARM_REG_R2, &param);
-            ::glTexParameteri(target, pname, param);
-            return;
-        }
-
-        if (name == "glTexParameterf") {
-            uint32_t target = 0, pname = 0, paramRaw = 0;
-            uc_reg_read(uc, UC_ARM_REG_R0, &target);
-            uc_reg_read(uc, UC_ARM_REG_R1, &pname);
-            uc_reg_read(uc, UC_ARM_REG_R2, &paramRaw);
-            float fparam;
-            std::memcpy(&fparam, &paramRaw, 4);
-            ::glTexParameterf(target, pname, fparam);
-            return;
-        }
-
-        if (name == "glTexImage2D") {
-            uint32_t target = 0, level = 0, internalformat = 0, width = 0;
-            uc_reg_read(uc, UC_ARM_REG_R0, &target);
-            uc_reg_read(uc, UC_ARM_REG_R1, &level);
-            uc_reg_read(uc, UC_ARM_REG_R2, &internalformat);
-            uc_reg_read(uc, UC_ARM_REG_R3, &width);
-
-            uint32_t sp = 0;
-            uc_reg_read(uc, UC_ARM_REG_SP, &sp);
-            uint32_t height = 0, border = 0, format = 0, type = 0, pixelsPtr = 0;
-            uc_mem_read(uc, sp, &height, 4);
-            uc_mem_read(uc, sp + 4, &border, 4);
-            uc_mem_read(uc, sp + 8, &format, 4);
-            uc_mem_read(uc, sp + 12, &type, 4);
-            uc_mem_read(uc, sp + 16, &pixelsPtr, 4);
-
-            if (pixelsPtr != 0 && width > 0 && height > 0) {
-                size_t bpp = 4;
-                if (format == GL_RGB) bpp = (type == GL_UNSIGNED_SHORT_5_6_5) ? 2 : 3;
-                else if (format == GL_LUMINANCE || format == GL_ALPHA) bpp = 1;
-                else if (format == GL_LUMINANCE_ALPHA) bpp = 2;
-                size_t totalBytes = static_cast<size_t>(width) * height * bpp;
-                std::vector<uint8_t> pBuf(totalBytes);
-                uc_mem_read(uc, pixelsPtr, pBuf.data(), totalBytes);
-                ::glTexImage2D(target, level, internalformat, width, height, border, format, type, pBuf.data());
             } else {
-                ::glTexImage2D(target, level, internalformat, width, height, border, format, type, nullptr);
+                fflush(fit->second);
             }
+        }
+        uint32_t ret = 0;
+        uc_reg_write(uc, UC_ARM_REG_R0, &ret);
+        return;
+    }
+
+    // 6. Dynamic Linker (dlopen con caricamento reale librerie guest come libmono.so, dlsym, dladdr)
+    if (name == "dlopen") {
+        uint32_t pathAddr = 0;
+        uc_reg_read(uc, UC_ARM_REG_R0, &pathAddr);
+        if (pathAddr == 0) {
+            uint32_t globalH = 0x50000001U;
+            uc_reg_write(uc, UC_ARM_REG_R0, &globalH);
             return;
         }
+        std::string reqPath = readGuestCString(uc, pathAddr, 256);
+        size_t sl = reqPath.find_last_of('/');
+        std::string baseName = (sl != std::string::npos) ? reqPath.substr(sl + 1) : reqPath;
 
-        if (name == "glTexSubImage2D") {
-            uint32_t target = 0, level = 0, xoff = 0, yoff = 0;
-            uc_reg_read(uc, UC_ARM_REG_R0, &target);
-            uc_reg_read(uc, UC_ARM_REG_R1, &level);
-            uc_reg_read(uc, UC_ARM_REG_R2, &xoff);
-            uc_reg_read(uc, UC_ARM_REG_R3, &yoff);
-
-            uint32_t sp = 0;
-            uc_reg_read(uc, UC_ARM_REG_SP, &sp);
-            uint32_t width = 0, height = 0, format = 0, type = 0, pixelsPtr = 0;
-            uc_mem_read(uc, sp, &width, 4);
-            uc_mem_read(uc, sp + 4, &height, 4);
-            uc_mem_read(uc, sp + 8, &format, 4);
-            uc_mem_read(uc, sp + 12, &type, 4);
-            uc_mem_read(uc, sp + 16, &pixelsPtr, 4);
-
-            if (pixelsPtr != 0 && width > 0 && height > 0) {
-                size_t bpp = (format == GL_RGB) ? 3 : ((format == GL_RGBA) ? 4 : 1);
-                size_t totalBytes = static_cast<size_t>(width) * height * bpp;
-                std::vector<uint8_t> pBuf(totalBytes);
-                uc_mem_read(uc, pixelsPtr, pBuf.data(), totalBytes);
-                ::glTexSubImage2D(target, level, xoff, yoff, width, height, format, type, pBuf.data());
+        // Cerca se gia' caricata tra le librerie guest
+        for (const auto& lib : loadedLibraries_) {
+            if (lib && lib->path.find(baseName) != std::string::npos) {
+                uint32_t h = nextDlHandle_++;
+                dlopenHandleMap_[h] = lib;
+                LOGI("dlopen('%s') -> libreria guest gia' caricata (Handle: 0x%x)", reqPath.c_str(), h);
+                uc_reg_write(uc, UC_ARM_REG_R0, &h);
+                return;
             }
-            return;
         }
 
-        if (name == "glPixelStorei") {
-            uint32_t pname = 0, param = 0;
-            uc_reg_read(uc, UC_ARM_REG_R0, &pname);
-            uc_reg_read(uc, UC_ARM_REG_R1, &param);
-            ::glPixelStorei(pname, param);
-            return;
-        }
-
-        if (name == "glGenBuffers") {
-            uint32_t count = 0, ptr = 0;
-            uc_reg_read(uc, UC_ARM_REG_R0, &count);
-            uc_reg_read(uc, UC_ARM_REG_R1, &ptr);
-            if (count > 0 && ptr != 0) {
-                std::vector<GLuint> ids(count);
-                ::glGenBuffers(count, ids.data());
-                uc_mem_write(uc, ptr, ids.data(), count * sizeof(GLuint));
-            }
-            return;
-        }
-
-        if (name == "glDeleteBuffers") {
-            uint32_t count = 0, ptr = 0;
-            uc_reg_read(uc, UC_ARM_REG_R0, &count);
-            uc_reg_read(uc, UC_ARM_REG_R1, &ptr);
-            if (count > 0 && ptr != 0) {
-                std::vector<GLuint> ids(count);
-                uc_mem_read(uc, ptr, ids.data(), count * sizeof(GLuint));
-                ::glDeleteBuffers(count, ids.data());
-            }
-            return;
-        }
-
-        if (name == "glBindBuffer") {
-            uint32_t target = 0, buffer = 0;
-            uc_reg_read(uc, UC_ARM_REG_R0, &target);
-            uc_reg_read(uc, UC_ARM_REG_R1, &buffer);
-            ::glBindBuffer(target, buffer);
-            return;
-        }
-
-        if (name == "glBufferData") {
-            uint32_t target = 0, size = 0, dataPtr = 0, usage = 0;
-            uc_reg_read(uc, UC_ARM_REG_R0, &target);
-            uc_reg_read(uc, UC_ARM_REG_R1, &size);
-            uc_reg_read(uc, UC_ARM_REG_R2, &dataPtr);
-            uc_reg_read(uc, UC_ARM_REG_R3, &usage);
-            if (dataPtr != 0 && size > 0) {
-                std::vector<uint8_t> buf(size);
-                uc_mem_read(uc, dataPtr, buf.data(), size);
-                ::glBufferData(target, size, buf.data(), usage);
-            } else {
-                ::glBufferData(target, size, nullptr, usage);
-            }
-            return;
-        }
-
-        if (name == "glBufferSubData") {
-            uint32_t target = 0, offset = 0, size = 0, dataPtr = 0;
-            uc_reg_read(uc, UC_ARM_REG_R0, &target);
-            uc_reg_read(uc, UC_ARM_REG_R1, &offset);
-            uc_reg_read(uc, UC_ARM_REG_R2, &size);
-            uc_reg_read(uc, UC_ARM_REG_R3, &dataPtr);
-            if (dataPtr != 0 && size > 0) {
-                std::vector<uint8_t> buf(size);
-                uc_mem_read(uc, dataPtr, buf.data(), size);
-                ::glBufferSubData(target, offset, size, buf.data());
-            }
-            return;
-        }
-
-        if (name == "glCreateShader") {
-            uint32_t type = 0;
-            uc_reg_read(uc, UC_ARM_REG_R0, &type);
-            GLuint shader = ::glCreateShader(static_cast<GLenum>(type));
-            uint32_t ret = shader;
-            uc_reg_write(uc, UC_ARM_REG_R0, &ret);
-            return;
-        }
-
-        if (name == "glShaderSource") {
-            uint32_t shader = 0, count = 0, strArrayPtr = 0, lenArrayPtr = 0;
-            uc_reg_read(uc, UC_ARM_REG_R0, &shader);
-            uc_reg_read(uc, UC_ARM_REG_R1, &count);
-            uc_reg_read(uc, UC_ARM_REG_R2, &strArrayPtr);
-            uc_reg_read(uc, UC_ARM_REG_R3, &lenArrayPtr);
-
-            if (count > 0 && strArrayPtr != 0) {
-                std::vector<std::string> sources(count);
-                std::vector<const char*> cStrs(count);
-                for (uint32_t i = 0; i < count; ++i) {
-                    uint32_t sPtr = 0;
-                    uc_mem_read(uc, strArrayPtr + (i * 4), &sPtr, 4);
-                    if (sPtr != 0) {
-                        char chunk[256];
-                        std::string fullSrc;
-                        uint32_t cur = sPtr;
-                        while (true) {
-                            std::memset(chunk, 0, sizeof(chunk));
-                            uc_mem_read(uc, cur, chunk, sizeof(chunk) - 1);
-                            size_t clen = std::strlen(chunk);
-                            fullSrc.append(chunk, clen);
-                            if (clen < sizeof(chunk) - 1) break;
-                            cur += clen;
-                        }
-                        sources[i] = fullSrc;
-                    }
-                    cStrs[i] = sources[i].c_str();
+        // Prova caricamento dinamico da nativeLibDir_ (es. libmono.so, libgdvoucher.so)
+        if (!nativeLibDir_.empty() && baseName != "libc.so" && baseName != "libm.so" &&
+            baseName != "libdl.so" && baseName != "liblog.so" && baseName != "libGLESv2.so" &&
+            baseName != "libGLESv1_CM.so" && baseName != "libGLESv3.so" && baseName != "libEGL.so" &&
+            baseName != "libandroid.so" && baseName != "libOpenSLES.so" && baseName != "libz.so") {
+            std::string fullCandidate = nativeLibDir_ + "/" + baseName;
+            if (access(fullCandidate.c_str(), F_OK) == 0) {
+                Elf32Loader dynLoader;
+                auto dynLib = dynLoader.loadFromFile(fullCandidate);
+                if (dynLib && dynLib->mapToUnicorn(uc)) {
+                    registerLoadedLibrary(dynLib);
+                    dynLib->applyRelocations(uc);
+                    uint32_t h = nextDlHandle_++;
+                    dlopenHandleMap_[h] = dynLib;
+                    LOGI("dlopen('%s') -> caricata dinamicamente da '%s' (Bias=0x%08x, Handle=0x%x)",
+                         reqPath.c_str(), fullCandidate.c_str(), dynLib->load_bias, h);
+                    uc_reg_write(uc, UC_ARM_REG_R0, &h);
+                    return;
                 }
-                ::glShaderSource(shader, count, cStrs.data(), nullptr);
             }
-            return;
         }
 
-        if (name == "glCompileShader") {
-            uint32_t shader = 0;
-            uc_reg_read(uc, UC_ARM_REG_R0, &shader);
-            ::glCompileShader(shader);
-            return;
-        }
+        uint32_t sysH = nextDlHandle_++;
+        LOGI("dlopen('%s') -> handle di sistema 0x%x", reqPath.c_str(), sysH);
+        uc_reg_write(uc, UC_ARM_REG_R0, &sysH);
+        return;
+    }
 
-        if (name == "glGetShaderiv") {
-            uint32_t shader = 0, pname = 0, paramsPtr = 0;
-            uc_reg_read(uc, UC_ARM_REG_R0, &shader);
-            uc_reg_read(uc, UC_ARM_REG_R1, &pname);
-            uc_reg_read(uc, UC_ARM_REG_R2, &paramsPtr);
-            GLint param = 0;
-            ::glGetShaderiv(shader, pname, &param);
-            if (paramsPtr) uc_mem_write(uc, paramsPtr, &param, sizeof(param));
-            return;
-        }
+    if (name == "dlsym") {
+        uint32_t handle = 0, symNameAddr = 0;
+        uc_reg_read(uc, UC_ARM_REG_R0, &handle);
+        uc_reg_read(uc, UC_ARM_REG_R1, &symNameAddr);
+        uint32_t resolvedAddr = 0;
 
-        if (name == "glGetShaderInfoLog") {
-            uint32_t shader = 0, bufsize = 0, lenPtr = 0, logPtr = 0;
-            uc_reg_read(uc, UC_ARM_REG_R0, &shader);
-            uc_reg_read(uc, UC_ARM_REG_R1, &bufsize);
-            uc_reg_read(uc, UC_ARM_REG_R2, &lenPtr);
-            uc_reg_read(uc, UC_ARM_REG_R3, &logPtr);
-            if (bufsize > 0 && logPtr != 0) {
-                std::vector<char> buf(bufsize, 0);
-                GLsizei length = 0;
-                ::glGetShaderInfoLog(shader, bufsize, &length, buf.data());
-                if (lenPtr) uc_mem_write(uc, lenPtr, &length, 4);
-                uc_mem_write(uc, logPtr, buf.data(), length + 1);
+        if (symNameAddr != 0) {
+            std::string symName = readGuestCString(uc, symNameAddr, 128);
+            auto hit = dlopenHandleMap_.find(handle);
+            if (hit != dlopenHandleMap_.end() && hit->second) {
+                for (const auto& s : hit->second->symbols) {
+                    if (s.name == symName && s.vaddr != 0) {
+                        resolvedAddr = hit->second->load_bias + s.vaddr;
+                        break;
+                    }
+                }
             }
-            return;
-        }
-
-        if (name == "glDeleteShader") {
-            uint32_t shader = 0;
-            uc_reg_read(uc, UC_ARM_REG_R0, &shader);
-            ::glDeleteShader(shader);
-            return;
-        }
-
-        if (name == "glCreateProgram") {
-            GLuint program = ::glCreateProgram();
-            uint32_t ret = program;
-            uc_reg_write(uc, UC_ARM_REG_R0, &ret);
-            return;
-        }
-
-        if (name == "glAttachShader") {
-            uint32_t program = 0, shader = 0;
-            uc_reg_read(uc, UC_ARM_REG_R0, &program);
-            uc_reg_read(uc, UC_ARM_REG_R1, &shader);
-            ::glAttachShader(program, shader);
-            return;
-        }
-
-        if (name == "glLinkProgram") {
-            uint32_t program = 0;
-            uc_reg_read(uc, UC_ARM_REG_R0, &program);
-            ::glLinkProgram(program);
-            return;
-        }
-
-        if (name == "glGetProgramiv") {
-            uint32_t program = 0, pname = 0, paramsPtr = 0;
-            uc_reg_read(uc, UC_ARM_REG_R0, &program);
-            uc_reg_read(uc, UC_ARM_REG_R1, &pname);
-            uc_reg_read(uc, UC_ARM_REG_R2, &paramsPtr);
-            GLint param = 0;
-            ::glGetProgramiv(program, pname, &param);
-            if (paramsPtr) uc_mem_write(uc, paramsPtr, &param, sizeof(param));
-            return;
-        }
-
-        if (name == "glGetProgramInfoLog") {
-            uint32_t program = 0, bufsize = 0, lenPtr = 0, logPtr = 0;
-            uc_reg_read(uc, UC_ARM_REG_R0, &program);
-            uc_reg_read(uc, UC_ARM_REG_R1, &bufsize);
-            uc_reg_read(uc, UC_ARM_REG_R2, &lenPtr);
-            uc_reg_read(uc, UC_ARM_REG_R3, &logPtr);
-            if (bufsize > 0 && logPtr != 0) {
-                std::vector<char> buf(bufsize, 0);
-                GLsizei length = 0;
-                ::glGetProgramInfoLog(program, bufsize, &length, buf.data());
-                if (lenPtr) uc_mem_write(uc, lenPtr, &length, 4);
-                uc_mem_write(uc, logPtr, buf.data(), length + 1);
+            if (resolvedAddr == 0 && symName.rfind("gl", 0) != 0 && symName.rfind("egl", 0) != 0) {
+                resolvedAddr = findExportedSymbol(symName);
             }
-            return;
-        }
-
-        if (name == "glUseProgram") {
-            uint32_t program = 0;
-            uc_reg_read(uc, UC_ARM_REG_R0, &program);
-            ::glUseProgram(program);
-            return;
-        }
-
-        if (name == "glDeleteProgram") {
-            uint32_t program = 0;
-            uc_reg_read(uc, UC_ARM_REG_R0, &program);
-            ::glDeleteProgram(program);
-            return;
-        }
-
-        if (name == "glGetUniformLocation") {
-            uint32_t program = 0, namePtr = 0;
-            uc_reg_read(uc, UC_ARM_REG_R0, &program);
-            uc_reg_read(uc, UC_ARM_REG_R1, &namePtr);
-            char uName[128] = {0};
-            if (namePtr) uc_mem_read(uc, namePtr, uName, sizeof(uName) - 1);
-            GLint loc = ::glGetUniformLocation(program, uName);
-            uint32_t ret = static_cast<uint32_t>(loc);
-            uc_reg_write(uc, UC_ARM_REG_R0, &ret);
-            return;
-        }
-
-        if (name == "glGetAttribLocation") {
-            uint32_t program = 0, namePtr = 0;
-            uc_reg_read(uc, UC_ARM_REG_R0, &program);
-            uc_reg_read(uc, UC_ARM_REG_R1, &namePtr);
-            char aName[128] = {0};
-            if (namePtr) uc_mem_read(uc, namePtr, aName, sizeof(aName) - 1);
-            GLint loc = ::glGetAttribLocation(program, aName);
-            uint32_t ret = static_cast<uint32_t>(loc);
-            uc_reg_write(uc, UC_ARM_REG_R0, &ret);
-            return;
-        }
-
-        if (name == "glUniform1i") {
-            uint32_t loc = 0, v0 = 0;
-            uc_reg_read(uc, UC_ARM_REG_R0, &loc);
-            uc_reg_read(uc, UC_ARM_REG_R1, &v0);
-            ::glUniform1i(static_cast<GLint>(loc), static_cast<GLint>(v0));
-            return;
-        }
-
-        if (name == "glUniform1f") {
-            uint32_t loc = 0, v0Raw = 0;
-            uc_reg_read(uc, UC_ARM_REG_R0, &loc);
-            uc_reg_read(uc, UC_ARM_REG_R1, &v0Raw);
-            float fv0;
-            std::memcpy(&fv0, &v0Raw, 4);
-            ::glUniform1f(static_cast<GLint>(loc), fv0);
-            return;
-        }
-
-        if (name == "glUniform2f") {
-            uint32_t loc = 0, v0Raw = 0, v1Raw = 0;
-            uc_reg_read(uc, UC_ARM_REG_R0, &loc);
-            uc_reg_read(uc, UC_ARM_REG_R1, &v0Raw);
-            uc_reg_read(uc, UC_ARM_REG_R2, &v1Raw);
-            float fv0, fv1;
-            std::memcpy(&fv0, &v0Raw, 4);
-            std::memcpy(&fv1, &v1Raw, 4);
-            ::glUniform2f(static_cast<GLint>(loc), fv0, fv1);
-            return;
-        }
-
-        if (name == "glUniform3f") {
-            uint32_t loc = 0, v0Raw = 0, v1Raw = 0, v2Raw = 0;
-            uc_reg_read(uc, UC_ARM_REG_R0, &loc);
-            uc_reg_read(uc, UC_ARM_REG_R1, &v0Raw);
-            uc_reg_read(uc, UC_ARM_REG_R2, &v1Raw);
-            uc_reg_read(uc, UC_ARM_REG_R3, &v2Raw);
-            float fv0, fv1, fv2;
-            std::memcpy(&fv0, &v0Raw, 4);
-            std::memcpy(&fv1, &v1Raw, 4);
-            std::memcpy(&fv2, &v2Raw, 4);
-            ::glUniform3f(static_cast<GLint>(loc), fv0, fv1, fv2);
-            return;
-        }
-
-        if (name == "glUniform4f") {
-            uint32_t loc = 0, v0Raw = 0, v1Raw = 0, v2Raw = 0;
-            uc_reg_read(uc, UC_ARM_REG_R0, &loc);
-            uc_reg_read(uc, UC_ARM_REG_R1, &v0Raw);
-            uc_reg_read(uc, UC_ARM_REG_R2, &v1Raw);
-            uc_reg_read(uc, UC_ARM_REG_R3, &v2Raw);
-            uint32_t sp = 0, v3Raw = 0;
-            uc_reg_read(uc, UC_ARM_REG_SP, &sp);
-            uc_mem_read(uc, sp, &v3Raw, 4);
-            float fv0, fv1, fv2, fv3;
-            std::memcpy(&fv0, &v0Raw, 4);
-            std::memcpy(&fv1, &v1Raw, 4);
-            std::memcpy(&fv2, &v2Raw, 4);
-            std::memcpy(&fv3, &v3Raw, 4);
-            ::glUniform4f(static_cast<GLint>(loc), fv0, fv1, fv2, fv3);
-            return;
-        }
-
-        if (name == "glUniformMatrix4fv") {
-            uint32_t loc = 0, count = 0, transpose = 0, valPtr = 0;
-            uc_reg_read(uc, UC_ARM_REG_R0, &loc);
-            uc_reg_read(uc, UC_ARM_REG_R1, &count);
-            uc_reg_read(uc, UC_ARM_REG_R2, &transpose);
-            uc_reg_read(uc, UC_ARM_REG_R3, &valPtr);
-            if (count > 0 && valPtr != 0) {
-                std::vector<GLfloat> mat(count * 16);
-                uc_mem_read(uc, valPtr, mat.data(), count * 16 * sizeof(GLfloat));
-                ::glUniformMatrix4fv(static_cast<GLint>(loc), count, static_cast<GLboolean>(transpose), mat.data());
+            if (resolvedAddr == 0) {
+                resolvedAddr = registerSymbolTrampoline(symName, uc);
             }
-            return;
+            LOGI("dlsym('%s') -> 0x%08x", symName.c_str(), resolvedAddr);
         }
+        uc_reg_write(uc, UC_ARM_REG_R0, &resolvedAddr);
+        return;
+    }
 
-        if (name == "glEnableVertexAttribArray") {
-            uint32_t index = 0;
-            uc_reg_read(uc, UC_ARM_REG_R0, &index);
-            ::glEnableVertexAttribArray(index);
-            return;
-        }
-
-        if (name == "glDisableVertexAttribArray") {
-            uint32_t index = 0;
-            uc_reg_read(uc, UC_ARM_REG_R0, &index);
-            ::glDisableVertexAttribArray(index);
-            return;
-        }
-
-        if (name == "glVertexAttribPointer") {
-            uint32_t index = 0, size = 0, type = 0, normalized = 0;
-            uc_reg_read(uc, UC_ARM_REG_R0, &index);
-            uc_reg_read(uc, UC_ARM_REG_R1, &size);
-            uc_reg_read(uc, UC_ARM_REG_R2, &type);
-            uc_reg_read(uc, UC_ARM_REG_R3, &normalized);
-
-            uint32_t sp = 0;
-            uc_reg_read(uc, UC_ARM_REG_SP, &sp);
-            uint32_t stride = 0, pointer = 0;
-            uc_mem_read(uc, sp, &stride, 4);
-            uc_mem_read(uc, sp + 4, &pointer, 4);
-
-            ::glVertexAttribPointer(
-                index,
-                static_cast<GLint>(size),
-                static_cast<GLenum>(type),
-                static_cast<GLboolean>(normalized),
-                static_cast<GLsizei>(stride),
-                reinterpret_cast<const void*>(static_cast<uintptr_t>(pointer))
-            );
-            return;
-        }
-
-        if (name == "glDrawArrays") {
-            uint32_t mode = 0, first = 0, count = 0;
-            uc_reg_read(uc, UC_ARM_REG_R0, &mode);
-            uc_reg_read(uc, UC_ARM_REG_R1, &first);
-            uc_reg_read(uc, UC_ARM_REG_R2, &count);
-            ::glDrawArrays(static_cast<GLenum>(mode), static_cast<GLint>(first), static_cast<GLsizei>(count));
-            return;
-        }
-
-        if (name == "glDrawElements") {
-            uint32_t mode = 0, count = 0, type = 0, indices = 0;
-            uc_reg_read(uc, UC_ARM_REG_R0, &mode);
-            uc_reg_read(uc, UC_ARM_REG_R1, &count);
-            uc_reg_read(uc, UC_ARM_REG_R2, &type);
-            uc_reg_read(uc, UC_ARM_REG_R3, &indices);
-
-            GLint boundEbo = 0;
-            ::glGetIntegerv(GL_ELEMENT_ARRAY_BUFFER_BINDING, &boundEbo);
-            if (boundEbo != 0) {
-                ::glDrawElements(
-                    static_cast<GLenum>(mode),
-                    static_cast<GLsizei>(count),
-                    static_cast<GLenum>(type),
-                    reinterpret_cast<const void*>(static_cast<uintptr_t>(indices))
-                );
-            } else if (indices != 0 && count > 0) {
-                size_t elemSize = (type == GL_UNSIGNED_SHORT) ? 2 : ((type == GL_UNSIGNED_BYTE) ? 1 : 4);
-                std::vector<uint8_t> idxBuf(count * elemSize);
-                uc_mem_read(uc, indices, idxBuf.data(), idxBuf.size());
-                ::glDrawElements(static_cast<GLenum>(mode), static_cast<GLsizei>(count), static_cast<GLenum>(type), idxBuf.data());
+    if (name == "dladdr") {
+        uint32_t addr = 0, infoPtr = 0;
+        uc_reg_read(uc, UC_ARM_REG_R0, &addr);
+        uc_reg_read(uc, UC_ARM_REG_R1, &infoPtr);
+        if (infoPtr != 0) {
+            std::string fpath = loadedLibraries_.empty() ? "/system/lib/libc.so" : loadedLibraries_.back()->path;
+            uint32_t fbase = loadedLibraries_.empty() ? 0x40000000U : loadedLibraries_.back()->load_bias;
+            for (const auto& lib : loadedLibraries_) {
+                if (lib && addr >= lib->load_bias && addr < (lib->load_bias + lib->aligned_max_vaddr)) {
+                    fpath = lib->path;
+                    fbase = lib->load_bias;
+                    break;
+                }
             }
-            return;
+            uint32_t dlInfo32[4] = {
+                createGuestString(uc, fpath),
+                fbase,
+                0,
+                addr
+            };
+            uc_mem_write(uc, infoPtr, dlInfo32, sizeof(dlInfo32));
         }
+        uint32_t one = 1;
+        uc_reg_write(uc, UC_ARM_REG_R0, &one);
+        return;
+    }
 
-        if (name == "glGenFramebuffers" || name == "glGenFramebuffersOES") {
-            uint32_t count = 0, ptr = 0;
-            uc_reg_read(uc, UC_ARM_REG_R0, &count);
-            uc_reg_read(uc, UC_ARM_REG_R1, &ptr);
-            if (count > 0 && ptr != 0) {
-                std::vector<GLuint> ids(count);
-                ::glGenFramebuffers(count, ids.data());
-                uc_mem_write(uc, ptr, ids.data(), count * sizeof(GLuint));
+    if (name == "dlclose" || name == "dlerror") {
+        uint32_t zero = 0;
+        uc_reg_write(uc, UC_ARM_REG_R0, &zero);
+        return;
+    }
+
+    // 7. Pthread & TLS Keys
+    if (name == "pthread_key_create") {
+        uint32_t keyAddr = 0;
+        uc_reg_read(uc, UC_ARM_REG_R0, &keyAddr);
+        if (keyAddr != 0) {
+            uint32_t newKey = sNextPthreadKey++;
+            sPthreadTlsMap[newKey] = 0;
+            uc_mem_write(uc, keyAddr, &newKey, 4);
+        }
+        uint32_t zero = 0;
+        uc_reg_write(uc, UC_ARM_REG_R0, &zero);
+        return;
+    }
+    if (name == "pthread_setspecific") {
+        uint32_t key = 0, val = 0;
+        uc_reg_read(uc, UC_ARM_REG_R0, &key);
+        uc_reg_read(uc, UC_ARM_REG_R1, &val);
+        sPthreadTlsMap[key] = val;
+        uint32_t zero = 0;
+        uc_reg_write(uc, UC_ARM_REG_R0, &zero);
+        return;
+    }
+    if (name == "pthread_getspecific") {
+        uint32_t key = 0;
+        uc_reg_read(uc, UC_ARM_REG_R0, &key);
+        uint32_t val = sPthreadTlsMap.count(key) ? sPthreadTlsMap[key] : 0U;
+        uc_reg_write(uc, UC_ARM_REG_R0, &val);
+        return;
+    }
+    if (name == "pthread_key_delete") {
+        uint32_t key = 0;
+        uc_reg_read(uc, UC_ARM_REG_R0, &key);
+        sPthreadTlsMap.erase(key);
+        uint32_t zero = 0;
+        uc_reg_write(uc, UC_ARM_REG_R0, &zero);
+        return;
+    }
+    if (name == "pthread_self") {
+        uc_reg_write(uc, UC_ARM_REG_R0, &guestTlsBase_);
+        return;
+    }
+    if (name == "pthread_equal") {
+        uint32_t t1 = 0, t2 = 0;
+        uc_reg_read(uc, UC_ARM_REG_R0, &t1);
+        uc_reg_read(uc, UC_ARM_REG_R1, &t2);
+        uint32_t eq = (t1 == t2) ? 1U : 0U;
+        uc_reg_write(uc, UC_ARM_REG_R0, &eq);
+        return;
+    }
+    if (name == "pthread_once") {
+        uint32_t onceCtrl = 0;
+        uc_reg_read(uc, UC_ARM_REG_R0, &onceCtrl);
+        if (onceCtrl != 0) {
+            uint32_t done = 1;
+            uc_mem_write(uc, onceCtrl, &done, 4);
+        }
+        uint32_t zero = 0;
+        uc_reg_write(uc, UC_ARM_REG_R0, &zero);
+        return;
+    }
+    if (name.rfind("pthread_mutex", 0) == 0 || name.rfind("pthread_cond", 0) == 0 ||
+        name.rfind("pthread_attr", 0) == 0 || name.rfind("pthread_rwlock", 0) == 0 ||
+        name == "pthread_getattr_np" || name == "pthread_setname_np" || name == "pthread_detach" || name == "pthread_join") {
+        uint32_t zero = 0;
+        uc_reg_write(uc, UC_ARM_REG_R0, &zero);
+        return;
+    }
+
+    // 8. Android NDK NativeWindow & AssetManager
+    if (name == "ANativeWindow_fromSurface") {
+        uint32_t winHandle = guestJniBase_ + 0x2800U;
+        uc_reg_write(uc, UC_ARM_REG_R0, &winHandle);
+        return;
+    }
+    if (name == "ANativeWindow_getWidth") {
+        uint32_t w = 1920;
+        uc_reg_write(uc, UC_ARM_REG_R0, &w);
+        return;
+    }
+    if (name == "ANativeWindow_getHeight") {
+        uint32_t h = 1080;
+        uc_reg_write(uc, UC_ARM_REG_R0, &h);
+        return;
+    }
+    if (name == "ANativeWindow_getFormat") {
+        uint32_t fmt = 1; // WINDOW_FORMAT_RGBA_8888
+        uc_reg_write(uc, UC_ARM_REG_R0, &fmt);
+        return;
+    }
+    if (name == "ANativeWindow_setBuffersGeometry" || name == "ANativeWindow_acquire" || name == "ANativeWindow_release") {
+        uint32_t zero = 0;
+        uc_reg_write(uc, UC_ARM_REG_R0, &zero);
+        return;
+    }
+
+    // 9. Zlib Native Asset Decompression (crc32, adler32, uncompress, inflateInit_, inflateInit2_, inflate, inflateEnd)
+    if (name == "crc32" || name == "adler32") {
+        uint32_t crc = 0, bufPtr = 0, len = 0;
+        uc_reg_read(uc, UC_ARM_REG_R0, &crc);
+        uc_reg_read(uc, UC_ARM_REG_R1, &bufPtr);
+        uc_reg_read(uc, UC_ARM_REG_R2, &len);
+        uLong res = (name == "crc32") ? ::crc32(crc, Z_NULL, 0) : ::adler32(crc, Z_NULL, 0);
+        if (bufPtr != 0 && len > 0 && len < 0x04000000U) {
+            std::vector<Bytef> tmp(len);
+            uc_mem_read(uc, bufPtr, tmp.data(), len);
+            res = (name == "crc32") ? ::crc32(crc, tmp.data(), len) : ::adler32(crc, tmp.data(), len);
+        }
+        uint32_t ret = static_cast<uint32_t>(res);
+        uc_reg_write(uc, UC_ARM_REG_R0, &ret);
+        return;
+    }
+    if (name == "uncompress") {
+        uint32_t dstPtr = 0, dstLenPtr = 0, srcPtr = 0, srcLen = 0;
+        uc_reg_read(uc, UC_ARM_REG_R0, &dstPtr);
+        uc_reg_read(uc, UC_ARM_REG_R1, &dstLenPtr);
+        uc_reg_read(uc, UC_ARM_REG_R2, &srcPtr);
+        uc_reg_read(uc, UC_ARM_REG_R3, &srcLen);
+        int zret = Z_DATA_ERROR;
+        if (dstPtr != 0 && dstLenPtr != 0 && srcPtr != 0 && srcLen > 0) {
+            uint32_t dstLen32 = 0;
+            uc_mem_read(uc, dstLenPtr, &dstLen32, 4);
+            if (dstLen32 > 0 && dstLen32 < 0x08000000U && srcLen < 0x04000000U) {
+                std::vector<Bytef> srcBuf(srcLen), dstBuf(dstLen32);
+                uc_mem_read(uc, srcPtr, srcBuf.data(), srcLen);
+                uLongf hostDstLen = dstLen32;
+                zret = ::uncompress(dstBuf.data(), &hostDstLen, srcBuf.data(), srcLen);
+                if (zret == Z_OK) {
+                    uc_mem_write(uc, dstPtr, dstBuf.data(), hostDstLen);
+                    uint32_t outLen32 = static_cast<uint32_t>(hostDstLen);
+                    uc_mem_write(uc, dstLenPtr, &outLen32, 4);
+                }
             }
-            return;
         }
-
-        if (name == "glBindFramebuffer" || name == "glBindFramebufferOES") {
-            uint32_t target = 0, fbo = 0;
-            uc_reg_read(uc, UC_ARM_REG_R0, &target);
-            uc_reg_read(uc, UC_ARM_REG_R1, &fbo);
-            ::glBindFramebuffer(target, fbo);
-            return;
-        }
-
-        if (name == "glGenRenderbuffers" || name == "glGenRenderbuffersOES") {
-            uint32_t count = 0, ptr = 0;
-            uc_reg_read(uc, UC_ARM_REG_R0, &count);
-            uc_reg_read(uc, UC_ARM_REG_R1, &ptr);
-            if (count > 0 && ptr != 0) {
-                std::vector<GLuint> ids(count);
-                ::glGenRenderbuffers(count, ids.data());
-                uc_mem_write(uc, ptr, ids.data(), count * sizeof(GLuint));
+        uint32_t ret = static_cast<uint32_t>(zret);
+        uc_reg_write(uc, UC_ARM_REG_R0, &ret);
+        return;
+    }
+    if (name == "inflateInit_" || name == "inflateInit2_") {
+        uint32_t strmPtr = 0, r1 = 0;
+        uc_reg_read(uc, UC_ARM_REG_R0, &strmPtr);
+        uc_reg_read(uc, UC_ARM_REG_R1, &r1);
+        int zret = Z_STREAM_ERROR;
+        if (strmPtr != 0) {
+            auto* hostStrm = new z_stream{};
+            zret = (name == "inflateInit2_") ? inflateInit2(hostStrm, static_cast<int>(static_cast<int32_t>(r1))) : inflateInit(hostStrm);
+            if (zret == Z_OK) {
+                uint32_t h = sNextZlibHandle++;
+                sZlibStreamMap[h] = hostStrm;
+                z_stream32 gStrm{};
+                uc_mem_read(uc, strmPtr, &gStrm, sizeof(gStrm));
+                gStrm.state = h;
+                gStrm.total_in = 0;
+                gStrm.total_out = 0;
+                uc_mem_write(uc, strmPtr, &gStrm, sizeof(gStrm));
+            } else {
+                delete hostStrm;
             }
-            return;
         }
-
-        if (name == "glBindRenderbuffer" || name == "glBindRenderbufferOES") {
-            uint32_t target = 0, rbo = 0;
-            uc_reg_read(uc, UC_ARM_REG_R0, &target);
-            uc_reg_read(uc, UC_ARM_REG_R1, &rbo);
-            ::glBindRenderbuffer(target, rbo);
-            return;
-        }
-
-        if (name == "glRenderbufferStorage" || name == "glRenderbufferStorageOES") {
-            uint32_t target = 0, internalformat = 0, w = 0, h = 0;
-            uc_reg_read(uc, UC_ARM_REG_R0, &target);
-            uc_reg_read(uc, UC_ARM_REG_R1, &internalformat);
-            uc_reg_read(uc, UC_ARM_REG_R2, &w);
-            uc_reg_read(uc, UC_ARM_REG_R3, &h);
-            ::glRenderbufferStorage(target, internalformat, w, h);
-            return;
-        }
-
-        if (name == "glFramebufferRenderbuffer" || name == "glFramebufferRenderbufferOES") {
-            uint32_t target = 0, attachment = 0, renderbuffertarget = 0, renderbuffer = 0;
-            uc_reg_read(uc, UC_ARM_REG_R0, &target);
-            uc_reg_read(uc, UC_ARM_REG_R1, &attachment);
-            uc_reg_read(uc, UC_ARM_REG_R2, &renderbuffertarget);
-            uc_reg_read(uc, UC_ARM_REG_R3, &renderbuffer);
-            ::glFramebufferRenderbuffer(target, attachment, renderbuffertarget, renderbuffer);
-            return;
-        }
-
-        if (name == "glFramebufferTexture2D" || name == "glFramebufferTexture2DOES") {
-            uint32_t target = 0, attachment = 0, textarget = 0, texture = 0;
-            uc_reg_read(uc, UC_ARM_REG_R0, &target);
-            uc_reg_read(uc, UC_ARM_REG_R1, &attachment);
-            uc_reg_read(uc, UC_ARM_REG_R2, &textarget);
-            uc_reg_read(uc, UC_ARM_REG_R3, &texture);
-            uint32_t sp = 0, level = 0;
-            uc_reg_read(uc, UC_ARM_REG_SP, &sp);
-            uc_mem_read(uc, sp, &level, 4);
-            ::glFramebufferTexture2D(target, attachment, textarget, texture, level);
-            return;
-        }
-
-        if (name == "glCheckFramebufferStatus" || name == "glCheckFramebufferStatusOES") {
-            uint32_t target = 0;
-            uc_reg_read(uc, UC_ARM_REG_R0, &target);
-            GLenum status = ::glCheckFramebufferStatus(target);
-            uint32_t ret = status;
-            uc_reg_write(uc, UC_ARM_REG_R0, &ret);
-            return;
-        }
-
-        if (name == "glFlush") {
-            ::glFlush();
-            return;
-        }
-
-        if (name == "glFinish") {
-            ::glFinish();
-            return;
-        }
-
-        if (name == "glGetError") {
-            uint32_t err = ::glGetError();
-            uc_reg_write(uc, UC_ARM_REG_R0, &err);
-            return;
-        }
-
-        if (name == "glGetIntegerv") {
-            uint32_t pname = 0, paramsAddr = 0;
-            uc_reg_read(uc, UC_ARM_REG_R0, &pname);
-            uc_reg_read(uc, UC_ARM_REG_R1, &paramsAddr);
-            if (paramsAddr != 0) {
-                GLint val[4] = {0};
-                ::glGetIntegerv(static_cast<GLenum>(pname), val);
-                uc_mem_write(uc, paramsAddr, val, sizeof(val));
+        uint32_t ret = static_cast<uint32_t>(zret);
+        uc_reg_write(uc, UC_ARM_REG_R0, &ret);
+        return;
+    }
+    if (name == "inflate") {
+        uint32_t strmPtr = 0, flush = 0;
+        uc_reg_read(uc, UC_ARM_REG_R0, &strmPtr);
+        uc_reg_read(uc, UC_ARM_REG_R1, &flush);
+        int zret = Z_STREAM_ERROR;
+        if (strmPtr != 0) {
+            z_stream32 gStrm{};
+            uc_mem_read(uc, strmPtr, &gStrm, sizeof(gStrm));
+            auto zit = sZlibStreamMap.find(gStrm.state);
+            if (zit != sZlibStreamMap.end() && zit->second) {
+                z_stream* hs = zit->second;
+                std::vector<Bytef> inBuf(gStrm.avail_in), outBuf(gStrm.avail_out);
+                if (gStrm.avail_in > 0 && gStrm.next_in != 0) {
+                    uc_mem_read(uc, gStrm.next_in, inBuf.data(), gStrm.avail_in);
+                }
+                hs->next_in = inBuf.data();
+                hs->avail_in = gStrm.avail_in;
+                hs->next_out = outBuf.data();
+                hs->avail_out = gStrm.avail_out;
+                zret = ::inflate(hs, static_cast<int>(flush));
+                uint32_t consumed = gStrm.avail_in - hs->avail_in;
+                uint32_t produced = gStrm.avail_out - hs->avail_out;
+                if (produced > 0 && gStrm.next_out != 0) {
+                    uc_mem_write(uc, gStrm.next_out, outBuf.data(), produced);
+                }
+                gStrm.next_in += consumed;
+                gStrm.avail_in = hs->avail_in;
+                gStrm.total_in += consumed;
+                gStrm.next_out += produced;
+                gStrm.avail_out = hs->avail_out;
+                gStrm.total_out += produced;
+                gStrm.adler = static_cast<uint32_t>(hs->adler);
+                uc_mem_write(uc, strmPtr, &gStrm, sizeof(gStrm));
             }
-            return;
         }
-
-        if (name == "glGetString") {
-            uint32_t nameParam = 0;
-            uc_reg_read(uc, UC_ARM_REG_R0, &nameParam);
-            const char* targetStr = reinterpret_cast<const char*>(::glGetString(static_cast<GLenum>(nameParam)));
-            if (!targetStr) {
-                targetStr = "OpenGL ES 2.0 Emux32";
+        uint32_t ret = static_cast<uint32_t>(zret);
+        uc_reg_write(uc, UC_ARM_REG_R0, &ret);
+        return;
+    }
+    if (name == "inflateEnd" || name == "inflateReset") {
+        uint32_t strmPtr = 0;
+        uc_reg_read(uc, UC_ARM_REG_R0, &strmPtr);
+        if (strmPtr != 0) {
+            z_stream32 gStrm{};
+            uc_mem_read(uc, strmPtr, &gStrm, sizeof(gStrm));
+            auto zit = sZlibStreamMap.find(gStrm.state);
+            if (zit != sZlibStreamMap.end() && zit->second) {
+                if (name == "inflateEnd") {
+                    ::inflateEnd(zit->second);
+                    delete zit->second;
+                    sZlibStreamMap.erase(zit);
+                } else {
+                    ::inflateReset(zit->second);
+                }
             }
-            uint32_t strAddr = sHeapCurrent;
-            size_t len = std::strlen(targetStr) + 1;
-            sHeapCurrent += (len + 15) & ~15U;
-            uc_mem_write(uc, strAddr, targetStr, len);
-            uc_reg_write(uc, UC_ARM_REG_R0, &strAddr);
-            return;
         }
+        uint32_t ret = Z_OK;
+        uc_reg_write(uc, UC_ARM_REG_R0, &ret);
+        return;
+    }
 
-        // ==================== EGL PASSTHROUGH ====================
-        if (name == "eglSwapBuffers") {
-            GuestRuntimeEnvironment::getInstance().swapBuffers();
-            uint32_t retVal = 1; // EGL_TRUE
-            uc_reg_write(uc, UC_ARM_REG_R0, &retVal);
-            return;
+    // 10. Libm Hardware Math (softfp ABI ARM32)
+    if (name == "sinf" || name == "cosf" || name == "tanf" || name == "sqrtf" ||
+        name == "expf" || name == "logf" || name == "floorf" || name == "ceilf" ||
+        name == "acosf" || name == "asinf" || name == "atanf") {
+        uint32_t r0 = 0;
+        uc_reg_read(uc, UC_ARM_REG_R0, &r0);
+        float x = 0.0f;
+        std::memcpy(&x, &r0, 4);
+        float res = 0.0f;
+        if (name == "sinf") res = std::sin(x);
+        else if (name == "cosf") res = std::cos(x);
+        else if (name == "tanf") res = std::tan(x);
+        else if (name == "sqrtf") res = x >= 0.0f ? std::sqrt(x) : 0.0f;
+        else if (name == "expf") res = std::exp(x);
+        else if (name == "logf") res = x > 0.0f ? std::log(x) : 0.0f;
+        else if (name == "floorf") res = std::floor(x);
+        else if (name == "ceilf") res = std::ceil(x);
+        else if (name == "acosf") res = std::acos(std::clamp(x, -1.0f, 1.0f));
+        else if (name == "asinf") res = std::asin(std::clamp(x, -1.0f, 1.0f));
+        else res = std::atan(x);
+        uint32_t out = 0;
+        std::memcpy(&out, &res, 4);
+        uc_reg_write(uc, UC_ARM_REG_R0, &out);
+        return;
+    }
+    if (name == "atan2f" || name == "powf" || name == "fmodf") {
+        uint32_t r0 = 0, r1 = 0;
+        uc_reg_read(uc, UC_ARM_REG_R0, &r0);
+        uc_reg_read(uc, UC_ARM_REG_R1, &r1);
+        float a = 0.0f, b = 0.0f;
+        std::memcpy(&a, &r0, 4);
+        std::memcpy(&b, &r1, 4);
+        float res = (name == "atan2f") ? std::atan2(a, b) : ((name == "powf") ? std::pow(a, b) : (b != 0.0f ? std::fmod(a, b) : 0.0f));
+        uint32_t out = 0;
+        std::memcpy(&out, &res, 4);
+        uc_reg_write(uc, UC_ARM_REG_R0, &out);
+        return;
+    }
+
+    // 11. OpenGL ES 2.0 & EGL Hardware Passthrough (64-bit Host GPU)
+    if (name == "glViewport" || name == "glScissor") {
+        uint32_t x = 0, y = 0, w = 0, h = 0;
+        uc_reg_read(uc, UC_ARM_REG_R0, &x);
+        uc_reg_read(uc, UC_ARM_REG_R1, &y);
+        uc_reg_read(uc, UC_ARM_REG_R2, &w);
+        uc_reg_read(uc, UC_ARM_REG_R3, &h);
+        if (name == "glViewport") glViewport(static_cast<GLint>(x), static_cast<GLint>(y), static_cast<GLsizei>(w), static_cast<GLsizei>(h));
+        else glScissor(static_cast<GLint>(x), static_cast<GLint>(y), static_cast<GLsizei>(w), static_cast<GLsizei>(h));
+        return;
+    }
+    if (name == "glClearColor") {
+        uint32_t r0 = 0, r1 = 0, r2 = 0, r3 = 0;
+        uc_reg_read(uc, UC_ARM_REG_R0, &r0);
+        uc_reg_read(uc, UC_ARM_REG_R1, &r1);
+        uc_reg_read(uc, UC_ARM_REG_R2, &r2);
+        uc_reg_read(uc, UC_ARM_REG_R3, &r3);
+        float red = 0.0f, green = 0.0f, blue = 0.0f, alpha = 1.0f;
+        std::memcpy(&red, &r0, 4);
+        std::memcpy(&green, &r1, 4);
+        std::memcpy(&blue, &r2, 4);
+        std::memcpy(&alpha, &r3, 4);
+        glClearColor(red, green, blue, alpha);
+        return;
+    }
+    if (name == "glClear") {
+        uint32_t mask = 0;
+        uc_reg_read(uc, UC_ARM_REG_R0, &mask);
+        glClear(static_cast<GLbitfield>(mask));
+        return;
+    }
+    if (name == "glClearDepthf") {
+        uint32_t r0 = 0;
+        uc_reg_read(uc, UC_ARM_REG_R0, &r0);
+        float d = 1.0f;
+        std::memcpy(&d, &r0, 4);
+        glClearDepthf(d);
+        return;
+    }
+    if (name == "glClearStencil") {
+        uint32_t s = 0;
+        uc_reg_read(uc, UC_ARM_REG_R0, &s);
+        glClearStencil(static_cast<GLint>(s));
+        return;
+    }
+    if (name == "glEnable" || name == "glDisable" || name == "glIsEnabled") {
+        uint32_t cap = 0;
+        uc_reg_read(uc, UC_ARM_REG_R0, &cap);
+        if (name == "glEnable") glEnable(static_cast<GLenum>(cap));
+        else if (name == "glDisable") glDisable(static_cast<GLenum>(cap));
+        else {
+            uint32_t res = glIsEnabled(static_cast<GLenum>(cap));
+            uc_reg_write(uc, UC_ARM_REG_R0, &res);
         }
-
-        if (name == "eglGetDisplay") {
-            EGLDisplay dpy = GuestRuntimeEnvironment::getInstance().getEglDisplay();
-            uint32_t ret = (dpy != EGL_NO_DISPLAY) ? static_cast<uint32_t>(reinterpret_cast<uintptr_t>(dpy)) : 1;
-            uc_reg_write(uc, UC_ARM_REG_R0, &ret);
-            return;
+        return;
+    }
+    if (name == "glBlendFunc") {
+        uint32_t s = 0, d = 0;
+        uc_reg_read(uc, UC_ARM_REG_R0, &s);
+        uc_reg_read(uc, UC_ARM_REG_R1, &d);
+        glBlendFunc(static_cast<GLenum>(s), static_cast<GLenum>(d));
+        return;
+    }
+    if (name == "glBlendFuncSeparate") {
+        uint32_t sr = 0, dr = 0, sa = 0, da = 0;
+        uc_reg_read(uc, UC_ARM_REG_R0, &sr);
+        uc_reg_read(uc, UC_ARM_REG_R1, &dr);
+        uc_reg_read(uc, UC_ARM_REG_R2, &sa);
+        uc_reg_read(uc, UC_ARM_REG_R3, &da);
+        glBlendFuncSeparate(sr, dr, sa, da);
+        return;
+    }
+    if (name == "glBlendEquation") {
+        uint32_t m = 0;
+        uc_reg_read(uc, UC_ARM_REG_R0, &m);
+        glBlendEquation(m);
+        return;
+    }
+    if (name == "glBlendEquationSeparate") {
+        uint32_t mr = 0, ma = 0;
+        uc_reg_read(uc, UC_ARM_REG_R0, &mr);
+        uc_reg_read(uc, UC_ARM_REG_R1, &ma);
+        glBlendEquationSeparate(mr, ma);
+        return;
+    }
+    if (name == "glDepthFunc" || name == "glCullFace" || name == "glFrontFace" || name == "glActiveTexture") {
+        uint32_t v = 0;
+        uc_reg_read(uc, UC_ARM_REG_R0, &v);
+        if (name == "glDepthFunc") glDepthFunc(v);
+        else if (name == "glCullFace") glCullFace(v);
+        else if (name == "glFrontFace") glFrontFace(v);
+        else glActiveTexture(v);
+        return;
+    }
+    if (name == "glDepthMask") {
+        uint32_t flag = 0;
+        uc_reg_read(uc, UC_ARM_REG_R0, &flag);
+        glDepthMask(static_cast<GLboolean>(flag));
+        return;
+    }
+    if (name == "glColorMask") {
+        uint32_t r = 0, g = 0, b = 0, a = 0;
+        uc_reg_read(uc, UC_ARM_REG_R0, &r);
+        uc_reg_read(uc, UC_ARM_REG_R1, &g);
+        uc_reg_read(uc, UC_ARM_REG_R2, &b);
+        uc_reg_read(uc, UC_ARM_REG_R3, &a);
+        glColorMask(static_cast<GLboolean>(r), static_cast<GLboolean>(g), static_cast<GLboolean>(b), static_cast<GLboolean>(a));
+        return;
+    }
+    if (name == "glBindTexture" || name == "glBindBuffer" || name == "glBindFramebuffer" || name == "glBindFramebufferOES" ||
+        name == "glBindRenderbuffer" || name == "glBindRenderbufferOES") {
+        uint32_t target = 0, id = 0;
+        uc_reg_read(uc, UC_ARM_REG_R0, &target);
+        uc_reg_read(uc, UC_ARM_REG_R1, &id);
+        if (name == "glBindTexture") glBindTexture(target, id);
+        else if (name == "glBindBuffer") glBindBuffer(target, id);
+        else if (name.rfind("glBindFramebuffer", 0) == 0) glBindFramebuffer(target, id);
+        else glBindRenderbuffer(target, id);
+        return;
+    }
+    if (name == "glGenTextures" || name == "glDeleteTextures" || name == "glGenBuffers" || name == "glDeleteBuffers" ||
+        name == "glGenFramebuffers" || name == "glGenFramebuffersOES" || name == "glDeleteFramebuffers" || name == "glDeleteFramebuffersOES" ||
+        name == "glGenRenderbuffers" || name == "glGenRenderbuffersOES" || name == "glDeleteRenderbuffers" || name == "glDeleteRenderbuffersOES") {
+        uint32_t n = 0, idsPtr = 0;
+        uc_reg_read(uc, UC_ARM_REG_R0, &n);
+        uc_reg_read(uc, UC_ARM_REG_R1, &idsPtr);
+        if (n > 0 && n <= 4096 && idsPtr != 0) {
+            std::vector<GLuint> ids(n, 0);
+            if (name.find("Delete") != std::string::npos) {
+                uc_mem_read(uc, idsPtr, ids.data(), n * sizeof(GLuint));
+                if (name == "glDeleteTextures") glDeleteTextures(n, ids.data());
+                else if (name == "glDeleteBuffers") glDeleteBuffers(n, ids.data());
+                else if (name.rfind("glDeleteFramebuffers", 0) == 0) glDeleteFramebuffers(n, ids.data());
+                else glDeleteRenderbuffers(n, ids.data());
+            } else {
+                if (name == "glGenTextures") glGenTextures(n, ids.data());
+                else if (name == "glGenBuffers") glGenBuffers(n, ids.data());
+                else if (name.rfind("glGenFramebuffers", 0) == 0) glGenFramebuffers(n, ids.data());
+                else glGenRenderbuffers(n, ids.data());
+                uc_mem_write(uc, idsPtr, ids.data(), n * sizeof(GLuint));
+            }
         }
+        return;
+    }
+    if (name == "glTexParameteri" || name == "glTexParameterf" || name == "glPixelStorei") {
+        uint32_t r0 = 0, r1 = 0, r2 = 0;
+        uc_reg_read(uc, UC_ARM_REG_R0, &r0);
+        uc_reg_read(uc, UC_ARM_REG_R1, &r1);
+        uc_reg_read(uc, UC_ARM_REG_R2, &r2);
+        if (name == "glPixelStorei") {
+            glPixelStorei(r0, static_cast<GLint>(r1));
+        } else if (name == "glTexParameteri") {
+            glTexParameteri(r0, r1, static_cast<GLint>(r2));
+        } else {
+            float param = 0.0f;
+            std::memcpy(&param, &r2, 4);
+            glTexParameterf(r0, r1, param);
+        }
+        return;
+    }
+    if (name == "glTexImage2D") {
+        uint32_t target = 0, level = 0, internalFmt = 0, width = 0;
+        uc_reg_read(uc, UC_ARM_REG_R0, &target);
+        uc_reg_read(uc, UC_ARM_REG_R1, &level);
+        uc_reg_read(uc, UC_ARM_REG_R2, &internalFmt);
+        uc_reg_read(uc, UC_ARM_REG_R3, &width);
+        uint32_t sp = 0, height = 0, border = 0, fmt = 0, type = 0, pixelsPtr = 0;
+        uc_reg_read(uc, UC_ARM_REG_SP, &sp);
+        uc_mem_read(uc, sp + 0, &height, 4);
+        uc_mem_read(uc, sp + 4, &border, 4);
+        uc_mem_read(uc, sp + 8, &fmt, 4);
+        uc_mem_read(uc, sp + 12, &type, 4);
+        uc_mem_read(uc, sp + 16, &pixelsPtr, 4);
 
+        std::vector<uint8_t> pixels;
+        const void* hostPixels = nullptr;
+        if (pixelsPtr != 0 && width > 0 && height > 0 && width <= 4096 && height <= 4096) {
+            size_t bpp = (type == GL_UNSIGNED_SHORT_5_6_5 || type == GL_UNSIGNED_SHORT_4_4_4_4 || type == GL_UNSIGNED_SHORT_5_5_5_1) ? 2 :
+                         (fmt == GL_RGB ? 3 : (fmt == GL_ALPHA || fmt == GL_LUMINANCE ? 1 : 4));
+            size_t totalBytes = static_cast<size_t>(width) * static_cast<size_t>(height) * bpp;
+            pixels.resize(totalBytes);
+            if (uc_mem_read(uc, pixelsPtr, pixels.data(), totalBytes) == UC_ERR_OK) {
+                hostPixels = pixels.data();
+            }
+        }
+        glTexImage2D(target, static_cast<GLint>(level), static_cast<GLint>(internalFmt),
+                     static_cast<GLsizei>(width), static_cast<GLsizei>(height),
+                     static_cast<GLint>(border), fmt, type, hostPixels);
+        return;
+    }
+    if (name == "glTexSubImage2D") {
+        uint32_t target = 0, level = 0, xoff = 0, yoff = 0;
+        uc_reg_read(uc, UC_ARM_REG_R0, &target);
+        uc_reg_read(uc, UC_ARM_REG_R1, &level);
+        uc_reg_read(uc, UC_ARM_REG_R2, &xoff);
+        uc_reg_read(uc, UC_ARM_REG_R3, &yoff);
+        uint32_t sp = 0, width = 0, height = 0, fmt = 0, type = 0, pixelsPtr = 0;
+        uc_reg_read(uc, UC_ARM_REG_SP, &sp);
+        uc_mem_read(uc, sp + 0, &width, 4);
+        uc_mem_read(uc, sp + 4, &height, 4);
+        uc_mem_read(uc, sp + 8, &fmt, 4);
+        uc_mem_read(uc, sp + 12, &type, 4);
+        uc_mem_read(uc, sp + 16, &pixelsPtr, 4);
+
+        std::vector<uint8_t> pixels;
+        if (pixelsPtr != 0 && width > 0 && height > 0 && width <= 4096 && height <= 4096) {
+            size_t bpp = (type == GL_UNSIGNED_SHORT_5_6_5 || type == GL_UNSIGNED_SHORT_4_4_4_4 || type == GL_UNSIGNED_SHORT_5_5_5_1) ? 2 :
+                         (fmt == GL_RGB ? 3 : (fmt == GL_ALPHA || fmt == GL_LUMINANCE ? 1 : 4));
+            size_t totalBytes = static_cast<size_t>(width) * static_cast<size_t>(height) * bpp;
+            pixels.resize(totalBytes);
+            if (uc_mem_read(uc, pixelsPtr, pixels.data(), totalBytes) == UC_ERR_OK) {
+                glTexSubImage2D(target, static_cast<GLint>(level), static_cast<GLint>(xoff), static_cast<GLint>(yoff),
+                                static_cast<GLsizei>(width), static_cast<GLsizei>(height), fmt, type, pixels.data());
+            }
+        }
+        return;
+    }
+    if (name == "glCompressedTexImage2D") {
+        uint32_t target = 0, level = 0, internalFmt = 0, width = 0;
+        uc_reg_read(uc, UC_ARM_REG_R0, &target);
+        uc_reg_read(uc, UC_ARM_REG_R1, &level);
+        uc_reg_read(uc, UC_ARM_REG_R2, &internalFmt);
+        uc_reg_read(uc, UC_ARM_REG_R3, &width);
+        uint32_t sp = 0, height = 0, border = 0, imgSize = 0, dataPtr = 0;
+        uc_reg_read(uc, UC_ARM_REG_SP, &sp);
+        uc_mem_read(uc, sp + 0, &height, 4);
+        uc_mem_read(uc, sp + 4, &border, 4);
+        uc_mem_read(uc, sp + 8, &imgSize, 4);
+        uc_mem_read(uc, sp + 12, &dataPtr, 4);
+        if (dataPtr != 0 && imgSize > 0 && imgSize < 0x04000000U) {
+            std::vector<uint8_t> data(imgSize);
+            if (uc_mem_read(uc, dataPtr, data.data(), imgSize) == UC_ERR_OK) {
+                glCompressedTexImage2D(target, static_cast<GLint>(level), internalFmt,
+                                       static_cast<GLsizei>(width), static_cast<GLsizei>(height),
+                                       static_cast<GLint>(border), static_cast<GLsizei>(imgSize), data.data());
+            }
+        }
+        return;
+    }
+    if (name == "glGenerateMipmap") {
+        uint32_t target = 0;
+        uc_reg_read(uc, UC_ARM_REG_R0, &target);
+        glGenerateMipmap(target);
+        return;
+    }
+    if (name == "glBufferData") {
+        uint32_t target = 0, size = 0, dataPtr = 0, usage = 0;
+        uc_reg_read(uc, UC_ARM_REG_R0, &target);
+        uc_reg_read(uc, UC_ARM_REG_R1, &size);
+        uc_reg_read(uc, UC_ARM_REG_R2, &dataPtr);
+        uc_reg_read(uc, UC_ARM_REG_R3, &usage);
+        if (size > 0 && size < 0x04000000U) {
+            if (dataPtr != 0) {
+                std::vector<uint8_t> buf(size);
+                uc_mem_read(uc, dataPtr, buf.data(), size);
+                glBufferData(target, size, buf.data(), usage);
+            } else {
+                glBufferData(target, size, nullptr, usage);
+            }
+        }
+        return;
+    }
+    if (name == "glBufferSubData") {
+        uint32_t target = 0, offset = 0, size = 0, dataPtr = 0;
+        uc_reg_read(uc, UC_ARM_REG_R0, &target);
+        uc_reg_read(uc, UC_ARM_REG_R1, &offset);
+        uc_reg_read(uc, UC_ARM_REG_R2, &size);
+        uc_reg_read(uc, UC_ARM_REG_R3, &dataPtr);
+        if (dataPtr != 0 && size > 0 && size < 0x04000000U) {
+            std::vector<uint8_t> buf(size);
+            uc_mem_read(uc, dataPtr, buf.data(), size);
+            glBufferSubData(target, offset, size, buf.data());
+        }
+        return;
+    }
+    if (name == "glCreateShader") {
+        uint32_t type = 0;
+        uc_reg_read(uc, UC_ARM_REG_R0, &type);
+        uint32_t s = glCreateShader(type);
+        uc_reg_write(uc, UC_ARM_REG_R0, &s);
+        return;
+    }
+    if (name == "glShaderSource") {
+        uint32_t shader = 0, count = 0, stringsPtr = 0, lengthsPtr = 0;
+        uc_reg_read(uc, UC_ARM_REG_R0, &shader);
+        uc_reg_read(uc, UC_ARM_REG_R1, &count);
+        uc_reg_read(uc, UC_ARM_REG_R2, &stringsPtr);
+        uc_reg_read(uc, UC_ARM_REG_R3, &lengthsPtr);
+        if (count > 0 && count <= 64 && stringsPtr != 0) {
+            std::string combined;
+            for (uint32_t i = 0; i < count; ++i) {
+                uint32_t strAddr = 0;
+                uc_mem_read(uc, stringsPtr + i * 4, &strAddr, 4);
+                int32_t len = -1;
+                if (lengthsPtr != 0) {
+                    uc_mem_read(uc, lengthsPtr + i * 4, &len, 4);
+                }
+                if (strAddr != 0) {
+                    if (len > 0 && len < 65536) {
+                        std::vector<char> part(len);
+                        uc_mem_read(uc, strAddr, part.data(), len);
+                        combined.append(part.data(), len);
+                    } else {
+                        combined += readGuestCString(uc, strAddr, 65536);
+                    }
+                }
+            }
+            const char* src = combined.c_str();
+            glShaderSource(shader, 1, &src, nullptr);
+        }
+        return;
+    }
+    if (name == "glCompileShader" || name == "glDeleteShader" || name == "glLinkProgram" || name == "glUseProgram" || name == "glDeleteProgram") {
+        uint32_t id = 0;
+        uc_reg_read(uc, UC_ARM_REG_R0, &id);
+        if (name == "glCompileShader") glCompileShader(id);
+        else if (name == "glDeleteShader") glDeleteShader(id);
+        else if (name == "glLinkProgram") glLinkProgram(id);
+        else if (name == "glUseProgram") glUseProgram(id);
+        else glDeleteProgram(id);
+        return;
+    }
+    if (name == "glGetShaderiv" || name == "glGetProgramiv") {
+        uint32_t id = 0, pname = 0, paramsPtr = 0;
+        uc_reg_read(uc, UC_ARM_REG_R0, &id);
+        uc_reg_read(uc, UC_ARM_REG_R1, &pname);
+        uc_reg_read(uc, UC_ARM_REG_R2, &paramsPtr);
+        GLint val = 1;
+        if (name == "glGetShaderiv") glGetShaderiv(id, pname, &val);
+        else glGetProgramiv(id, pname, &val);
+        if (paramsPtr != 0) {
+            uc_mem_write(uc, paramsPtr, &val, 4);
+        }
+        return;
+    }
+    if (name == "glGetShaderInfoLog" || name == "glGetProgramInfoLog") {
+        uint32_t id = 0, maxLen = 0, lenPtr = 0, logPtr = 0;
+        uc_reg_read(uc, UC_ARM_REG_R0, &id);
+        uc_reg_read(uc, UC_ARM_REG_R1, &maxLen);
+        uc_reg_read(uc, UC_ARM_REG_R2, &lenPtr);
+        uc_reg_read(uc, UC_ARM_REG_R3, &logPtr);
+        if (lenPtr != 0) {
+            uint32_t z = 0;
+            uc_mem_write(uc, lenPtr, &z, 4);
+        }
+        if (logPtr != 0 && maxLen > 0) {
+            char z = 0;
+            uc_mem_write(uc, logPtr, &z, 1);
+        }
+        return;
+    }
+    if (name == "glCreateProgram") {
+        uint32_t p = glCreateProgram();
+        uc_reg_write(uc, UC_ARM_REG_R0, &p);
+        return;
+    }
+    if (name == "glAttachShader") {
+        uint32_t prog = 0, sh = 0;
+        uc_reg_read(uc, UC_ARM_REG_R0, &prog);
+        uc_reg_read(uc, UC_ARM_REG_R1, &sh);
+        glAttachShader(prog, sh);
+        return;
+    }
+    if (name == "glBindAttribLocation") {
+        uint32_t prog = 0, idx = 0, namePtr = 0;
+        uc_reg_read(uc, UC_ARM_REG_R0, &prog);
+        uc_reg_read(uc, UC_ARM_REG_R1, &idx);
+        uc_reg_read(uc, UC_ARM_REG_R2, &namePtr);
+        std::string attr = readGuestCString(uc, namePtr, 128);
+        glBindAttribLocation(prog, idx, attr.c_str());
+        return;
+    }
+    if (name == "glGetUniformLocation" || name == "glGetAttribLocation") {
+        uint32_t prog = 0, namePtr = 0;
+        uc_reg_read(uc, UC_ARM_REG_R0, &prog);
+        uc_reg_read(uc, UC_ARM_REG_R1, &namePtr);
+        std::string sym = readGuestCString(uc, namePtr, 128);
+        GLint loc = (name == "glGetUniformLocation") ? glGetUniformLocation(prog, sym.c_str())
+                                                     : glGetAttribLocation(prog, sym.c_str());
+        uint32_t ret = static_cast<uint32_t>(loc);
+        uc_reg_write(uc, UC_ARM_REG_R0, &ret);
+        return;
+    }
+    if (name == "glUniform1i") {
+        uint32_t loc = 0, v0 = 0;
+        uc_reg_read(uc, UC_ARM_REG_R0, &loc);
+        uc_reg_read(uc, UC_ARM_REG_R1, &v0);
+        glUniform1i(static_cast<GLint>(loc), static_cast<GLint>(v0));
+        return;
+    }
+    if (name == "glUniform1f") {
+        uint32_t loc = 0, r1 = 0;
+        uc_reg_read(uc, UC_ARM_REG_R0, &loc);
+        uc_reg_read(uc, UC_ARM_REG_R1, &r1);
+        float v0 = 0.0f;
+        std::memcpy(&v0, &r1, 4);
+        glUniform1f(static_cast<GLint>(loc), v0);
+        return;
+    }
+    if (name == "glUniform2f" || name == "glUniform3f" || name == "glUniform4f") {
+        uint32_t loc = 0, r1 = 0, r2 = 0, r3 = 0, r4 = 0, sp = 0;
+        uc_reg_read(uc, UC_ARM_REG_R0, &loc);
+        uc_reg_read(uc, UC_ARM_REG_R1, &r1);
+        uc_reg_read(uc, UC_ARM_REG_R2, &r2);
+        uc_reg_read(uc, UC_ARM_REG_R3, &r3);
+        uc_reg_read(uc, UC_ARM_REG_SP, &sp);
+        uc_mem_read(uc, sp, &r4, 4);
+        float f0 = 0, f1 = 0, f2 = 0, f3 = 0;
+        std::memcpy(&f0, &r1, 4);
+        std::memcpy(&f1, &r2, 4);
+        std::memcpy(&f2, &r3, 4);
+        std::memcpy(&f3, &r4, 4);
+        if (name == "glUniform2f") glUniform2f(static_cast<GLint>(loc), f0, f1);
+        else if (name == "glUniform3f") glUniform3f(static_cast<GLint>(loc), f0, f1, f2);
+        else glUniform4f(static_cast<GLint>(loc), f0, f1, f2, f3);
+        return;
+    }
+    if (name == "glUniform1fv" || name == "glUniform2fv" || name == "glUniform3fv" || name == "glUniform4fv" ||
+        name == "glUniform1iv" || name == "glUniform2iv" || name == "glUniform3iv" || name == "glUniform4iv") {
+        uint32_t loc = 0, count = 0, ptr = 0;
+        uc_reg_read(uc, UC_ARM_REG_R0, &loc);
+        uc_reg_read(uc, UC_ARM_REG_R1, &count);
+        uc_reg_read(uc, UC_ARM_REG_R2, &ptr);
+        int comp = (name[9] - '0');
+        if (ptr != 0 && count > 0 && count <= 1024 && comp >= 1 && comp <= 4) {
+            std::vector<uint32_t> vals(count * comp);
+            uc_mem_read(uc, ptr, vals.data(), vals.size() * 4);
+            if (name[10] == 'f') {
+                const auto* fp = reinterpret_cast<const GLfloat*>(vals.data());
+                if (comp == 1) glUniform1fv(static_cast<GLint>(loc), count, fp);
+                else if (comp == 2) glUniform2fv(static_cast<GLint>(loc), count, fp);
+                else if (comp == 3) glUniform3fv(static_cast<GLint>(loc), count, fp);
+                else glUniform4fv(static_cast<GLint>(loc), count, fp);
+            } else {
+                const auto* ip = reinterpret_cast<const GLint*>(vals.data());
+                if (comp == 1) glUniform1iv(static_cast<GLint>(loc), count, ip);
+                else if (comp == 2) glUniform2iv(static_cast<GLint>(loc), count, ip);
+                else if (comp == 3) glUniform3iv(static_cast<GLint>(loc), count, ip);
+                else glUniform4iv(static_cast<GLint>(loc), count, ip);
+            }
+        }
+        return;
+    }
+    if (name == "glUniformMatrix2fv" || name == "glUniformMatrix3fv" || name == "glUniformMatrix4fv") {
+        uint32_t loc = 0, count = 0, transpose = 0, ptr = 0;
+        uc_reg_read(uc, UC_ARM_REG_R0, &loc);
+        uc_reg_read(uc, UC_ARM_REG_R1, &count);
+        uc_reg_read(uc, UC_ARM_REG_R2, &transpose);
+        uc_reg_read(uc, UC_ARM_REG_R3, &ptr);
+        int dim = (name[15] - '0');
+        int elems = dim * dim;
+        if (ptr != 0 && count > 0 && count <= 512) {
+            std::vector<GLfloat> mat(count * elems);
+            uc_mem_read(uc, ptr, mat.data(), mat.size() * sizeof(GLfloat));
+            if (dim == 2) glUniformMatrix2fv(static_cast<GLint>(loc), count, static_cast<GLboolean>(transpose), mat.data());
+            else if (dim == 3) glUniformMatrix3fv(static_cast<GLint>(loc), count, static_cast<GLboolean>(transpose), mat.data());
+            else glUniformMatrix4fv(static_cast<GLint>(loc), count, static_cast<GLboolean>(transpose), mat.data());
+        }
+        return;
+    }
+    if (name == "glEnableVertexAttribArray" || name == "glDisableVertexAttribArray") {
+        uint32_t idx = 0;
+        uc_reg_read(uc, UC_ARM_REG_R0, &idx);
+        if (name == "glEnableVertexAttribArray") glEnableVertexAttribArray(idx);
+        else glDisableVertexAttribArray(idx);
+        return;
+    }
+    if (name == "glVertexAttribPointer") {
+        uint32_t idx = 0, size = 0, type = 0, norm = 0, stride = 0, ptr = 0, sp = 0;
+        uc_reg_read(uc, UC_ARM_REG_R0, &idx);
+        uc_reg_read(uc, UC_ARM_REG_R1, &size);
+        uc_reg_read(uc, UC_ARM_REG_R2, &type);
+        uc_reg_read(uc, UC_ARM_REG_R3, &norm);
+        uc_reg_read(uc, UC_ARM_REG_SP, &sp);
+        uc_mem_read(uc, sp + 0, &stride, 4);
+        uc_mem_read(uc, sp + 4, &ptr, 4);
+
+        GLint boundVbo = 0;
+        glGetIntegerv(GL_ARRAY_BUFFER_BINDING, &boundVbo);
+        if (boundVbo != 0) {
+            glVertexAttribPointer(idx, static_cast<GLint>(size), type, static_cast<GLboolean>(norm),
+                                  static_cast<GLsizei>(stride), reinterpret_cast<const void*>(static_cast<uintptr_t>(ptr)));
+        } else if (ptr != 0 && idx < 16) {
+            static std::vector<uint8_t> sClientAttribBuffers[16];
+            sClientAttribBuffers[idx].resize(65536);
+            uc_mem_read(uc, ptr, sClientAttribBuffers[idx].data(), 65536);
+            glVertexAttribPointer(idx, static_cast<GLint>(size), type, static_cast<GLboolean>(norm),
+                                  static_cast<GLsizei>(stride), sClientAttribBuffers[idx].data());
+        }
+        return;
+    }
+    if (name == "glDrawArrays") {
+        uint32_t mode = 0, first = 0, count = 0;
+        uc_reg_read(uc, UC_ARM_REG_R0, &mode);
+        uc_reg_read(uc, UC_ARM_REG_R1, &first);
+        uc_reg_read(uc, UC_ARM_REG_R2, &count);
+        glDrawArrays(mode, static_cast<GLint>(first), static_cast<GLsizei>(count));
+        return;
+    }
+    if (name == "glDrawElements") {
+        uint32_t mode = 0, count = 0, type = 0, indicesPtr = 0;
+        uc_reg_read(uc, UC_ARM_REG_R0, &mode);
+        uc_reg_read(uc, UC_ARM_REG_R1, &count);
+        uc_reg_read(uc, UC_ARM_REG_R2, &type);
+        uc_reg_read(uc, UC_ARM_REG_R3, &indicesPtr);
+
+        GLint boundEbo = 0;
+        glGetIntegerv(GL_ELEMENT_ARRAY_BUFFER_BINDING, &boundEbo);
+        if (boundEbo != 0) {
+            glDrawElements(mode, static_cast<GLsizei>(count), type, reinterpret_cast<const void*>(static_cast<uintptr_t>(indicesPtr)));
+        } else if (indicesPtr != 0 && count > 0 && count <= 65536) {
+            size_t idxSize = (type == GL_UNSIGNED_SHORT) ? 2 : ((type == GL_UNSIGNED_INT) ? 4 : 1);
+            std::vector<uint8_t> idxBuf(count * idxSize);
+            uc_mem_read(uc, indicesPtr, idxBuf.data(), idxBuf.size());
+            glDrawElements(mode, static_cast<GLsizei>(count), type, idxBuf.data());
+        }
+        return;
+    }
+    if (name == "glRenderbufferStorage" || name == "glRenderbufferStorageOES") {
+        uint32_t target = 0, fmt = 0, w = 0, h = 0;
+        uc_reg_read(uc, UC_ARM_REG_R0, &target);
+        uc_reg_read(uc, UC_ARM_REG_R1, &fmt);
+        uc_reg_read(uc, UC_ARM_REG_R2, &w);
+        uc_reg_read(uc, UC_ARM_REG_R3, &h);
+        glRenderbufferStorage(target, fmt, static_cast<GLsizei>(w), static_cast<GLsizei>(h));
+        return;
+    }
+    if (name == "glFramebufferRenderbuffer" || name == "glFramebufferRenderbufferOES") {
+        uint32_t target = 0, att = 0, rtarget = 0, rb = 0;
+        uc_reg_read(uc, UC_ARM_REG_R0, &target);
+        uc_reg_read(uc, UC_ARM_REG_R1, &att);
+        uc_reg_read(uc, UC_ARM_REG_R2, &rtarget);
+        uc_reg_read(uc, UC_ARM_REG_R3, &rb);
+        glFramebufferRenderbuffer(target, att, rtarget, rb);
+        return;
+    }
+    if (name == "glFramebufferTexture2D" || name == "glFramebufferTexture2DOES") {
+        uint32_t target = 0, att = 0, textarget = 0, tex = 0, level = 0, sp = 0;
+        uc_reg_read(uc, UC_ARM_REG_R0, &target);
+        uc_reg_read(uc, UC_ARM_REG_R1, &att);
+        uc_reg_read(uc, UC_ARM_REG_R2, &textarget);
+        uc_reg_read(uc, UC_ARM_REG_R3, &tex);
+        uc_reg_read(uc, UC_ARM_REG_SP, &sp);
+        uc_mem_read(uc, sp, &level, 4);
+        glFramebufferTexture2D(target, att, textarget, tex, static_cast<GLint>(level));
+        return;
+    }
+    if (name == "glCheckFramebufferStatus" || name == "glCheckFramebufferStatusOES") {
+        uint32_t target = 0;
+        uc_reg_read(uc, UC_ARM_REG_R0, &target);
+        uint32_t st = glCheckFramebufferStatus(target);
+        if (st == 0) st = GL_FRAMEBUFFER_COMPLETE;
+        uc_reg_write(uc, UC_ARM_REG_R0, &st);
+        return;
+    }
+    if (name == "glFlush" || name == "glFinish") {
+        glFlush();
+        return;
+    }
+    if (name == "glGetError") {
+        uint32_t err = 0; // GL_NO_ERROR
+        uc_reg_write(uc, UC_ARM_REG_R0, &err);
+        return;
+    }
+    if (name == "glGetIntegerv" || name == "glGetFloatv" || name == "glGetBooleanv") {
+        uint32_t pname = 0, paramsPtr = 0;
+        uc_reg_read(uc, UC_ARM_REG_R0, &pname);
+        uc_reg_read(uc, UC_ARM_REG_R1, &paramsPtr);
+        if (paramsPtr != 0) {
+            if (name == "glGetIntegerv") {
+                GLint vals[4] = {4096, 4096, 1920, 1080};
+                glGetIntegerv(pname, vals);
+                uc_mem_write(uc, paramsPtr, vals, 4);
+            } else if (name == "glGetFloatv") {
+                GLfloat vals[4] = {1.0f, 1.0f, 1.0f, 1.0f};
+                glGetFloatv(pname, vals);
+                uc_mem_write(uc, paramsPtr, vals, 4);
+            } else {
+                GLboolean b = GL_TRUE;
+                glGetBooleanv(pname, &b);
+                uc_mem_write(uc, paramsPtr, &b, 1);
+            }
+        }
+        return;
+    }
+    if (name == "glGetString") {
+        uint32_t glEnum = 0;
+        uc_reg_read(uc, UC_ARM_REG_R0, &glEnum);
+        std::string strVal = "Emux32 Hardware GLES 2.0";
+        if (glEnum == GL_VENDOR) strVal = "ARM / Qualcomm";
+        else if (glEnum == GL_RENDERER) strVal = "Adreno / Mali Hardware Accelerated";
+        else if (glEnum == GL_VERSION) strVal = "OpenGL ES 2.0 Emux32";
+        else if (glEnum == GL_SHADING_LANGUAGE_VERSION) strVal = "OpenGL ES GLSL ES 1.00";
+        else if (glEnum == GL_EXTENSIONS) strVal = "GL_OES_compressed_ETC1_RGB8_texture GL_OES_depth24 GL_OES_packed_depth_stencil GL_OES_rgb8_rgba8 GL_OES_vertex_half_float GL_EXT_texture_format_BGRA8888 GL_OES_framebuffer_object";
+        uint32_t strGuestAddr = createGuestString(uc, strVal);
+        uc_reg_write(uc, UC_ARM_REG_R0, &strGuestAddr);
+        return;
+    }
+
+    // 12. EGL Guest Calls (Coordinate col Worker Thread EGL in DbtEngine)
+    if (name == "eglSwapBuffers") {
+        EGLDisplay dpy = eglGetCurrentDisplay();
+        EGLSurface surf = eglGetCurrentSurface(EGL_DRAW);
+        if (dpy != EGL_NO_DISPLAY && surf != EGL_NO_SURFACE) {
+            eglSwapBuffers(dpy, surf);
+        }
+        uint32_t one = 1;
+        uc_reg_write(uc, UC_ARM_REG_R0, &one);
+        return;
+    }
+    if (name == "eglGetDisplay" || name == "eglGetCurrentDisplay" || name == "eglGetCurrentSurface" ||
+        name == "eglGetCurrentContext" || name == "eglCreateWindowSurface" || name == "eglCreateContext" ||
+        name == "eglInitialize" || name == "eglMakeCurrent" || name == "eglChooseConfig") {
         if (name == "eglInitialize") {
             uint32_t majPtr = 0, minPtr = 0;
             uc_reg_read(uc, UC_ARM_REG_R1, &majPtr);
             uc_reg_read(uc, UC_ARM_REG_R2, &minPtr);
-            if (majPtr) { uint32_t maj = 1; uc_mem_write(uc, majPtr, &maj, 4); }
-            if (minPtr) { uint32_t min = 4; uc_mem_write(uc, minPtr, &min, 4); }
-            uint32_t ret = 1;
-            uc_reg_write(uc, UC_ARM_REG_R0, &ret);
-            return;
-        }
-
-        if (name == "eglChooseConfig") {
+            uint32_t maj = 1, min = 4;
+            if (majPtr) uc_mem_write(uc, majPtr, &maj, 4);
+            if (minPtr) uc_mem_write(uc, minPtr, &min, 4);
+        } else if (name == "eglChooseConfig") {
             uint32_t configsPtr = 0, numConfigPtr = 0;
             uc_reg_read(uc, UC_ARM_REG_R2, &configsPtr);
             uc_reg_read(uc, UC_ARM_REG_R4, &numConfigPtr);
-            if (configsPtr) { uint32_t cfg = 1; uc_mem_write(uc, configsPtr, &cfg, 4); }
-            if (numConfigPtr) { uint32_t n = 1; uc_mem_write(uc, numConfigPtr, &n, 4); }
-            uint32_t ret = 1;
-            uc_reg_write(uc, UC_ARM_REG_R0, &ret);
-            return;
+            uint32_t sp = 0;
+            uc_reg_read(uc, UC_ARM_REG_SP, &sp);
+            uc_mem_read(uc, sp, &numConfigPtr, 4);
+            uint32_t cfg = 1;
+            if (configsPtr) uc_mem_write(uc, configsPtr, &cfg, 4);
+            if (numConfigPtr) uc_mem_write(uc, numConfigPtr, &cfg, 4);
         }
-
-        if (name == "eglCreateWindowSurface") {
-            EGLSurface surf = GuestRuntimeEnvironment::getInstance().getEglSurface();
-            uint32_t ret = (surf != EGL_NO_SURFACE) ? static_cast<uint32_t>(reinterpret_cast<uintptr_t>(surf)) : 1;
-            uc_reg_write(uc, UC_ARM_REG_R0, &ret);
-            return;
-        }
-
-        if (name == "eglCreateContext") {
-            EGLContext ctx = GuestRuntimeEnvironment::getInstance().getEglContext();
-            uint32_t ret = (ctx != EGL_NO_CONTEXT) ? static_cast<uint32_t>(reinterpret_cast<uintptr_t>(ctx)) : 1;
-            uc_reg_write(uc, UC_ARM_REG_R0, &ret);
-            return;
-        }
-
-        if (name == "eglMakeCurrent") {
-            uint32_t ret = 1; // EGL_TRUE
-            uc_reg_write(uc, UC_ARM_REG_R0, &ret);
-            return;
-        }
-
-        if (name == "eglGetProcAddress") {
-            uint32_t procNameAddr = 0;
-            uc_reg_read(uc, UC_ARM_REG_R0, &procNameAddr);
-            if (procNameAddr != 0) {
-                char procName[128] = {0};
-                uc_mem_read(uc, procNameAddr, procName, sizeof(procName) - 1);
-                uint32_t tramp = registerSymbolTrampoline(procName, uc);
-                LOGI("eglGetProcAddress('%s') -> 0x%08x", procName, tramp);
-                uc_reg_write(uc, UC_ARM_REG_R0, &tramp);
-                return;
-            }
-            uint32_t zero = 0;
-            uc_reg_write(uc, UC_ARM_REG_R0, &zero);
-            return;
-        }
-
-        if (name == "pthread_create") {
-            uint32_t threadPtr = 0, startRoutine = 0, arg = 0;
-            uc_reg_read(uc, UC_ARM_REG_R0, &threadPtr);
-            uc_reg_read(uc, UC_ARM_REG_R2, &startRoutine);
-            uc_reg_read(uc, UC_ARM_REG_R3, &arg);
-            static uint32_t sThreadId = 100;
-            if (threadPtr) {
-                uint32_t tid = sThreadId++;
-                uc_mem_write(uc, threadPtr, &tid, 4);
-            }
-            LOGI("pthread_create gestito: start_routine=0x%08x, arg=0x%08x", startRoutine, arg);
-            uint32_t ret = 0;
-            uc_reg_write(uc, UC_ARM_REG_R0, &ret);
-            return;
-        }
-
-        // Funzioni GLES/EGL grafiche generiche residue (no-op sicure per evitare crash)
-        if (name.rfind("gl", 0) == 0 || name.rfind("egl", 0) == 0) {
-            uint32_t retVal = 1;
-            uc_reg_write(uc, UC_ARM_REG_R0, &retVal);
-            return;
-        }
-
-        // Fallback generico per qualsiasi altro simbolo Bionic / libc
-        LOGI("Trampoline invocato per simbolo: %s (ritorno default 0)", name.c_str());
-        uint32_t retVal = 0;
-        uc_reg_write(uc, UC_ARM_REG_R0, &retVal);
+        uint32_t one = 1;
+        uc_reg_write(uc, UC_ARM_REG_R0, &one);
+        return;
     }
+    if (name == "eglGetConfigAttrib" || name == "eglQuerySurface") {
+        uint32_t attr = 0, valPtr = 0;
+        uc_reg_read(uc, UC_ARM_REG_R2, &attr);
+        uc_reg_read(uc, UC_ARM_REG_R3, &valPtr);
+        if (valPtr != 0) {
+            uint32_t val = (attr == 0x3057) ? 1920U : ((attr == 0x3056) ? 1080U : 8U);
+            uc_mem_write(uc, valPtr, &val, 4);
+        }
+        uint32_t one = 1;
+        uc_reg_write(uc, UC_ARM_REG_R0, &one);
+        return;
+    }
+    if (name == "eglGetError") {
+        uint32_t ok = 0x3000U; // EGL_SUCCESS
+        uc_reg_write(uc, UC_ARM_REG_R0, &ok);
+        return;
+    }
+    if (name == "eglGetProcAddress") {
+        uint32_t procNamePtr = 0;
+        uc_reg_read(uc, UC_ARM_REG_R0, &procNamePtr);
+        std::string procName = readGuestCString(uc, procNamePtr, 128);
+        uint32_t tramp = registerSymbolTrampoline(procName, uc);
+        uc_reg_write(uc, UC_ARM_REG_R0, &tramp);
+        return;
+    }
+
+    // 13. Pthread Create
+    if (name == "pthread_create") {
+        uint32_t tidPtr = 0;
+        uc_reg_read(uc, UC_ARM_REG_R0, &tidPtr);
+        if (tidPtr != 0) {
+            static uint32_t sFakeTid = 0x60001000U;
+            uint32_t tid = sFakeTid++;
+            uc_mem_write(uc, tidPtr, &tid, 4);
+        }
+        uint32_t zero = 0;
+        uc_reg_write(uc, UC_ARM_REG_R0, &zero);
+        return;
+    }
+
+    // Default fallback per stub non critici: ritorna 0
+    uint32_t zero = 0;
+    uc_reg_write(uc, UC_ARM_REG_R0, &zero);
 }
 
 } // namespace emux

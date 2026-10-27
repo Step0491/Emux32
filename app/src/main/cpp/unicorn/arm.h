@@ -69,6 +69,8 @@ typedef enum uc_arm_reg {
     UC_ARM_REG_R13 = UC_ARM_REG_SP,
     UC_ARM_REG_R14 = UC_ARM_REG_LR,
     UC_ARM_REG_R15 = UC_ARM_REG_PC,
+    UC_ARM_REG_C13_C0_2 = 90,
+    UC_ARM_REG_C13_C0_3 = 91,
     UC_ARM_REG_ENDING
 } uc_arm_reg;
 

@@ -77,6 +77,7 @@ fun GamePlayerScreen(
         )
 
         onDispose {
+            NativeEngine.nativeStopEmulation()
             val w = (context as? Activity)?.window
             if (w != null) {
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
@@ -92,6 +93,7 @@ fun GamePlayerScreen(
 
     // Intercetta il tasto Indietro hardware per ritornare al selettore
     BackHandler {
+        NativeEngine.nativeStopEmulation()
         onExitGame()
     }
 
@@ -160,7 +162,10 @@ fun GamePlayerScreen(
                     verticalAlignment = Alignment.CenterVertically
                 ) {
                     IconButton(
-                        onClick = onExitGame,
+                        onClick = {
+                            NativeEngine.nativeStopEmulation()
+                            onExitGame()
+                        },
                         modifier = Modifier.background(Color.Black.copy(alpha = 0.6f), CircleShape)
                     ) {
                         Icon(

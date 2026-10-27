@@ -27,6 +27,7 @@ find_library(log-lib log)
 find_library(android-lib android)
 find_library(egl-lib EGL)
 find_library(gles-lib GLESv2)
+find_library(z-lib z)
 
 target_link_libraries(
     emux_engine
@@ -34,4 +35,5 @@ target_link_libraries(
     ${android-lib}
     ${egl-lib}
     ${gles-lib}
+    ${z-lib}
 )

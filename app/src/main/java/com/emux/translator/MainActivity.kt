@@ -188,6 +188,7 @@ class MainActivity : ComponentActivity() {
                     GamePlayerScreen(
                         game = activeGame!!,
                         onExitGame = {
+                            NativeEngine.nativeStopEmulation()
                             activeGame = null
                             refreshGames()
                         },
@@ -330,6 +331,11 @@ class MainActivity : ComponentActivity() {
             // ==========================================
             EmuxLogger.i("Emux32", "[FASE 2/5] Verifica file OBB associati...")
             val obbList = rom.obbFiles
+            val primaryObbDir = File(filesDir, "obb/$pkg")
+            if (!primaryObbDir.exists()) {
+                primaryObbDir.mkdirs()
+            }
+
             if (obbList.isEmpty()) {
                 EmuxLogger.i("Emux32", "[FASE 2/5] Nessun file OBB richiesto o presente per questo titolo.")
             } else {
@@ -342,7 +348,7 @@ class MainActivity : ComponentActivity() {
                 val targetDirs = listOf(
                     File(Environment.getExternalStorageDirectory(), "Android/obb/$pkg"),
                     File(getExternalFilesDir(null)?.parentFile?.parentFile, "obb/$pkg"),
-                    File(filesDir, "obb/$pkg")
+                    primaryObbDir
                 )
 
                 for (targetDir in targetDirs) {
@@ -386,13 +392,13 @@ class MainActivity : ComponentActivity() {
             // ==========================================
             EmuxLogger.i("Emux32", "[FASE 3/5] Analisi APK ed estrazione librerie native ARM32 (armeabi-v7a / armeabi)...")
             val zip = java.util.zip.ZipFile(apkFile)
-            val entries = zip.entries()
+            val allEntries = zip.entries().toList()
+            val hasArmV7a = allEntries.any { it.name.startsWith("lib/armeabi-v7a/") && it.name.endsWith(".so") }
+            val targetAbiPrefix = if (hasArmV7a) "lib/armeabi-v7a/" else "lib/armeabi/"
             val extractedSos = mutableListOf<File>()
 
-            while (entries.hasMoreElements()) {
-                val entry = entries.nextElement()
-                val isArm32 = (entry.name.startsWith("lib/armeabi-v7a/") || entry.name.startsWith("lib/armeabi/")) && entry.name.endsWith(".so")
-                if (isArm32) {
+            for (entry in allEntries) {
+                if (entry.name.startsWith(targetAbiPrefix) && entry.name.endsWith(".so")) {
                     val outFile = File(cacheDir, File(entry.name).name)
                     if (outFile.exists()) {
                         outFile.delete()
@@ -402,7 +408,7 @@ class MainActivity : ComponentActivity() {
                     }
                     if (outFile.length() > 0) {
                         extractedSos.add(outFile)
-                        EmuxLogger.i("Emux32", "   -> Estratta libreria ARM32: ${outFile.name} (${outFile.length()} byte)")
+                        EmuxLogger.i("Emux32", "   -> Estratta libreria ARM32 ($targetAbiPrefix): ${outFile.name} (${outFile.length()} byte)")
                     }
                 }
             }
@@ -456,17 +462,25 @@ class MainActivity : ComponentActivity() {
                 EmuxLogger.e("Emux32", "[FASE 4/5] Inizializzazione motore nativo fallita!")
                 return@withContext
             }
+            NativeEngine.nativeSetGameContext(
+                pkg,
+                apkFile.absolutePath,
+                primaryObbDir.absolutePath,
+                cacheDir.absolutePath,
+                filesDir.absolutePath
+            )
             NativeEngine.nativeConfigurePerformance(60, enableFhd = true, throttleGuard = true)
             EmuxLogger.i("Emux32", "[FASE 4/5] Motore DBT configurato: 60 FPS Lock, Buffer FHD 1080p, Throttle Guard attivo.")
 
             // ==========================================
             // FASE 5: Caricamento ELF ed Esecuzione Guest
             // ==========================================
-            // Pre-caricamento librerie di supporto condivise (STL, libc++, audio) se presenti nell'APK
+            // Pre-caricamento librerie di supporto condivise (STL, libc++, Mono, audio) se presenti nell'APK
             for (depFile in extractedSos) {
                 if (depFile != mainSo) {
                     val depName = depFile.name.lowercase()
-                    if (depName.contains("stl") || depName.contains("c++") || depName.contains("shared") || depName.contains("fmod")) {
+                    if (depName.contains("stl") || depName.contains("c++") || depName.contains("shared") ||
+                        depName.contains("fmod") || depName.contains("mono") || depName.contains("gdvoucher")) {
                         EmuxLogger.i("Emux32", "[FASE 5/5] Pre-caricamento libreria di supporto: ${depFile.name}")
                         NativeEngine.nativeLoadElfLibrary(depFile.absolutePath)
                     }

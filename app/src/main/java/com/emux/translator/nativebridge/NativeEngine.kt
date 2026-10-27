@@ -17,9 +17,17 @@ object NativeEngine {
     external fun nativeInitEngine(guestRamMb: Long): Boolean
     external fun nativeConfigurePerformance(targetFps: Int, enableFhd: Boolean, throttleGuard: Boolean): Boolean
     external fun nativeSetStoragePath(path: String): Boolean
+    external fun nativeSetGameContext(
+        packageName: String,
+        apkPath: String,
+        obbDir: String,
+        nativeLibDir: String,
+        filesDir: String
+    )
     external fun nativeLoadElfLibrary(libraryPath: String): Boolean
     external fun startEmulationNative(): Boolean
     external fun nativeExecuteEntryPoint(): Boolean
+    external fun nativeStopEmulation()
     external fun nativeSetSurface(surface: Any?)
     external fun nativeSendTouchEvent(action: Int, x: Float, y: Float, pointerId: Int): Boolean
     external fun nativeReleaseEngine()
