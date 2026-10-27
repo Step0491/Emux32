@@ -1,6 +1,7 @@
 #include "linker_hook.h"
 #include "elf_loader.h"
 #include "core/syscall_thunker.h"
+#include "core/audio_thunker.h"
 #include "unicorn/arm.h"
 
 #include <EGL/egl.h>
@@ -671,6 +672,9 @@ bool GuestRuntimeEnvironment::initialize(uc_engine* uc) {
     classHandleMap_[0x1002] = "com/unity3d/player/UnityPlayer";
     classHandleMap_[0x1003] = "android/view/Surface";
     classHandleMap_[0x1050] = "android/view/MotionEvent";
+
+    // Inizializza modulo Audio OpenSL ES simulato per i giochi guest
+    AudioThunker::initialize(uc);
 
     LOGI("GuestRuntimeEnvironment inizializzato: JavaVM32=0x%08x, JNIEnv32=0x%08x (256 slot ABI), TLS=0x%08x, Heap=0x58000000",
          guestJavaVMAddr_, guestJNIEnvAddr_, guestTlsBase_);
@@ -1504,6 +1508,11 @@ void GuestRuntimeEnvironment::handleTrampolineCall(uint32_t trampolineId, uc_eng
         return;
     }
     if (name == "free" || name == "_ZdlPv" || name == "_ZdaPv") {
+        return;
+    }
+
+    // 3b. OpenSL ES Audio Thunking
+    if (AudioThunker::handleAudioCall(name, uc)) {
         return;
     }
 
