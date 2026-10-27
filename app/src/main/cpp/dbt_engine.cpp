@@ -159,9 +159,8 @@ bool DbtEngine::ensureWorkerEgl(bool waitIfNull) {
     if (height <= 0) height = 1080;
 
     glViewport(0, 0, width, height);
-    glClearColor(0.05f, 0.06f, 0.10f, 1.0f);
+    glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
     glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
-    eglSwapBuffers(eglDisplay_, eglSurface_);
 
     LOGI("initEgl [WorkerThread]: Contesto EGL attivo e collegato a ANativeWindow (%dx%d).", width, height);
     GuestRuntimeEnvironment::getInstance().setEglState(eglDisplay_, eglSurface_, eglContext_, &governor_);
@@ -459,7 +458,8 @@ bool DbtEngine::startEmulation() {
         } else if (lower.find("init") != std::string::npos || lower == "create" || lower == "nativecreate") {
             LOGI("Invocazione metodo guest di setup '%s' (0x%08x)...", m.name.c_str(), m.fnPtr);
             if (m.signature.find("(II)") != std::string::npos) {
-                invokeGuestFunction(m.fnPtr, jniEnvPtr, dummyInstance, 1920, 1080, 1000000);
+                // Metodi tipo Cocos2d-x nativeInit(int w, int h)
+                invokeGuestFunction(m.fnPtr, jniEnvPtr, dummyInstance, 1920, 1080, 2000000);
             } else {
                 invokeGuestFunction(m.fnPtr, jniEnvPtr, dummyInstance, 0x1001, 0, 1000000);
             }
@@ -477,9 +477,9 @@ bool DbtEngine::startEmulation() {
             } else {
                 invokeGuestFunction(m.fnPtr, jniEnvPtr, dummyInstance, dummySurface, 0, 1500000);
             }
-        } else if (lower.find("surfacechanged") != std::string::npos || lower.find("resize") != std::string::npos) {
+        } else if (lower.find("surfacechanged") != std::string::npos || lower.find("resize") != std::string::npos || lower.find("onsurfacechanged") != std::string::npos) {
             LOGI("Invocazione resize grafico '%s' (1920x1080)...", m.name.c_str());
-            invokeGuestFunction(m.fnPtr, jniEnvPtr, dummyInstance, 1920, 1080, 1000000);
+            invokeGuestFunction(m.fnPtr, jniEnvPtr, dummyInstance, 1920, 1080, 1500000);
         } else if (lower.find("focuschanged") != std::string::npos) {
             invokeGuestFunction(m.fnPtr, jniEnvPtr, dummyInstance, 1, 0, 500000);
         } else if (lower.find("resume") != std::string::npos) {

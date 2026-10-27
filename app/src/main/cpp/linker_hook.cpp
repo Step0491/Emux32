@@ -2852,11 +2852,7 @@ void GuestRuntimeEnvironment::handleTrampolineCall(uint32_t trampolineId, uc_eng
 
     // 12. EGL Guest Calls (Coordinate col Worker Thread EGL in DbtEngine)
     if (name == "eglSwapBuffers") {
-        EGLDisplay dpy = eglGetCurrentDisplay();
-        EGLSurface surf = eglGetCurrentSurface(EGL_DRAW);
-        if (dpy != EGL_NO_DISPLAY && surf != EGL_NO_SURFACE) {
-            eglSwapBuffers(dpy, surf);
-        }
+        GuestRuntimeEnvironment::getInstance().swapBuffers();
         uint32_t one = 1;
         uc_reg_write(uc, UC_ARM_REG_R0, &one);
         return;
