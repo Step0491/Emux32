@@ -42,33 +42,66 @@ jobs:
           exit 1
         }
 
+    - name: Generate Dynamic Build Name
+      if: success()
+      run: |
+        BUILD_TAG="Emux32_d$(TZ='Europe/Rome' date +'%d-%m_t%H-%M')"
+        echo "BUILD_NAME=${BUILD_TAG}" >> $GITHUB_ENV
+        echo "APK_NAME=${BUILD_TAG}.apk" >> $GITHUB_ENV
+        echo "Generated Build Name: ${BUILD_TAG}"
+
     - name: Prepare Named APK
       if: success()
       run: |
+        cp app/build/outputs/apk/debug/app-debug.apk "${{ env.APK_NAME }}"
         cp app/build/outputs/apk/debug/app-debug.apk Emux32-app-debug.apk
 
     - name: Upload Debug APK Artifact
       if: success()
       uses: actions/upload-artifact@v4
       with:
-        name: Emux32-ARM64-Debug-APK
-        path: Emux32-app-debug.apk
+        name: ${{ env.BUILD_NAME }}
+        path: |
+          ${{ env.APK_NAME }}
+          Emux32-app-debug.apk
         retention-days: 30
 
-    - name: Publish or Update GitHub Release
+    - name: Publish Versioned GitHub Release
+      if: success() && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')
+      uses: softprops/action-gh-release@v2
+      with:
+        tag_name: ${{ env.BUILD_NAME }}
+        name: ${{ env.BUILD_NAME }}
+        body: |
+          ### Release Emux32: ${{ env.BUILD_NAME }}
+          Compilazione automatica eseguita con successo.
+          - **File APK**: `${{ env.APK_NAME }}`
+          - **Commit**: `${{ github.sha }}`
+          - **Architettura Host**: `ARM64-v8a`
+          - **Architettura Guest**: `ARMv7-A` (32-bit DBT)
+          - **Data e Ora (CET/CEST)**: ${{ env.BUILD_NAME }}
+        files: |
+          ${{ env.APK_NAME }}
+          Emux32-app-debug.apk
+        prerelease: false
+        generate_release_notes: false
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: Update Latest Release Pointer
       if: success() && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')
       uses: softprops/action-gh-release@v2
       with:
         tag_name: latest
-        name: Emux32 Latest Build (ARM64)
+        name: Emux32 Latest Build (${{ env.BUILD_NAME }})
         body: |
-          ### Release Automatica Continua
-          Pacchetto APK nativo compilato automaticamente all'ultimo push sul branch `main`.
+          ### Release Automatica Continua (Ultimo Aggiornamento)
+          Ultima build compilata: **${{ env.BUILD_NAME }}**
+          - **File APK Principale**: `${{ env.APK_NAME }}`
           - **Commit**: `${{ github.sha }}`
-          - **Architettura Host**: `ARM64-v8a`
-          - **Architettura Guest**: `ARMv7-A` (32-bit DBT)
-          - **Data Compilazione**: ${{ github.event.head_commit.timestamp }}
-        files: Emux32-app-debug.apk
+        files: |
+          ${{ env.APK_NAME }}
+          Emux32-app-debug.apk
         prerelease: false
         generate_release_notes: false
       env:
