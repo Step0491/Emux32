@@ -38,7 +38,6 @@
 
 namespace emux {
 
-static std::mutex gHandleMutex;
 static std::string sCustomStoragePath = "/sdcard/Emux32";
 static uint32_t sHeapCurrent = 0x58000000;
 
@@ -84,49 +83,6 @@ static inline uint32_t allocGuestHeap(uc_engine* uc, uint32_t size, uint32_t ali
     }
     sHeapCurrent = nextEnd;
     return alignedStart;
-}
-
-JniHandleTable& JniHandleTable::getInstance() {
-    static JniHandleTable instance;
-    return instance;
-}
-
-JniHandleTable::JniHandleTable() = default;
-
-jptr32_t JniHandleTable::registerObject(jobject obj) {
-    if (!obj) return 0;
-    std::lock_guard<std::mutex> lock(gHandleMutex);
-    jptr32_t handle = nextHandle_++;
-    objectMap_[handle] = obj;
-    return handle;
-}
-
-jobject JniHandleTable::getObject(jptr32_t handle) {
-    if (handle == 0) return nullptr;
-    std::lock_guard<std::mutex> lock(gHandleMutex);
-    auto it = objectMap_.find(handle);
-    return (it != objectMap_.end()) ? it->second : nullptr;
-}
-
-void JniHandleTable::unregisterObject(jptr32_t handle) {
-    if (handle == 0) return;
-    std::lock_guard<std::mutex> lock(gHandleMutex);
-    objectMap_.erase(handle);
-}
-
-jptr32_t JniHandleTable::registerMethod(jmethodID method) {
-    if (!method) return 0;
-    std::lock_guard<std::mutex> lock(gHandleMutex);
-    jptr32_t handle = nextHandle_++;
-    methodMap_[handle] = method;
-    return handle;
-}
-
-jmethodID JniHandleTable::getMethod(jptr32_t handle) {
-    if (handle == 0) return nullptr;
-    std::lock_guard<std::mutex> lock(gHandleMutex);
-    auto it = methodMap_.find(handle);
-    return (it != methodMap_.end()) ? it->second : nullptr;
 }
 
 void SyscallDispatcher::setStoragePath(const std::string& path) {
@@ -466,7 +422,14 @@ int32_t SyscallDispatcher::handleSyscall(
             }
             return static_cast<int32_t>(alignedBase);
         }
-        case ARM_NR_munmap:
+        case ARM_NR_munmap: {
+            if (uc && r0 != 0 && r1 != 0) {
+                uint32_t alignedBase = r0 & ~0xFFFU;
+                uint32_t alignedSize = (r1 + 0xFFFU) & ~0xFFFU;
+                uc_mem_unmap(uc, alignedBase, alignedSize);
+            }
+            return 0;
+        }
         case ARM_NR_mprotect:
         case ARM_NR_prctl:
         case 174: // rt_sigaction
@@ -478,7 +441,7 @@ int32_t SyscallDispatcher::handleSyscall(
         case ARM_NR_nanosleep:
         case ARM_NR_futex:
         case 145: // readv
-        case 146: // writev:
+        case 146: // writev
             return SyscallThunker::dispatch(uc, sysno, r0, r1, r2, r3, r4, r5);
         case ARM_NR_sched_yield:
             sched_yield();

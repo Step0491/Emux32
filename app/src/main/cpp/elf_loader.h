@@ -37,7 +37,6 @@ struct ExportedSymbol {
 
 struct LoadedLibrary {
     std::string path;
-    uintptr_t base_address{0};
     size_t total_memory_size{0};
     uint32_t aligned_min_vaddr{0};
     uint32_t aligned_max_vaddr{0};
@@ -54,7 +53,7 @@ struct LoadedLibrary {
     std::vector<uint8_t> raw_binary;
     bool is_pie{false};
 
-    ~LoadedLibrary();
+    ~LoadedLibrary() = default;
 
     // Mappa tutti i segmenti PT_LOAD all'interno dell'istanza Unicorn applicando strict page alignment
     bool mapToUnicorn(uc_engine* uc) const;

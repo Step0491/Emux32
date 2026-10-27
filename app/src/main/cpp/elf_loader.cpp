@@ -20,14 +20,6 @@ namespace emux {
 
 static std::atomic<uint32_t> sNextLoadBias{0x40000000U};
 
-LoadedLibrary::~LoadedLibrary() {
-    if (base_address != 0 && total_memory_size > 0) {
-        munmap(reinterpret_cast<void*>(base_address), total_memory_size);
-        base_address = 0;
-        total_memory_size = 0;
-    }
-}
-
 bool LoadedLibrary::mapToUnicorn(uc_engine* uc) const {
     if (!uc || total_memory_size == 0) {
         LOGE("mapToUnicorn: Parametri non validi");
@@ -201,6 +193,8 @@ bool LoadedLibrary::applyRelocations(uc_engine* uc) const {
         processRelTable(jmpRelVaddr, jmpRelSz);
 
         if (totalRelocsApplied > 0) {
+            const_cast<std::vector<uint8_t>&>(raw_binary).clear();
+            const_cast<std::vector<uint8_t>&>(raw_binary).shrink_to_fit();
             LOGI("applyRelocations (via PT_DYNAMIC) per [%s]: %zu rilocazioni applicate.", path.c_str(), totalRelocsApplied);
             return true;
         }
@@ -256,6 +250,10 @@ bool LoadedLibrary::applyRelocations(uc_engine* uc) const {
             }
         }
     }
+
+    // Libera il buffer binario raw dopo aver completato tutte le rilocazioni per risparmiare RAM host
+    const_cast<std::vector<uint8_t>&>(raw_binary).clear();
+    const_cast<std::vector<uint8_t>&>(raw_binary).shrink_to_fit();
 
     LOGI("Rilocazioni dinamiche applicate per [%s]: %zu simboli rilocati.", path.c_str(), totalRelocsApplied);
     return true;

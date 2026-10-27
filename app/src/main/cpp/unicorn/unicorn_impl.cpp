@@ -1,6 +1,7 @@
 #include "unicorn/unicorn.h"
 #include "unicorn/arm.h"
 #include "core/guest_memory.h"
+#include "core/tb_cache.h"
 
 #include <android/log.h>
 #include <sys/mman.h>
@@ -278,8 +279,9 @@ struct UnicornInstance {
         setVfpDRaw(regIdx, raw);
     }
 
-    // Arena flat 4 GB GuestMemory O(1) (g2h = base + addr) + fallback regioni
+    // Arena flat 4 GB GuestMemory O(1) (g2h = base + addr) + TranslationBlockCache + fallback regioni
     emux::GuestMemory flat_mem;
+    emux::TranslationBlockCache tb_cache;
     std::vector<MemoryRegion> regions;
     int last_region_idx{-1};
     std::mutex mem_mutex;
@@ -297,6 +299,7 @@ struct UnicornInstance {
 
     ~UnicornInstance() {
         std::lock_guard<std::mutex> lock(mem_mutex);
+        tb_cache.clear();
         flat_mem.destroy();
         for (auto& reg : regions) {
             if (reg.owned && reg.host_ptr) {
@@ -364,6 +367,9 @@ struct UnicornInstance {
             uint32_t gaddr = static_cast<uint32_t>(addr);
             if (flat_mem.isMappedRange(gaddr, size)) {
                 std::memcpy(flat_mem.g2h(gaddr), src, size);
+                if (flat_mem.getPageProt(gaddr) & emux::GP_EXEC) {
+                    tb_cache.invalidateRange(gaddr, static_cast<uint32_t>(size));
+                }
                 return UC_ERR_OK;
             }
             return UC_ERR_WRITE_UNMAPPED;
@@ -392,32 +398,57 @@ struct UnicornInstance {
     }
 
     inline uint8_t readU8(uint32_t addr) {
+        if (flat_mem.isReady() && flat_mem.isMapped(addr)) {
+            return *flat_mem.g2h(addr);
+        }
         uint8_t val = 0;
         readMem(addr, &val, 1);
         return val;
     }
 
     inline uint16_t readU16(uint32_t addr) {
+        if (flat_mem.isReady() && ((addr & 0xFFFU) <= 0xFFEU) && flat_mem.isMapped(addr)) {
+            uint16_t val;
+            std::memcpy(&val, flat_mem.g2h(addr), 2);
+            return val;
+        }
         uint16_t val = 0;
         readMem(addr, &val, 2);
         return val;
     }
 
     inline uint32_t readU32(uint32_t addr) {
+        if (flat_mem.isReady() && ((addr & 0xFFFU) <= 0xFFCU) && flat_mem.isMapped(addr)) {
+            uint32_t val;
+            std::memcpy(&val, flat_mem.g2h(addr), 4);
+            return val;
+        }
         uint32_t val = 0;
         readMem(addr, &val, 4);
         return val;
     }
 
     inline void writeU8(uint32_t addr, uint8_t val) {
+        if (flat_mem.isReady() && flat_mem.isMapped(addr)) {
+            *flat_mem.g2h(addr) = val;
+            return;
+        }
         writeMem(addr, &val, 1);
     }
 
     inline void writeU16(uint32_t addr, uint16_t val) {
+        if (flat_mem.isReady() && ((addr & 0xFFFU) <= 0xFFEU) && flat_mem.isMapped(addr)) {
+            std::memcpy(flat_mem.g2h(addr), &val, 2);
+            return;
+        }
         writeMem(addr, &val, 2);
     }
 
     inline void writeU32(uint32_t addr, uint32_t val) {
+        if (flat_mem.isReady() && ((addr & 0xFFFU) <= 0xFFCU) && flat_mem.isMapped(addr)) {
+            std::memcpy(flat_mem.g2h(addr), &val, 4);
+            return;
+        }
         writeMem(addr, &val, 4);
     }
 
@@ -1207,10 +1238,26 @@ uc_err uc_emu_start(uc_engine *uc, uint64_t begin, uint64_t until, uint64_t /* t
         lastValidPc = pc;
         bool isThumb = (inst->cpsr & FLAG_T) != 0;
 
+        // Indicizzazione nella TranslationBlockCache (O(1) fast lookup) per i blocchi di ingresso
+        uint32_t taggedPc = pc | (isThumb ? 1U : 0U);
+        emux::BasicBlock* bb = inst->tb_cache.lookupFast(taggedPc);
+        if (!bb) {
+            bb = inst->tb_cache.findOrInsert(taggedPc, isThumb);
+        }
+        if (bb) {
+            bb->insnCount++;
+        }
+
         if (!isThumb) {
             uint32_t insn = 0;
-            uc_err readErr = inst->readMem(pc, &insn, 4);
-            if (readErr != UC_ERR_OK) {
+            bool fetchOk = false;
+            if (inst->flat_mem.isReady() && ((pc & 0xFFFU) <= 0xFFCU) && inst->flat_mem.isMapped(pc)) {
+                std::memcpy(&insn, inst->flat_mem.g2h(pc), 4);
+                fetchOk = true;
+            } else {
+                fetchOk = (inst->readMem(pc, &insn, 4) == UC_ERR_OK);
+            }
+            if (!fetchOk) {
                 LOGE("uc_emu_start [ARM]: Fault lettura PC=0x%08x (LR=0x%08x)", pc, inst->regs[14]);
                 if (inst->regs[14] >= 0x1000U && inst->regs[14] != 0xDEADBEEFU && nullRecoveries < 32) {
                     nullRecoveries++;
@@ -1219,7 +1266,7 @@ uc_err uc_emu_start(uc_engine *uc, uint64_t begin, uint64_t until, uint64_t /* t
                     continue;
                 }
                 inst->is_running.store(false);
-                return readErr;
+                return UC_ERR_FETCH_UNMAPPED;
             }
 
             uint32_t cond = (insn >> 28) & 0xFU;
@@ -1588,8 +1635,14 @@ uc_err uc_emu_start(uc_engine *uc, uint64_t begin, uint64_t until, uint64_t /* t
         } else {
             // ==================== DECODIFICA & ESECUZIONE THUMB / THUMB-2 ====================
             uint16_t tInsn = 0;
-            uc_err tReadErr = inst->readMem(pc, &tInsn, 2);
-            if (tReadErr != UC_ERR_OK) {
+            bool tFetchOk = false;
+            if (inst->flat_mem.isReady() && ((pc & 0xFFFU) <= 0xFFEU) && inst->flat_mem.isMapped(pc)) {
+                std::memcpy(&tInsn, inst->flat_mem.g2h(pc), 2);
+                tFetchOk = true;
+            } else {
+                tFetchOk = (inst->readMem(pc, &tInsn, 2) == UC_ERR_OK);
+            }
+            if (!tFetchOk) {
                 LOGE("uc_emu_start [Thumb]: Fault lettura PC=0x%08x (LR=0x%08x)", pc, inst->regs[14]);
                 if (inst->regs[14] >= 0x1000U && inst->regs[14] != 0xDEADBEEFU && nullRecoveries < 32) {
                     nullRecoveries++;
@@ -1598,7 +1651,7 @@ uc_err uc_emu_start(uc_engine *uc, uint64_t begin, uint64_t until, uint64_t /* t
                     continue;
                 }
                 inst->is_running.store(false);
-                return tReadErr;
+                return UC_ERR_FETCH_UNMAPPED;
             }
 
             bool isThumb32 = ((tInsn & 0xF800U) == 0xE800U) || ((tInsn & 0xF000U) == 0xF000U);
@@ -1617,8 +1670,7 @@ uc_err uc_emu_start(uc_engine *uc, uint64_t begin, uint64_t until, uint64_t /* t
             }
 
             if (isThumb32) {
-                uint16_t tInsn2 = 0;
-                inst->readMem(pc + 2, &tInsn2, 2);
+                uint16_t tInsn2 = inst->readU16(pc + 2);
                 uint32_t insn32 = (static_cast<uint32_t>(tInsn) << 16) | tInsn2;
 
                 if ((tInsn & 0xFC00U) == 0xEC00U) { // VFP / CP15

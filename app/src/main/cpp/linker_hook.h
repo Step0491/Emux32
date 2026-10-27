@@ -42,24 +42,6 @@ using jint32_t = int32_t;
 using jlong32_t = int64_t;
 using jptr32_t = uint32_t;
 
-class JniHandleTable {
-public:
-    static JniHandleTable& getInstance();
-
-    jptr32_t registerObject(jobject obj);
-    jobject getObject(jptr32_t handle);
-    void unregisterObject(jptr32_t handle);
-
-    jptr32_t registerMethod(jmethodID method);
-    jmethodID getMethod(jptr32_t handle);
-
-private:
-    JniHandleTable();
-    jptr32_t nextHandle_{0x1000};
-    std::unordered_map<jptr32_t, jobject> objectMap_;
-    std::unordered_map<jptr32_t, jmethodID> methodMap_;
-};
-
 // Tabella JNIInvokeInterface32 standard a 8 slot (JavaVM)
 struct JNIInvokeInterface32 {
     jptr32_t slots[8];
