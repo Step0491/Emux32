@@ -9,11 +9,14 @@ namespace emux {
 using guest_addr_t = uint32_t;
 
 enum GuestProt : uint8_t {
-    GP_NONE = 0,
-    GP_R    = 1 << 0,
-    GP_W    = 1 << 1,
-    GP_X    = 1 << 2,
-    GP_RWX  = GP_R | GP_W | GP_X
+    GP_NONE  = 0,
+    GP_R     = 1 << 0,
+    GP_W     = 1 << 1,
+    GP_X     = 1 << 2,
+    GP_READ  = GP_R,
+    GP_WRITE = GP_W,
+    GP_EXEC  = GP_X,
+    GP_RWX   = GP_R | GP_W | GP_X
 };
 
 /**
@@ -73,6 +76,14 @@ public:
             if (pageProt_[p] == GP_NONE) return false;
         }
         return true;
+    }
+
+    inline bool isMapped(guest_addr_t addr) const noexcept {
+        return pageProt_[addr >> kGuestPageShift] != GP_NONE;
+    }
+
+    inline uint8_t getPageProt(guest_addr_t addr) const noexcept {
+        return pageProt_[addr >> kGuestPageShift];
     }
 
     inline bool isReady() const noexcept { return base_ != nullptr; }

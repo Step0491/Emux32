@@ -5,6 +5,7 @@
 #include <time.h>
 #include <unistd.h>
 #include <cerrno>
+#include <algorithm>
 #include <vector>
 #include <linux/futex.h>
 #include <android/log.h>

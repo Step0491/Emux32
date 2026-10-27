@@ -442,7 +442,7 @@ int32_t SyscallDispatcher::handleSyscall(
         case ARM_NR_futex:
         case 145: // readv
         case 146: // writev
-            return SyscallThunker::dispatch(uc, sysno, r0, r1, r2, r3, r4, r5);
+            return SyscallThunker::dispatch(uc, syscallNum, r0, r1, r2, r3, r4, r5);
         case ARM_NR_sched_yield:
             sched_yield();
             return 0;
