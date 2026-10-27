@@ -213,8 +213,6 @@ bool LoadedLibrary::applyRelocations(uc_engine* uc) const {
     const char* dynstr = dynstrShdr ? reinterpret_cast<const char*>(raw_binary.data() + dynstrShdr->sh_offset) : nullptr;
     size_t dynstrSize = dynstrShdr ? dynstrShdr->sh_size : 0;
 
-    size_t totalRelocsApplied = 0;
-
     for (uint16_t s = 0; s < ehdr->e_shnum; ++s) {
         const auto& sh = shdrs[s];
         if (sh.sh_type == SHT_REL) {
