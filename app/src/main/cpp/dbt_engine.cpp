@@ -442,17 +442,21 @@ bool DbtEngine::startEmulation() {
         }
     }
 
-    // 5b. Metodi di init (initJni, init, nativeInit)
+    // 5b. Metodi di init (initJni, init, nativeInit) - Escludiamo tassativamente qualsiasi metodo grafico/surface/recreate
     for (const auto& m : nativeMethods) {
         std::string lower = m.name;
         std::transform(lower.begin(), lower.end(), lower.begin(), ::tolower);
+        if (lower.find("recreate") != std::string::npos || lower.find("surface") != std::string::npos || lower.find("gfx") != std::string::npos) {
+            continue; // Riservato alla fase 5c con la Surface valida
+        }
+
         if (lower == "initjni" || lower == "nativeinitjni") {
             LOGI("Invocazione metodo guest '%s' (Context=0x1001)...", m.name.c_str());
             invokeGuestFunction(m.fnPtr, jniEnvPtr, dummyInstance, 0x1001, 0, 1000000);
         } else if (lower == "init" && m.signature == "(IZ)V") {
             LOGI("Invocazione metodo guest '%s' (0, false)...", m.name.c_str());
             invokeGuestFunction(m.fnPtr, jniEnvPtr, dummyInstance, 0, 0, 1000000);
-        } else if (lower.find("init") != std::string::npos || lower.find("create") != std::string::npos) {
+        } else if (lower.find("init") != std::string::npos || lower == "create" || lower == "nativecreate") {
             LOGI("Invocazione metodo guest di setup '%s' (0x%08x)...", m.name.c_str(), m.fnPtr);
             if (m.signature.find("(II)") != std::string::npos) {
                 invokeGuestFunction(m.fnPtr, jniEnvPtr, dummyInstance, 1920, 1080, 1000000);

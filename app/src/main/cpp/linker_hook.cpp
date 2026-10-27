@@ -469,6 +469,11 @@ int32_t SyscallDispatcher::handleSyscall(
         case ARM_NR_nanosleep:
         case ARM_NR_prctl:
         case ARM_NR_futex:
+        case 174: // rt_sigaction
+        case 175: // rt_sigprocmask
+        case 186: // sigaltstack
+        case 238: // tkill
+        case 268: // tgkill
             return 0;
         case ARM_NR_sched_yield:
             sched_yield();
@@ -645,6 +650,18 @@ bool GuestRuntimeEnvironment::initialize(uc_engine* uc) {
         uc_mem_write(uc, stubAddr, stubInsn, sizeof(stubInsn));
     }
     uc_mem_write(uc, env32.functions, &envVtable, sizeof(envVtable));
+
+    // Inizializza mock ANativeWindow a 0x7D002800 con stub safe MOV R0, #0; BX LR a 0x7D002900
+    uint32_t winStub[2] = { 0xE3A00000U, 0xE12FFF1EU };
+    uint32_t winStubAddr = guestJniBase_ + 0x2900U;
+    uc_mem_write(uc, winStubAddr, winStub, sizeof(winStub));
+
+    uint32_t fakeNativeWindow[32];
+    for (size_t w = 0; w < 32; ++w) fakeNativeWindow[w] = winStubAddr;
+    fakeNativeWindow[1] = 1920; // width
+    fakeNativeWindow[2] = 1080; // height
+    fakeNativeWindow[3] = 1;    // format WINDOW_FORMAT_RGBA_8888
+    uc_mem_write(uc, guestJniBase_ + 0x2800U, fakeNativeWindow, sizeof(fakeNativeWindow));
 
     classHandleMap_[0x1001] = "android/content/Context";
     classHandleMap_[0x1002] = "com/unity3d/player/UnityPlayer";
@@ -1353,6 +1370,14 @@ void GuestRuntimeEnvironment::handleTrampolineCall(uint32_t trampolineId, uc_eng
             ? formatGuestPrintf(uc, fmt, 4, vaAddr)
             : formatGuestPrintf(uc, fmt, 3, 0);
         LOGI("[GuestLog][%s] %s", tag.c_str(), formatted.c_str());
+        if (tag == "CRASH" || fmt.find("trapped") != std::string::npos) {
+            uint32_t sp = 0, lr = 0, pc = 0;
+            uc_reg_read(uc, UC_ARM_REG_SP, &sp);
+            uc_reg_read(uc, UC_ARM_REG_LR, &lr);
+            uc_reg_read(uc, UC_ARM_REG_PC, &pc);
+            LOGW("[GuestLogCrashDiagnostic] Trap detect: tag='%s', fmt='%s', PC=0x%08x, LR=0x%08x, SP=0x%08x",
+                 tag.c_str(), fmt.c_str(), pc, lr, sp);
+        }
         uint32_t ret = 1;
         uc_reg_write(uc, UC_ARM_REG_R0, &ret);
         return;
@@ -1983,7 +2008,9 @@ void GuestRuntimeEnvironment::handleTrampolineCall(uint32_t trampolineId, uc_eng
 
     // 8. Android NDK NativeWindow & AssetManager
     if (name == "ANativeWindow_fromSurface") {
-        uint32_t winHandle = guestJniBase_ + 0x2800U;
+        uint32_t surfObj = 0;
+        uc_reg_read(uc, UC_ARM_REG_R1, &surfObj);
+        uint32_t winHandle = (surfObj != 0) ? (guestJniBase_ + 0x2800U) : 0U;
         uc_reg_write(uc, UC_ARM_REG_R0, &winHandle);
         return;
     }
@@ -2002,7 +2029,68 @@ void GuestRuntimeEnvironment::handleTrampolineCall(uint32_t trampolineId, uc_eng
         uc_reg_write(uc, UC_ARM_REG_R0, &fmt);
         return;
     }
-    if (name == "ANativeWindow_setBuffersGeometry" || name == "ANativeWindow_acquire" || name == "ANativeWindow_release") {
+    if (name == "ANativeWindow_setBuffersGeometry" || name == "ANativeWindow_acquire" ||
+        name == "ANativeWindow_release" || name == "ANativeWindow_lock" || name == "ANativeWindow_unlockAndPost") {
+        uint32_t zero = 0;
+        uc_reg_write(uc, UC_ARM_REG_R0, &zero);
+        return;
+    }
+
+    // 8b. Signal Handling & Assertion Safety (Evita che crash handler intrappolino il Main Thread)
+    if (name == "sigaction" || name == "__sigaction") {
+        uint32_t sig = 0, actPtr = 0, oldActPtr = 0;
+        uc_reg_read(uc, UC_ARM_REG_R0, &sig);
+        uc_reg_read(uc, UC_ARM_REG_R1, &actPtr);
+        uc_reg_read(uc, UC_ARM_REG_R2, &oldActPtr);
+        if (actPtr != 0) {
+            uint32_t sa_handler = 0;
+            uc_mem_read(uc, actPtr, &sa_handler, 4);
+            LOGI("Guest sigaction intercettata (sig=%u, sa_handler=0x%08x)", sig, sa_handler);
+        }
+        if (oldActPtr != 0) {
+            uint32_t zero = 0;
+            uc_mem_write(uc, oldActPtr, &zero, 4);
+        }
+        uint32_t zero = 0;
+        uc_reg_write(uc, UC_ARM_REG_R0, &zero);
+        return;
+    }
+    if (name == "signal" || name == "bsd_signal") {
+        uint32_t sig = 0, handler = 0;
+        uc_reg_read(uc, UC_ARM_REG_R0, &sig);
+        uc_reg_read(uc, UC_ARM_REG_R1, &handler);
+        LOGI("Guest signal intercettata (sig=%u, handler=0x%08x)", sig, handler);
+        uint32_t zero = 0;
+        uc_reg_write(uc, UC_ARM_REG_R0, &zero);
+        return;
+    }
+    if (name == "sigaltstack" || name == "sigprocmask" || name == "pthread_sigmask") {
+        uint32_t zero = 0;
+        uc_reg_write(uc, UC_ARM_REG_R0, &zero);
+        return;
+    }
+    if (name == "raise" || name == "kill" || name == "tkill" || name == "tgkill") {
+        uint32_t sig = 0;
+        uc_reg_read(uc, UC_ARM_REG_R0, &sig);
+        LOGW("Guest %s intercettata (sig=%u) - neutralizzata", name.c_str(), sig);
+        uint32_t zero = 0;
+        uc_reg_write(uc, UC_ARM_REG_R0, &zero);
+        return;
+    }
+    if (name == "abort") {
+        LOGE("Guest ha invocato abort() - neutralizzato per preservare il main loop");
+        uint32_t zero = 0;
+        uc_reg_write(uc, UC_ARM_REG_R0, &zero);
+        return;
+    }
+    if (name == "__assert" || name == "__assert2") {
+        uint32_t fileAddr = 0, line = 0, msgAddr = 0;
+        uc_reg_read(uc, UC_ARM_REG_R0, &fileAddr);
+        uc_reg_read(uc, UC_ARM_REG_R1, &line);
+        uc_reg_read(uc, UC_ARM_REG_R2, &msgAddr);
+        std::string file = readGuestCString(uc, fileAddr, 128);
+        std::string msg = readGuestCString(uc, msgAddr, 256);
+        LOGE("Guest ASSERTION FAILED: %s:%u: %s", file.c_str(), line, msg.c_str());
         uint32_t zero = 0;
         uc_reg_write(uc, UC_ARM_REG_R0, &zero);
         return;
@@ -2745,13 +2833,25 @@ void GuestRuntimeEnvironment::handleTrampolineCall(uint32_t trampolineId, uc_eng
         uc_reg_read(uc, UC_ARM_REG_R1, &paramsPtr);
         if (paramsPtr != 0) {
             if (name == "glGetIntegerv") {
-                GLint vals[4] = {4096, 4096, 1920, 1080};
-                glGetIntegerv(pname, vals);
-                uc_mem_write(uc, paramsPtr, vals, 4);
+                if (pname == GL_VIEWPORT || pname == GL_SCISSOR_BOX) {
+                    GLint box[4] = {0, 0, 1920, 1080};
+                    uc_mem_write(uc, paramsPtr, box, 16);
+                } else if (pname == GL_MAX_VIEWPORT_DIMS) {
+                    GLint dims[2] = {4096, 4096};
+                    uc_mem_write(uc, paramsPtr, dims, 8);
+                } else {
+                    GLint val = 4096;
+                    if (pname == GL_NUM_COMPRESSED_TEXTURE_FORMATS) val = 10;
+                    else if (pname == GL_MAX_TEXTURE_IMAGE_UNITS || pname == GL_MAX_COMBINED_TEXTURE_IMAGE_UNITS) val = 16;
+                    else if (pname == GL_MAX_VERTEX_ATTRIBS) val = 16;
+                    else if (pname == GL_MAX_RENDERBUFFER_SIZE) val = 4096;
+                    else glGetIntegerv(pname, &val);
+                    uc_mem_write(uc, paramsPtr, &val, 4);
+                }
             } else if (name == "glGetFloatv") {
                 GLfloat vals[4] = {1.0f, 1.0f, 1.0f, 1.0f};
                 glGetFloatv(pname, vals);
-                uc_mem_write(uc, paramsPtr, vals, 4);
+                uc_mem_write(uc, paramsPtr, vals, 16);
             } else {
                 GLboolean b = GL_TRUE;
                 glGetBooleanv(pname, &b);
@@ -2768,7 +2868,7 @@ void GuestRuntimeEnvironment::handleTrampolineCall(uint32_t trampolineId, uc_eng
         else if (glEnum == GL_RENDERER) strVal = "Adreno / Mali Hardware Accelerated";
         else if (glEnum == GL_VERSION) strVal = "OpenGL ES 2.0 Emux32";
         else if (glEnum == GL_SHADING_LANGUAGE_VERSION) strVal = "OpenGL ES GLSL ES 1.00";
-        else if (glEnum == GL_EXTENSIONS) strVal = "GL_OES_compressed_ETC1_RGB8_texture GL_OES_depth24 GL_OES_packed_depth_stencil GL_OES_rgb8_rgba8 GL_OES_vertex_half_float GL_EXT_texture_format_BGRA8888 GL_OES_framebuffer_object";
+        else if (glEnum == GL_EXTENSIONS) strVal = "GL_OES_compressed_ETC1_RGB8_texture GL_OES_depth24 GL_OES_depth_texture GL_OES_texture_npot GL_OES_packed_depth_stencil GL_OES_rgb8_rgba8 GL_OES_vertex_half_float GL_EXT_texture_format_BGRA8888 GL_OES_framebuffer_object GL_OES_element_index_uint GL_OES_standard_derivatives GL_EXT_discard_framebuffer GL_OES_mapbuffer";
         uint32_t strGuestAddr = createGuestString(uc, strVal);
         uc_reg_write(uc, UC_ARM_REG_R0, &strGuestAddr);
         return;
@@ -2815,7 +2915,21 @@ void GuestRuntimeEnvironment::handleTrampolineCall(uint32_t trampolineId, uc_eng
         uc_reg_read(uc, UC_ARM_REG_R2, &attr);
         uc_reg_read(uc, UC_ARM_REG_R3, &valPtr);
         if (valPtr != 0) {
-            uint32_t val = (attr == 0x3057) ? 1920U : ((attr == 0x3056) ? 1080U : 8U);
+            uint32_t val = 0;
+            switch (attr) {
+                case 0x3057: val = 1920; break; // EGL_WIDTH
+                case 0x3056: val = 1080; break; // EGL_HEIGHT
+                case 0x3040: val = 4; break;    // EGL_RENDERABLE_TYPE (EGL_OPENGL_ES2_BIT)
+                case 0x3033: val = 5; break;    // EGL_SURFACE_TYPE (WINDOW | PBUFFER)
+                case 0x3025: val = 24; break;   // EGL_DEPTH_SIZE
+                case 0x3026: val = 8; break;    // EGL_STENCIL_SIZE
+                case 0x3024:                    // EGL_RED_SIZE
+                case 0x3023:                    // EGL_GREEN_SIZE
+                case 0x3022:                    // EGL_BLUE_SIZE
+                case 0x3021: val = 8; break;    // EGL_ALPHA_SIZE
+                case 0x3028: val = 1; break;    // EGL_CONFIG_ID
+                default: val = 8; break;
+            }
             uc_mem_write(uc, valPtr, &val, 4);
         }
         uint32_t one = 1;
