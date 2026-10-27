@@ -17,6 +17,8 @@
 
 namespace emux {
 
+static std::atomic<uint32_t> sNextLoadBias{0x40000000U};
+
 LoadedLibrary::~LoadedLibrary() {
     if (base_address != 0 && total_memory_size > 0) {
         munmap(reinterpret_cast<void*>(base_address), total_memory_size);
@@ -166,7 +168,20 @@ bool LoadedLibrary::applyRelocations(uc_engine* uc) const {
                 } else if (type == 21 || type == 22 || type == 2) { // R_ARM_GLOB_DAT, R_ARM_JUMP_SLOT, R_ARM_ABS32
                     if (symtab && dynstr) {
                         const auto& sym = symtab[symIdx];
-                        if (strtabSz == 0 || sym.st_name < strtabSz) {
+                        if (sym.st_shndx != 0 || sym.st_value != 0) {
+                            // Simbolo definito internamente nella libreria stessa
+                            uint32_t symAddr = load_bias + sym.st_value;
+                            if (type == 2) { // R_ARM_ABS32
+                                uint32_t addend = 0;
+                                uc_mem_read(uc, targetAddr, &addend, sizeof(addend));
+                                uint32_t relocated = symAddr + addend;
+                                uc_mem_write(uc, targetAddr, &relocated, sizeof(relocated));
+                            } else {
+                                uc_mem_write(uc, targetAddr, &symAddr, sizeof(symAddr));
+                            }
+                            totalRelocsApplied++;
+                        } else if (strtabSz == 0 || sym.st_name < strtabSz) {
+                            // Simbolo esterno: risoluzione tramite Trampoline
                             const char* symName = dynstr + sym.st_name;
                             if (symName && symName[0] != '\0') {
                                 uint32_t tramp = GuestRuntimeEnvironment::getInstance().registerSymbolTrampoline(symName, uc);
@@ -248,7 +263,19 @@ bool LoadedLibrary::applyRelocations(uc_engine* uc) const {
                 } else if (type == 21 || type == 22 || type == 2) { // R_ARM_GLOB_DAT, R_ARM_JUMP_SLOT, R_ARM_ABS32
                     if (symtab && symIdx < numSyms && dynstr) {
                         const auto& sym = symtab[symIdx];
-                        if (sym.st_name < dynstrSize) {
+                        if (sym.st_shndx != 0 || sym.st_value != 0) {
+                            // Simbolo definito internamente nella libreria
+                            uint32_t symAddr = load_bias + sym.st_value;
+                            if (type == 2) { // R_ARM_ABS32
+                                uint32_t addend = 0;
+                                uc_mem_read(uc, targetAddr, &addend, sizeof(addend));
+                                uint32_t relocated = symAddr + addend;
+                                uc_mem_write(uc, targetAddr, &relocated, sizeof(relocated));
+                            } else {
+                                uc_mem_write(uc, targetAddr, &symAddr, sizeof(symAddr));
+                            }
+                            totalRelocsApplied++;
+                        } else if (sym.st_name < dynstrSize) {
                             const char* symName = dynstr + sym.st_name;
                             if (symName && symName[0] != '\0') {
                                 uint32_t tramp = GuestRuntimeEnvironment::getInstance().registerSymbolTrampoline(symName, uc);
@@ -547,8 +574,13 @@ std::shared_ptr<LoadedLibrary> Elf32Loader::loadFromMemory(
     loadedLib->total_memory_size = totalMemorySize;
     loadedLib->is_pie = (ehdr->e_type == ET_DYN);
 
-    // Per librerie condivise (.so) viene impostato un load bias sicuro (0x40000000 = 1GB)
-    loadedLib->load_bias = loadedLib->is_pie ? 0x40000000U : 0U;
+    // Per librerie condivise (.so) viene impostato un load bias dinamico isolato per ogni libreria
+    if (loadedLib->is_pie) {
+        loadedLib->load_bias = sNextLoadBias.load();
+        sNextLoadBias.fetch_add(static_cast<uint32_t>(PAGE_ALIGN_UP(totalMemorySize) + 0x200000U));
+    } else {
+        loadedLib->load_bias = 0U;
+    }
 
     // Determinazione del punto di ingresso: e_entry, oppure ricerca del simbolo JNI_OnLoad
     if (ehdr->e_entry != 0) {
@@ -574,8 +606,32 @@ std::shared_ptr<LoadedLibrary> Elf32Loader::loadFromMemory(
     loadedLib->segments = loadSegments;
     loadedLib->raw_binary.assign(buffer, buffer + bufferSize);
 
-    LOGI("Caricamento ELF completato: %s (Entry Point: 0x%08x, Load Bias: 0x%08x, Segmenti: %zu)",
-         name.c_str(), loadedLib->entry_point, loadedLib->load_bias, loadSegments.size());
+    // Estrazione simboli esportati
+    if (ehdr->e_shoff != 0 && ehdr->e_shnum != 0) {
+        const auto* shdrs = reinterpret_cast<const Elf32_Shdr*>(buffer + ehdr->e_shoff);
+        const Elf32_Shdr* symShdr = nullptr;
+        const Elf32_Shdr* strShdr = nullptr;
+        for (uint16_t s = 0; s < ehdr->e_shnum; ++s) {
+            if (shdrs[s].sh_type == SHT_DYNSYM) symShdr = &shdrs[s];
+            if (shdrs[s].sh_type == SHT_STRTAB && s != ehdr->e_shstrndx) strShdr = &shdrs[s];
+        }
+        if (symShdr && strShdr && strShdr->sh_offset < bufferSize) {
+            const auto* syms = reinterpret_cast<const Elf32_Sym*>(buffer + symShdr->sh_offset);
+            size_t nSyms = symShdr->sh_size / sizeof(Elf32_Sym);
+            const char* strtab = reinterpret_cast<const char*>(buffer + strShdr->sh_offset);
+            for (size_t i = 0; i < nSyms; ++i) {
+                if (syms[i].st_name < strShdr->sh_size && syms[i].st_value != 0) {
+                    const char* sName = strtab + syms[i].st_name;
+                    if (sName && sName[0] != '\0') {
+                        loadedLib->symbols.push_back({sName, syms[i].st_value});
+                    }
+                }
+            }
+        }
+    }
+
+    LOGI("Caricamento ELF completato: %s (Entry Point: 0x%08x, Load Bias: 0x%08x, Segmenti: %zu, Simboli: %zu)",
+         name.c_str(), loadedLib->entry_point, loadedLib->load_bias, loadSegments.size(), loadedLib->symbols.size());
     return loadedLib;
 }
 

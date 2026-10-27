@@ -462,7 +462,18 @@ class MainActivity : ComponentActivity() {
             // ==========================================
             // FASE 5: Caricamento ELF ed Esecuzione Guest
             // ==========================================
-            EmuxLogger.i("Emux32", "[FASE 5/5] Caricamento ELF binario guest (${mainSo.name})...")
+            // Pre-caricamento librerie di supporto condivise (STL, libc++, audio) se presenti nell'APK
+            for (depFile in extractedSos) {
+                if (depFile != mainSo) {
+                    val depName = depFile.name.lowercase()
+                    if (depName.contains("stl") || depName.contains("c++") || depName.contains("shared") || depName.contains("fmod")) {
+                        EmuxLogger.i("Emux32", "[FASE 5/5] Pre-caricamento libreria di supporto: ${depFile.name}")
+                        NativeEngine.nativeLoadElfLibrary(depFile.absolutePath)
+                    }
+                }
+            }
+
+            EmuxLogger.i("Emux32", "[FASE 5/5] Caricamento ELF binario guest principale (${mainSo.name})...")
             val loaded = NativeEngine.nativeLoadElfLibrary(mainSo.absolutePath)
             if (loaded) {
                 EmuxLogger.i("Emux32", "[FASE 5/5] ELF caricato e rilocato. Avvio uc_emu_start su thread isolato Dispatchers.IO...")

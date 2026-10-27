@@ -13,6 +13,7 @@
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, TAG, __VA_ARGS__)
 
 static std::unique_ptr<emux::DbtEngine> gEngine = nullptr;
+static ANativeWindow* gSavedWindow = nullptr;
 static std::mutex gEngineMutex;
 
 extern "C" {
@@ -27,6 +28,11 @@ Java_com_emux_translator_nativebridge_NativeEngine_nativeInitEngine(
     LOGI("Inizializzazione Engine Nativo Unicorn DBT con %ld MB di RAM...", (long)guestRamMb);
 
     gEngine = std::make_unique<emux::DbtEngine>();
+    if (gSavedWindow) {
+        LOGI("Collegamento ANativeWindow salvata al nuovo DbtEngine.");
+        gEngine->setNativeSurface(gSavedWindow);
+    }
+
     size_t ramBytes = static_cast<size_t>(guestRamMb) * 1024 * 1024;
     bool success = gEngine->initialize(ramBytes);
 
@@ -131,13 +137,17 @@ Java_com_emux_translator_nativebridge_NativeEngine_nativeSetSurface(
     jobject surface
 ) {
     std::lock_guard<std::mutex> lock(gEngineMutex);
-    if (!gEngine) return;
+    if (gSavedWindow) {
+        ANativeWindow_release(gSavedWindow);
+        gSavedWindow = nullptr;
+    }
 
     if (surface) {
-        ANativeWindow* window = ANativeWindow_fromSurface(env, surface);
-        gEngine->setNativeSurface(window);
-    } else {
-        gEngine->setNativeSurface(nullptr);
+        gSavedWindow = ANativeWindow_fromSurface(env, surface);
+    }
+
+    if (gEngine) {
+        gEngine->setNativeSurface(gSavedWindow);
     }
 }
 
@@ -164,6 +174,10 @@ Java_com_emux_translator_nativebridge_NativeEngine_nativeReleaseEngine(
     if (gEngine) {
         LOGI("Rilascio DbtEngine...");
         gEngine.reset();
+    }
+    if (gSavedWindow) {
+        ANativeWindow_release(gSavedWindow);
+        gSavedWindow = nullptr;
     }
 }
 

@@ -1,6 +1,10 @@
 #include "linker_hook.h"
 #include "unicorn/arm.h"
 
+#include <EGL/egl.h>
+#include <GLES2/gl2.h>
+#include <GLES2/gl2ext.h>
+
 #include <android/log.h>
 #include <dlfcn.h>
 #include <unistd.h>
@@ -693,6 +697,7 @@ void GuestRuntimeEnvironment::handleTrampolineCall(uint32_t trampolineId, uc_eng
             if (namePtr) uc_mem_read(uc, namePtr, mName, sizeof(mName) - 1);
             if (sigPtr) uc_mem_read(uc, sigPtr, mSig, sizeof(mSig) - 1);
             LOGI("   -> Registrato JNINativeMethod[%u]: '%s' (%s) -> Entry Point: 0x%08x", i, mName, mSig, fnPtr);
+            addRegisteredMethod(mName, mSig, fnPtr);
         }
 
         uint32_t ret = 0; // JNI_OK
@@ -1117,25 +1122,758 @@ void GuestRuntimeEnvironment::handleTrampolineCall(uint32_t trampolineId, uc_eng
             return;
         }
 
-        // 7. OpenGL ES 2.0 Stubs sicuri
-        if (name == "glGetString") {
-            uint32_t nameParam = 0;
-            uc_reg_read(uc, UC_ARM_REG_R0, &nameParam);
-            static const char sGlesVersion[] = "OpenGL ES 2.0 Emux32";
-            static const char sGlesRenderer[] = "Adreno (Emux32 DBT Translator)";
-            static const char sGlesVendor[] = "Qualcomm";
-            static const char sGlesExt[] = "GL_OES_texture_npot GL_OES_rgb8_rgba8 GL_EXT_texture_format_BGRA8888";
+        // 7. OpenGL ES 2.0 / EGL Real Hardware Passthrough
+        if (name == "glViewport") {
+            uint32_t x = 0, y = 0, w = 0, h = 0;
+            uc_reg_read(uc, UC_ARM_REG_R0, &x);
+            uc_reg_read(uc, UC_ARM_REG_R1, &y);
+            uc_reg_read(uc, UC_ARM_REG_R2, &w);
+            uc_reg_read(uc, UC_ARM_REG_R3, &h);
+            ::glViewport(static_cast<GLint>(x), static_cast<GLint>(y), static_cast<GLsizei>(w), static_cast<GLsizei>(h));
+            return;
+        }
 
-            const char* targetStr = sGlesVersion;
-            if (nameParam == 0x1F01) targetStr = sGlesRenderer; // GL_RENDERER
-            if (nameParam == 0x1F00) targetStr = sGlesVendor;   // GL_VENDOR
-            if (nameParam == 0x1F03) targetStr = sGlesExt;      // GL_EXTENSIONS
+        if (name == "glScissor") {
+            uint32_t x = 0, y = 0, w = 0, h = 0;
+            uc_reg_read(uc, UC_ARM_REG_R0, &x);
+            uc_reg_read(uc, UC_ARM_REG_R1, &y);
+            uc_reg_read(uc, UC_ARM_REG_R2, &w);
+            uc_reg_read(uc, UC_ARM_REG_R3, &h);
+            ::glScissor(static_cast<GLint>(x), static_cast<GLint>(y), static_cast<GLsizei>(w), static_cast<GLsizei>(h));
+            return;
+        }
 
-            uint32_t strAddr = sHeapCurrent;
-            size_t len = std::strlen(targetStr) + 1;
-            sHeapCurrent += (len + 15) & ~15U;
-            uc_mem_write(uc, strAddr, targetStr, len);
-            uc_reg_write(uc, UC_ARM_REG_R0, &strAddr);
+        if (name == "glClearColor") {
+            uint32_t r = 0, g = 0, b = 0, a = 0;
+            uc_reg_read(uc, UC_ARM_REG_R0, &r);
+            uc_reg_read(uc, UC_ARM_REG_R1, &g);
+            uc_reg_read(uc, UC_ARM_REG_R2, &b);
+            uc_reg_read(uc, UC_ARM_REG_R3, &a);
+            float fr, fg, fb, fa;
+            std::memcpy(&fr, &r, 4);
+            std::memcpy(&fg, &g, 4);
+            std::memcpy(&fb, &b, 4);
+            std::memcpy(&fa, &a, 4);
+            ::glClearColor(fr, fg, fb, fa);
+            return;
+        }
+
+        if (name == "glClear") {
+            uint32_t mask = 0;
+            uc_reg_read(uc, UC_ARM_REG_R0, &mask);
+            ::glClear(static_cast<GLbitfield>(mask));
+            return;
+        }
+
+        if (name == "glClearDepthf") {
+            uint32_t d = 0;
+            uc_reg_read(uc, UC_ARM_REG_R0, &d);
+            float fd;
+            std::memcpy(&fd, &d, 4);
+            ::glClearDepthf(fd);
+            return;
+        }
+
+        if (name == "glClearStencil") {
+            uint32_t s = 0;
+            uc_reg_read(uc, UC_ARM_REG_R0, &s);
+            ::glClearStencil(static_cast<GLint>(s));
+            return;
+        }
+
+        if (name == "glEnable") {
+            uint32_t cap = 0;
+            uc_reg_read(uc, UC_ARM_REG_R0, &cap);
+            ::glEnable(static_cast<GLenum>(cap));
+            return;
+        }
+
+        if (name == "glDisable") {
+            uint32_t cap = 0;
+            uc_reg_read(uc, UC_ARM_REG_R0, &cap);
+            ::glDisable(static_cast<GLenum>(cap));
+            return;
+        }
+
+        if (name == "glIsEnabled") {
+            uint32_t cap = 0;
+            uc_reg_read(uc, UC_ARM_REG_R0, &cap);
+            uint32_t res = ::glIsEnabled(static_cast<GLenum>(cap)) ? 1 : 0;
+            uc_reg_write(uc, UC_ARM_REG_R0, &res);
+            return;
+        }
+
+        if (name == "glBlendFunc") {
+            uint32_t s = 0, d = 0;
+            uc_reg_read(uc, UC_ARM_REG_R0, &s);
+            uc_reg_read(uc, UC_ARM_REG_R1, &d);
+            ::glBlendFunc(static_cast<GLenum>(s), static_cast<GLenum>(d));
+            return;
+        }
+
+        if (name == "glBlendFuncSeparate") {
+            uint32_t srcRGB = 0, dstRGB = 0, srcAlpha = 0, dstAlpha = 0;
+            uc_reg_read(uc, UC_ARM_REG_R0, &srcRGB);
+            uc_reg_read(uc, UC_ARM_REG_R1, &dstRGB);
+            uc_reg_read(uc, UC_ARM_REG_R2, &srcAlpha);
+            uc_reg_read(uc, UC_ARM_REG_R3, &dstAlpha);
+            ::glBlendFuncSeparate(srcRGB, dstRGB, srcAlpha, dstAlpha);
+            return;
+        }
+
+        if (name == "glBlendEquation") {
+            uint32_t mode = 0;
+            uc_reg_read(uc, UC_ARM_REG_R0, &mode);
+            ::glBlendEquation(static_cast<GLenum>(mode));
+            return;
+        }
+
+        if (name == "glBlendEquationSeparate") {
+            uint32_t modeRGB = 0, modeAlpha = 0;
+            uc_reg_read(uc, UC_ARM_REG_R0, &modeRGB);
+            uc_reg_read(uc, UC_ARM_REG_R1, &modeAlpha);
+            ::glBlendEquationSeparate(modeRGB, modeAlpha);
+            return;
+        }
+
+        if (name == "glDepthFunc") {
+            uint32_t func = 0;
+            uc_reg_read(uc, UC_ARM_REG_R0, &func);
+            ::glDepthFunc(static_cast<GLenum>(func));
+            return;
+        }
+
+        if (name == "glDepthMask") {
+            uint32_t flag = 0;
+            uc_reg_read(uc, UC_ARM_REG_R0, &flag);
+            ::glDepthMask(static_cast<GLboolean>(flag));
+            return;
+        }
+
+        if (name == "glCullFace") {
+            uint32_t mode = 0;
+            uc_reg_read(uc, UC_ARM_REG_R0, &mode);
+            ::glCullFace(static_cast<GLenum>(mode));
+            return;
+        }
+
+        if (name == "glFrontFace") {
+            uint32_t mode = 0;
+            uc_reg_read(uc, UC_ARM_REG_R0, &mode);
+            ::glFrontFace(static_cast<GLenum>(mode));
+            return;
+        }
+
+        if (name == "glColorMask") {
+            uint32_t r = 0, g = 0, b = 0, a = 0;
+            uc_reg_read(uc, UC_ARM_REG_R0, &r);
+            uc_reg_read(uc, UC_ARM_REG_R1, &g);
+            uc_reg_read(uc, UC_ARM_REG_R2, &b);
+            uc_reg_read(uc, UC_ARM_REG_R3, &a);
+            ::glColorMask(r, g, b, a);
+            return;
+        }
+
+        if (name == "glBindTexture") {
+            uint32_t target = 0, texture = 0;
+            uc_reg_read(uc, UC_ARM_REG_R0, &target);
+            uc_reg_read(uc, UC_ARM_REG_R1, &texture);
+            ::glBindTexture(static_cast<GLenum>(target), static_cast<GLuint>(texture));
+            return;
+        }
+
+        if (name == "glActiveTexture") {
+            uint32_t texture = 0;
+            uc_reg_read(uc, UC_ARM_REG_R0, &texture);
+            ::glActiveTexture(static_cast<GLenum>(texture));
+            return;
+        }
+
+        if (name == "glGenTextures") {
+            uint32_t count = 0, ptr = 0;
+            uc_reg_read(uc, UC_ARM_REG_R0, &count);
+            uc_reg_read(uc, UC_ARM_REG_R1, &ptr);
+            if (count > 0 && ptr != 0) {
+                std::vector<GLuint> ids(count);
+                ::glGenTextures(count, ids.data());
+                uc_mem_write(uc, ptr, ids.data(), count * sizeof(GLuint));
+            }
+            return;
+        }
+
+        if (name == "glDeleteTextures") {
+            uint32_t count = 0, ptr = 0;
+            uc_reg_read(uc, UC_ARM_REG_R0, &count);
+            uc_reg_read(uc, UC_ARM_REG_R1, &ptr);
+            if (count > 0 && ptr != 0) {
+                std::vector<GLuint> ids(count);
+                uc_mem_read(uc, ptr, ids.data(), count * sizeof(GLuint));
+                ::glDeleteTextures(count, ids.data());
+            }
+            return;
+        }
+
+        if (name == "glTexParameteri") {
+            uint32_t target = 0, pname = 0, param = 0;
+            uc_reg_read(uc, UC_ARM_REG_R0, &target);
+            uc_reg_read(uc, UC_ARM_REG_R1, &pname);
+            uc_reg_read(uc, UC_ARM_REG_R2, &param);
+            ::glTexParameteri(target, pname, param);
+            return;
+        }
+
+        if (name == "glTexParameterf") {
+            uint32_t target = 0, pname = 0, paramRaw = 0;
+            uc_reg_read(uc, UC_ARM_REG_R0, &target);
+            uc_reg_read(uc, UC_ARM_REG_R1, &pname);
+            uc_reg_read(uc, UC_ARM_REG_R2, &paramRaw);
+            float fparam;
+            std::memcpy(&fparam, &paramRaw, 4);
+            ::glTexParameterf(target, pname, fparam);
+            return;
+        }
+
+        if (name == "glTexImage2D") {
+            uint32_t target = 0, level = 0, internalformat = 0, width = 0;
+            uc_reg_read(uc, UC_ARM_REG_R0, &target);
+            uc_reg_read(uc, UC_ARM_REG_R1, &level);
+            uc_reg_read(uc, UC_ARM_REG_R2, &internalformat);
+            uc_reg_read(uc, UC_ARM_REG_R3, &width);
+
+            uint32_t sp = 0;
+            uc_reg_read(uc, UC_ARM_REG_SP, &sp);
+            uint32_t height = 0, border = 0, format = 0, type = 0, pixelsPtr = 0;
+            uc_mem_read(uc, sp, &height, 4);
+            uc_mem_read(uc, sp + 4, &border, 4);
+            uc_mem_read(uc, sp + 8, &format, 4);
+            uc_mem_read(uc, sp + 12, &type, 4);
+            uc_mem_read(uc, sp + 16, &pixelsPtr, 4);
+
+            if (pixelsPtr != 0 && width > 0 && height > 0) {
+                size_t bpp = 4;
+                if (format == GL_RGB) bpp = (type == GL_UNSIGNED_SHORT_5_6_5) ? 2 : 3;
+                else if (format == GL_LUMINANCE || format == GL_ALPHA) bpp = 1;
+                else if (format == GL_LUMINANCE_ALPHA) bpp = 2;
+                size_t totalBytes = static_cast<size_t>(width) * height * bpp;
+                std::vector<uint8_t> pBuf(totalBytes);
+                uc_mem_read(uc, pixelsPtr, pBuf.data(), totalBytes);
+                ::glTexImage2D(target, level, internalformat, width, height, border, format, type, pBuf.data());
+            } else {
+                ::glTexImage2D(target, level, internalformat, width, height, border, format, type, nullptr);
+            }
+            return;
+        }
+
+        if (name == "glTexSubImage2D") {
+            uint32_t target = 0, level = 0, xoff = 0, yoff = 0;
+            uc_reg_read(uc, UC_ARM_REG_R0, &target);
+            uc_reg_read(uc, UC_ARM_REG_R1, &level);
+            uc_reg_read(uc, UC_ARM_REG_R2, &xoff);
+            uc_reg_read(uc, UC_ARM_REG_R3, &yoff);
+
+            uint32_t sp = 0;
+            uc_reg_read(uc, UC_ARM_REG_SP, &sp);
+            uint32_t width = 0, height = 0, format = 0, type = 0, pixelsPtr = 0;
+            uc_mem_read(uc, sp, &width, 4);
+            uc_mem_read(uc, sp + 4, &height, 4);
+            uc_mem_read(uc, sp + 8, &format, 4);
+            uc_mem_read(uc, sp + 12, &type, 4);
+            uc_mem_read(uc, sp + 16, &pixelsPtr, 4);
+
+            if (pixelsPtr != 0 && width > 0 && height > 0) {
+                size_t bpp = (format == GL_RGB) ? 3 : ((format == GL_RGBA) ? 4 : 1);
+                size_t totalBytes = static_cast<size_t>(width) * height * bpp;
+                std::vector<uint8_t> pBuf(totalBytes);
+                uc_mem_read(uc, pixelsPtr, pBuf.data(), totalBytes);
+                ::glTexSubImage2D(target, level, xoff, yoff, width, height, format, type, pBuf.data());
+            }
+            return;
+        }
+
+        if (name == "glPixelStorei") {
+            uint32_t pname = 0, param = 0;
+            uc_reg_read(uc, UC_ARM_REG_R0, &pname);
+            uc_reg_read(uc, UC_ARM_REG_R1, &param);
+            ::glPixelStorei(pname, param);
+            return;
+        }
+
+        if (name == "glGenBuffers") {
+            uint32_t count = 0, ptr = 0;
+            uc_reg_read(uc, UC_ARM_REG_R0, &count);
+            uc_reg_read(uc, UC_ARM_REG_R1, &ptr);
+            if (count > 0 && ptr != 0) {
+                std::vector<GLuint> ids(count);
+                ::glGenBuffers(count, ids.data());
+                uc_mem_write(uc, ptr, ids.data(), count * sizeof(GLuint));
+            }
+            return;
+        }
+
+        if (name == "glDeleteBuffers") {
+            uint32_t count = 0, ptr = 0;
+            uc_reg_read(uc, UC_ARM_REG_R0, &count);
+            uc_reg_read(uc, UC_ARM_REG_R1, &ptr);
+            if (count > 0 && ptr != 0) {
+                std::vector<GLuint> ids(count);
+                uc_mem_read(uc, ptr, ids.data(), count * sizeof(GLuint));
+                ::glDeleteBuffers(count, ids.data());
+            }
+            return;
+        }
+
+        if (name == "glBindBuffer") {
+            uint32_t target = 0, buffer = 0;
+            uc_reg_read(uc, UC_ARM_REG_R0, &target);
+            uc_reg_read(uc, UC_ARM_REG_R1, &buffer);
+            ::glBindBuffer(target, buffer);
+            return;
+        }
+
+        if (name == "glBufferData") {
+            uint32_t target = 0, size = 0, dataPtr = 0, usage = 0;
+            uc_reg_read(uc, UC_ARM_REG_R0, &target);
+            uc_reg_read(uc, UC_ARM_REG_R1, &size);
+            uc_reg_read(uc, UC_ARM_REG_R2, &dataPtr);
+            uc_reg_read(uc, UC_ARM_REG_R3, &usage);
+            if (dataPtr != 0 && size > 0) {
+                std::vector<uint8_t> buf(size);
+                uc_mem_read(uc, dataPtr, buf.data(), size);
+                ::glBufferData(target, size, buf.data(), usage);
+            } else {
+                ::glBufferData(target, size, nullptr, usage);
+            }
+            return;
+        }
+
+        if (name == "glBufferSubData") {
+            uint32_t target = 0, offset = 0, size = 0, dataPtr = 0;
+            uc_reg_read(uc, UC_ARM_REG_R0, &target);
+            uc_reg_read(uc, UC_ARM_REG_R1, &offset);
+            uc_reg_read(uc, UC_ARM_REG_R2, &size);
+            uc_reg_read(uc, UC_ARM_REG_R3, &dataPtr);
+            if (dataPtr != 0 && size > 0) {
+                std::vector<uint8_t> buf(size);
+                uc_mem_read(uc, dataPtr, buf.data(), size);
+                ::glBufferSubData(target, offset, size, buf.data());
+            }
+            return;
+        }
+
+        if (name == "glCreateShader") {
+            uint32_t type = 0;
+            uc_reg_read(uc, UC_ARM_REG_R0, &type);
+            GLuint shader = ::glCreateShader(static_cast<GLenum>(type));
+            uint32_t ret = shader;
+            uc_reg_write(uc, UC_ARM_REG_R0, &ret);
+            return;
+        }
+
+        if (name == "glShaderSource") {
+            uint32_t shader = 0, count = 0, strArrayPtr = 0, lenArrayPtr = 0;
+            uc_reg_read(uc, UC_ARM_REG_R0, &shader);
+            uc_reg_read(uc, UC_ARM_REG_R1, &count);
+            uc_reg_read(uc, UC_ARM_REG_R2, &strArrayPtr);
+            uc_reg_read(uc, UC_ARM_REG_R3, &lenArrayPtr);
+
+            if (count > 0 && strArrayPtr != 0) {
+                std::vector<std::string> sources(count);
+                std::vector<const char*> cStrs(count);
+                for (uint32_t i = 0; i < count; ++i) {
+                    uint32_t sPtr = 0;
+                    uc_mem_read(uc, strArrayPtr + (i * 4), &sPtr, 4);
+                    if (sPtr != 0) {
+                        char chunk[256];
+                        std::string fullSrc;
+                        uint32_t cur = sPtr;
+                        while (true) {
+                            std::memset(chunk, 0, sizeof(chunk));
+                            uc_mem_read(uc, cur, chunk, sizeof(chunk) - 1);
+                            size_t clen = std::strlen(chunk);
+                            fullSrc.append(chunk, clen);
+                            if (clen < sizeof(chunk) - 1) break;
+                            cur += clen;
+                        }
+                        sources[i] = fullSrc;
+                    }
+                    cStrs[i] = sources[i].c_str();
+                }
+                ::glShaderSource(shader, count, cStrs.data(), nullptr);
+            }
+            return;
+        }
+
+        if (name == "glCompileShader") {
+            uint32_t shader = 0;
+            uc_reg_read(uc, UC_ARM_REG_R0, &shader);
+            ::glCompileShader(shader);
+            return;
+        }
+
+        if (name == "glGetShaderiv") {
+            uint32_t shader = 0, pname = 0, paramsPtr = 0;
+            uc_reg_read(uc, UC_ARM_REG_R0, &shader);
+            uc_reg_read(uc, UC_ARM_REG_R1, &pname);
+            uc_reg_read(uc, UC_ARM_REG_R2, &paramsPtr);
+            GLint param = 0;
+            ::glGetShaderiv(shader, pname, &param);
+            if (paramsPtr) uc_mem_write(uc, paramsPtr, &param, sizeof(param));
+            return;
+        }
+
+        if (name == "glGetShaderInfoLog") {
+            uint32_t shader = 0, bufsize = 0, lenPtr = 0, logPtr = 0;
+            uc_reg_read(uc, UC_ARM_REG_R0, &shader);
+            uc_reg_read(uc, UC_ARM_REG_R1, &bufsize);
+            uc_reg_read(uc, UC_ARM_REG_R2, &lenPtr);
+            uc_reg_read(uc, UC_ARM_REG_R3, &logPtr);
+            if (bufsize > 0 && logPtr != 0) {
+                std::vector<char> buf(bufsize, 0);
+                GLsizei length = 0;
+                ::glGetShaderInfoLog(shader, bufsize, &length, buf.data());
+                if (lenPtr) uc_mem_write(uc, lenPtr, &length, 4);
+                uc_mem_write(uc, logPtr, buf.data(), length + 1);
+            }
+            return;
+        }
+
+        if (name == "glDeleteShader") {
+            uint32_t shader = 0;
+            uc_reg_read(uc, UC_ARM_REG_R0, &shader);
+            ::glDeleteShader(shader);
+            return;
+        }
+
+        if (name == "glCreateProgram") {
+            GLuint program = ::glCreateProgram();
+            uint32_t ret = program;
+            uc_reg_write(uc, UC_ARM_REG_R0, &ret);
+            return;
+        }
+
+        if (name == "glAttachShader") {
+            uint32_t program = 0, shader = 0;
+            uc_reg_read(uc, UC_ARM_REG_R0, &program);
+            uc_reg_read(uc, UC_ARM_REG_R1, &shader);
+            ::glAttachShader(program, shader);
+            return;
+        }
+
+        if (name == "glLinkProgram") {
+            uint32_t program = 0;
+            uc_reg_read(uc, UC_ARM_REG_R0, &program);
+            ::glLinkProgram(program);
+            return;
+        }
+
+        if (name == "glGetProgramiv") {
+            uint32_t program = 0, pname = 0, paramsPtr = 0;
+            uc_reg_read(uc, UC_ARM_REG_R0, &program);
+            uc_reg_read(uc, UC_ARM_REG_R1, &pname);
+            uc_reg_read(uc, UC_ARM_REG_R2, &paramsPtr);
+            GLint param = 0;
+            ::glGetProgramiv(program, pname, &param);
+            if (paramsPtr) uc_mem_write(uc, paramsPtr, &param, sizeof(param));
+            return;
+        }
+
+        if (name == "glGetProgramInfoLog") {
+            uint32_t program = 0, bufsize = 0, lenPtr = 0, logPtr = 0;
+            uc_reg_read(uc, UC_ARM_REG_R0, &program);
+            uc_reg_read(uc, UC_ARM_REG_R1, &bufsize);
+            uc_reg_read(uc, UC_ARM_REG_R2, &lenPtr);
+            uc_reg_read(uc, UC_ARM_REG_R3, &logPtr);
+            if (bufsize > 0 && logPtr != 0) {
+                std::vector<char> buf(bufsize, 0);
+                GLsizei length = 0;
+                ::glGetProgramInfoLog(program, bufsize, &length, buf.data());
+                if (lenPtr) uc_mem_write(uc, lenPtr, &length, 4);
+                uc_mem_write(uc, logPtr, buf.data(), length + 1);
+            }
+            return;
+        }
+
+        if (name == "glUseProgram") {
+            uint32_t program = 0;
+            uc_reg_read(uc, UC_ARM_REG_R0, &program);
+            ::glUseProgram(program);
+            return;
+        }
+
+        if (name == "glDeleteProgram") {
+            uint32_t program = 0;
+            uc_reg_read(uc, UC_ARM_REG_R0, &program);
+            ::glDeleteProgram(program);
+            return;
+        }
+
+        if (name == "glGetUniformLocation") {
+            uint32_t program = 0, namePtr = 0;
+            uc_reg_read(uc, UC_ARM_REG_R0, &program);
+            uc_reg_read(uc, UC_ARM_REG_R1, &namePtr);
+            char uName[128] = {0};
+            if (namePtr) uc_mem_read(uc, namePtr, uName, sizeof(uName) - 1);
+            GLint loc = ::glGetUniformLocation(program, uName);
+            uint32_t ret = static_cast<uint32_t>(loc);
+            uc_reg_write(uc, UC_ARM_REG_R0, &ret);
+            return;
+        }
+
+        if (name == "glGetAttribLocation") {
+            uint32_t program = 0, namePtr = 0;
+            uc_reg_read(uc, UC_ARM_REG_R0, &program);
+            uc_reg_read(uc, UC_ARM_REG_R1, &namePtr);
+            char aName[128] = {0};
+            if (namePtr) uc_mem_read(uc, namePtr, aName, sizeof(aName) - 1);
+            GLint loc = ::glGetAttribLocation(program, aName);
+            uint32_t ret = static_cast<uint32_t>(loc);
+            uc_reg_write(uc, UC_ARM_REG_R0, &ret);
+            return;
+        }
+
+        if (name == "glUniform1i") {
+            uint32_t loc = 0, v0 = 0;
+            uc_reg_read(uc, UC_ARM_REG_R0, &loc);
+            uc_reg_read(uc, UC_ARM_REG_R1, &v0);
+            ::glUniform1i(static_cast<GLint>(loc), static_cast<GLint>(v0));
+            return;
+        }
+
+        if (name == "glUniform1f") {
+            uint32_t loc = 0, v0Raw = 0;
+            uc_reg_read(uc, UC_ARM_REG_R0, &loc);
+            uc_reg_read(uc, UC_ARM_REG_R1, &v0Raw);
+            float fv0;
+            std::memcpy(&fv0, &v0Raw, 4);
+            ::glUniform1f(static_cast<GLint>(loc), fv0);
+            return;
+        }
+
+        if (name == "glUniform2f") {
+            uint32_t loc = 0, v0Raw = 0, v1Raw = 0;
+            uc_reg_read(uc, UC_ARM_REG_R0, &loc);
+            uc_reg_read(uc, UC_ARM_REG_R1, &v0Raw);
+            uc_reg_read(uc, UC_ARM_REG_R2, &v1Raw);
+            float fv0, fv1;
+            std::memcpy(&fv0, &v0Raw, 4);
+            std::memcpy(&fv1, &v1Raw, 4);
+            ::glUniform2f(static_cast<GLint>(loc), fv0, fv1);
+            return;
+        }
+
+        if (name == "glUniform3f") {
+            uint32_t loc = 0, v0Raw = 0, v1Raw = 0, v2Raw = 0;
+            uc_reg_read(uc, UC_ARM_REG_R0, &loc);
+            uc_reg_read(uc, UC_ARM_REG_R1, &v0Raw);
+            uc_reg_read(uc, UC_ARM_REG_R2, &v1Raw);
+            uc_reg_read(uc, UC_ARM_REG_R3, &v2Raw);
+            float fv0, fv1, fv2;
+            std::memcpy(&fv0, &v0Raw, 4);
+            std::memcpy(&fv1, &v1Raw, 4);
+            std::memcpy(&fv2, &v2Raw, 4);
+            ::glUniform3f(static_cast<GLint>(loc), fv0, fv1, fv2);
+            return;
+        }
+
+        if (name == "glUniform4f") {
+            uint32_t loc = 0, v0Raw = 0, v1Raw = 0, v2Raw = 0;
+            uc_reg_read(uc, UC_ARM_REG_R0, &loc);
+            uc_reg_read(uc, UC_ARM_REG_R1, &v0Raw);
+            uc_reg_read(uc, UC_ARM_REG_R2, &v1Raw);
+            uc_reg_read(uc, UC_ARM_REG_R3, &v2Raw);
+            uint32_t sp = 0, v3Raw = 0;
+            uc_reg_read(uc, UC_ARM_REG_SP, &sp);
+            uc_mem_read(uc, sp, &v3Raw, 4);
+            float fv0, fv1, fv2, fv3;
+            std::memcpy(&fv0, &v0Raw, 4);
+            std::memcpy(&fv1, &v1Raw, 4);
+            std::memcpy(&fv2, &v2Raw, 4);
+            std::memcpy(&fv3, &v3Raw, 4);
+            ::glUniform4f(static_cast<GLint>(loc), fv0, fv1, fv2, fv3);
+            return;
+        }
+
+        if (name == "glUniformMatrix4fv") {
+            uint32_t loc = 0, count = 0, transpose = 0, valPtr = 0;
+            uc_reg_read(uc, UC_ARM_REG_R0, &loc);
+            uc_reg_read(uc, UC_ARM_REG_R1, &count);
+            uc_reg_read(uc, UC_ARM_REG_R2, &transpose);
+            uc_reg_read(uc, UC_ARM_REG_R3, &valPtr);
+            if (count > 0 && valPtr != 0) {
+                std::vector<GLfloat> mat(count * 16);
+                uc_mem_read(uc, valPtr, mat.data(), count * 16 * sizeof(GLfloat));
+                ::glUniformMatrix4fv(static_cast<GLint>(loc), count, static_cast<GLboolean>(transpose), mat.data());
+            }
+            return;
+        }
+
+        if (name == "glEnableVertexAttribArray") {
+            uint32_t index = 0;
+            uc_reg_read(uc, UC_ARM_REG_R0, &index);
+            ::glEnableVertexAttribArray(index);
+            return;
+        }
+
+        if (name == "glDisableVertexAttribArray") {
+            uint32_t index = 0;
+            uc_reg_read(uc, UC_ARM_REG_R0, &index);
+            ::glDisableVertexAttribArray(index);
+            return;
+        }
+
+        if (name == "glVertexAttribPointer") {
+            uint32_t index = 0, size = 0, type = 0, normalized = 0;
+            uc_reg_read(uc, UC_ARM_REG_R0, &index);
+            uc_reg_read(uc, UC_ARM_REG_R1, &size);
+            uc_reg_read(uc, UC_ARM_REG_R2, &type);
+            uc_reg_read(uc, UC_ARM_REG_R3, &normalized);
+
+            uint32_t sp = 0;
+            uc_reg_read(uc, UC_ARM_REG_SP, &sp);
+            uint32_t stride = 0, pointer = 0;
+            uc_mem_read(uc, sp, &stride, 4);
+            uc_mem_read(uc, sp + 4, &pointer, 4);
+
+            ::glVertexAttribPointer(
+                index,
+                static_cast<GLint>(size),
+                static_cast<GLenum>(type),
+                static_cast<GLboolean>(normalized),
+                static_cast<GLsizei>(stride),
+                reinterpret_cast<const void*>(static_cast<uintptr_t>(pointer))
+            );
+            return;
+        }
+
+        if (name == "glDrawArrays") {
+            uint32_t mode = 0, first = 0, count = 0;
+            uc_reg_read(uc, UC_ARM_REG_R0, &mode);
+            uc_reg_read(uc, UC_ARM_REG_R1, &first);
+            uc_reg_read(uc, UC_ARM_REG_R2, &count);
+            ::glDrawArrays(static_cast<GLenum>(mode), static_cast<GLint>(first), static_cast<GLsizei>(count));
+            return;
+        }
+
+        if (name == "glDrawElements") {
+            uint32_t mode = 0, count = 0, type = 0, indices = 0;
+            uc_reg_read(uc, UC_ARM_REG_R0, &mode);
+            uc_reg_read(uc, UC_ARM_REG_R1, &count);
+            uc_reg_read(uc, UC_ARM_REG_R2, &type);
+            uc_reg_read(uc, UC_ARM_REG_R3, &indices);
+
+            GLint boundEbo = 0;
+            ::glGetIntegerv(GL_ELEMENT_ARRAY_BUFFER_BINDING, &boundEbo);
+            if (boundEbo != 0) {
+                ::glDrawElements(
+                    static_cast<GLenum>(mode),
+                    static_cast<GLsizei>(count),
+                    static_cast<GLenum>(type),
+                    reinterpret_cast<const void*>(static_cast<uintptr_t>(indices))
+                );
+            } else if (indices != 0 && count > 0) {
+                size_t elemSize = (type == GL_UNSIGNED_SHORT) ? 2 : ((type == GL_UNSIGNED_BYTE) ? 1 : 4);
+                std::vector<uint8_t> idxBuf(count * elemSize);
+                uc_mem_read(uc, indices, idxBuf.data(), idxBuf.size());
+                ::glDrawElements(static_cast<GLenum>(mode), static_cast<GLsizei>(count), static_cast<GLenum>(type), idxBuf.data());
+            }
+            return;
+        }
+
+        if (name == "glGenFramebuffers" || name == "glGenFramebuffersOES") {
+            uint32_t count = 0, ptr = 0;
+            uc_reg_read(uc, UC_ARM_REG_R0, &count);
+            uc_reg_read(uc, UC_ARM_REG_R1, &ptr);
+            if (count > 0 && ptr != 0) {
+                std::vector<GLuint> ids(count);
+                ::glGenFramebuffers(count, ids.data());
+                uc_mem_write(uc, ptr, ids.data(), count * sizeof(GLuint));
+            }
+            return;
+        }
+
+        if (name == "glBindFramebuffer" || name == "glBindFramebufferOES") {
+            uint32_t target = 0, fbo = 0;
+            uc_reg_read(uc, UC_ARM_REG_R0, &target);
+            uc_reg_read(uc, UC_ARM_REG_R1, &fbo);
+            ::glBindFramebuffer(target, fbo);
+            return;
+        }
+
+        if (name == "glGenRenderbuffers" || name == "glGenRenderbuffersOES") {
+            uint32_t count = 0, ptr = 0;
+            uc_reg_read(uc, UC_ARM_REG_R0, &count);
+            uc_reg_read(uc, UC_ARM_REG_R1, &ptr);
+            if (count > 0 && ptr != 0) {
+                std::vector<GLuint> ids(count);
+                ::glGenRenderbuffers(count, ids.data());
+                uc_mem_write(uc, ptr, ids.data(), count * sizeof(GLuint));
+            }
+            return;
+        }
+
+        if (name == "glBindRenderbuffer" || name == "glBindRenderbufferOES") {
+            uint32_t target = 0, rbo = 0;
+            uc_reg_read(uc, UC_ARM_REG_R0, &target);
+            uc_reg_read(uc, UC_ARM_REG_R1, &rbo);
+            ::glBindRenderbuffer(target, rbo);
+            return;
+        }
+
+        if (name == "glRenderbufferStorage" || name == "glRenderbufferStorageOES") {
+            uint32_t target = 0, internalformat = 0, w = 0, h = 0;
+            uc_reg_read(uc, UC_ARM_REG_R0, &target);
+            uc_reg_read(uc, UC_ARM_REG_R1, &internalformat);
+            uc_reg_read(uc, UC_ARM_REG_R2, &w);
+            uc_reg_read(uc, UC_ARM_REG_R3, &h);
+            ::glRenderbufferStorage(target, internalformat, w, h);
+            return;
+        }
+
+        if (name == "glFramebufferRenderbuffer" || name == "glFramebufferRenderbufferOES") {
+            uint32_t target = 0, attachment = 0, renderbuffertarget = 0, renderbuffer = 0;
+            uc_reg_read(uc, UC_ARM_REG_R0, &target);
+            uc_reg_read(uc, UC_ARM_REG_R1, &attachment);
+            uc_reg_read(uc, UC_ARM_REG_R2, &renderbuffertarget);
+            uc_reg_read(uc, UC_ARM_REG_R3, &renderbuffer);
+            ::glFramebufferRenderbuffer(target, attachment, renderbuffertarget, renderbuffer);
+            return;
+        }
+
+        if (name == "glFramebufferTexture2D" || name == "glFramebufferTexture2DOES") {
+            uint32_t target = 0, attachment = 0, textarget = 0, texture = 0;
+            uc_reg_read(uc, UC_ARM_REG_R0, &target);
+            uc_reg_read(uc, UC_ARM_REG_R1, &attachment);
+            uc_reg_read(uc, UC_ARM_REG_R2, &textarget);
+            uc_reg_read(uc, UC_ARM_REG_R3, &texture);
+            uint32_t sp = 0, level = 0;
+            uc_reg_read(uc, UC_ARM_REG_SP, &sp);
+            uc_mem_read(uc, sp, &level, 4);
+            ::glFramebufferTexture2D(target, attachment, textarget, texture, level);
+            return;
+        }
+
+        if (name == "glCheckFramebufferStatus" || name == "glCheckFramebufferStatusOES") {
+            uint32_t target = 0;
+            uc_reg_read(uc, UC_ARM_REG_R0, &target);
+            GLenum status = ::glCheckFramebufferStatus(target);
+            uint32_t ret = status;
+            uc_reg_write(uc, UC_ARM_REG_R0, &ret);
+            return;
+        }
+
+        if (name == "glFlush") {
+            ::glFlush();
+            return;
+        }
+
+        if (name == "glFinish") {
+            ::glFinish();
+            return;
+        }
+
+        if (name == "glGetError") {
+            uint32_t err = ::glGetError();
+            uc_reg_write(uc, UC_ARM_REG_R0, &err);
             return;
         }
 
@@ -1144,32 +1882,118 @@ void GuestRuntimeEnvironment::handleTrampolineCall(uint32_t trampolineId, uc_eng
             uc_reg_read(uc, UC_ARM_REG_R0, &pname);
             uc_reg_read(uc, UC_ARM_REG_R1, &paramsAddr);
             if (paramsAddr != 0) {
-                int32_t val[4] = {0, 0, 1920, 1080}; // Viewport default FHD
+                GLint val[4] = {0};
+                ::glGetIntegerv(static_cast<GLenum>(pname), val);
                 uc_mem_write(uc, paramsAddr, val, sizeof(val));
             }
             return;
         }
 
-        if (name == "glGetError") {
-            uint32_t noError = 0; // GL_NO_ERROR
-            uc_reg_write(uc, UC_ARM_REG_R0, &noError);
-            return;
-        }
-
-        if (name == "glGenTextures" || name == "glGenBuffers" || name == "glGenFramebuffers" || name == "glGenRenderbuffers") {
-            uint32_t count = 0, ptr = 0;
-            uc_reg_read(uc, UC_ARM_REG_R0, &count);
-            uc_reg_read(uc, UC_ARM_REG_R1, &ptr);
-            if (count > 0 && ptr != 0) {
-                static uint32_t sNextGlId = 1;
-                std::vector<uint32_t> ids(count);
-                for (uint32_t i = 0; i < count; ++i) ids[i] = sNextGlId++;
-                uc_mem_write(uc, ptr, ids.data(), count * sizeof(uint32_t));
+        if (name == "glGetString") {
+            uint32_t nameParam = 0;
+            uc_reg_read(uc, UC_ARM_REG_R0, &nameParam);
+            const char* targetStr = reinterpret_cast<const char*>(::glGetString(static_cast<GLenum>(nameParam)));
+            if (!targetStr) {
+                targetStr = "OpenGL ES 2.0 Emux32";
             }
+            uint32_t strAddr = sHeapCurrent;
+            size_t len = std::strlen(targetStr) + 1;
+            sHeapCurrent += (len + 15) & ~15U;
+            uc_mem_write(uc, strAddr, targetStr, len);
+            uc_reg_write(uc, UC_ARM_REG_R0, &strAddr);
             return;
         }
 
-        // Funzioni GLES grafiche generiche (no-op sicure per evitare crash)
+        // ==================== EGL PASSTHROUGH ====================
+        if (name == "eglSwapBuffers") {
+            GuestRuntimeEnvironment::getInstance().swapBuffers();
+            uint32_t retVal = 1; // EGL_TRUE
+            uc_reg_write(uc, UC_ARM_REG_R0, &retVal);
+            return;
+        }
+
+        if (name == "eglGetDisplay") {
+            EGLDisplay dpy = GuestRuntimeEnvironment::getInstance().getEglDisplay();
+            uint32_t ret = (dpy != EGL_NO_DISPLAY) ? static_cast<uint32_t>(reinterpret_cast<uintptr_t>(dpy)) : 1;
+            uc_reg_write(uc, UC_ARM_REG_R0, &ret);
+            return;
+        }
+
+        if (name == "eglInitialize") {
+            uint32_t majPtr = 0, minPtr = 0;
+            uc_reg_read(uc, UC_ARM_REG_R1, &majPtr);
+            uc_reg_read(uc, UC_ARM_REG_R2, &minPtr);
+            if (majPtr) { uint32_t maj = 1; uc_mem_write(uc, majPtr, &maj, 4); }
+            if (minPtr) { uint32_t min = 4; uc_mem_write(uc, minPtr, &min, 4); }
+            uint32_t ret = 1;
+            uc_reg_write(uc, UC_ARM_REG_R0, &ret);
+            return;
+        }
+
+        if (name == "eglChooseConfig") {
+            uint32_t configsPtr = 0, numConfigPtr = 0;
+            uc_reg_read(uc, UC_ARM_REG_R2, &configsPtr);
+            uc_reg_read(uc, UC_ARM_REG_R4, &numConfigPtr);
+            if (configsPtr) { uint32_t cfg = 1; uc_mem_write(uc, configsPtr, &cfg, 4); }
+            if (numConfigPtr) { uint32_t n = 1; uc_mem_write(uc, numConfigPtr, &n, 4); }
+            uint32_t ret = 1;
+            uc_reg_write(uc, UC_ARM_REG_R0, &ret);
+            return;
+        }
+
+        if (name == "eglCreateWindowSurface") {
+            EGLSurface surf = GuestRuntimeEnvironment::getInstance().getEglSurface();
+            uint32_t ret = (surf != EGL_NO_SURFACE) ? static_cast<uint32_t>(reinterpret_cast<uintptr_t>(surf)) : 1;
+            uc_reg_write(uc, UC_ARM_REG_R0, &ret);
+            return;
+        }
+
+        if (name == "eglCreateContext") {
+            EGLContext ctx = GuestRuntimeEnvironment::getInstance().getEglContext();
+            uint32_t ret = (ctx != EGL_NO_CONTEXT) ? static_cast<uint32_t>(reinterpret_cast<uintptr_t>(ctx)) : 1;
+            uc_reg_write(uc, UC_ARM_REG_R0, &ret);
+            return;
+        }
+
+        if (name == "eglMakeCurrent") {
+            uint32_t ret = 1; // EGL_TRUE
+            uc_reg_write(uc, UC_ARM_REG_R0, &ret);
+            return;
+        }
+
+        if (name == "eglGetProcAddress") {
+            uint32_t procNameAddr = 0;
+            uc_reg_read(uc, UC_ARM_REG_R0, &procNameAddr);
+            if (procNameAddr != 0) {
+                char procName[128] = {0};
+                uc_mem_read(uc, procNameAddr, procName, sizeof(procName) - 1);
+                uint32_t tramp = registerSymbolTrampoline(procName, uc);
+                LOGI("eglGetProcAddress('%s') -> 0x%08x", procName, tramp);
+                uc_reg_write(uc, UC_ARM_REG_R0, &tramp);
+                return;
+            }
+            uint32_t zero = 0;
+            uc_reg_write(uc, UC_ARM_REG_R0, &zero);
+            return;
+        }
+
+        if (name == "pthread_create") {
+            uint32_t threadPtr = 0, startRoutine = 0, arg = 0;
+            uc_reg_read(uc, UC_ARM_REG_R0, &threadPtr);
+            uc_reg_read(uc, UC_ARM_REG_R2, &startRoutine);
+            uc_reg_read(uc, UC_ARM_REG_R3, &arg);
+            static uint32_t sThreadId = 100;
+            if (threadPtr) {
+                uint32_t tid = sThreadId++;
+                uc_mem_write(uc, threadPtr, &tid, 4);
+            }
+            LOGI("pthread_create gestito: start_routine=0x%08x, arg=0x%08x", startRoutine, arg);
+            uint32_t ret = 0;
+            uc_reg_write(uc, UC_ARM_REG_R0, &ret);
+            return;
+        }
+
+        // Funzioni GLES/EGL grafiche generiche residue (no-op sicure per evitare crash)
         if (name.rfind("gl", 0) == 0 || name.rfind("egl", 0) == 0) {
             uint32_t retVal = 1;
             uc_reg_write(uc, UC_ARM_REG_R0, &retVal);

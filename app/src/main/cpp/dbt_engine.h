@@ -4,6 +4,10 @@
 #include "unicorn/unicorn.h"
 #include "unicorn/arm.h"
 
+#include <EGL/egl.h>
+#include <GLES2/gl2.h>
+#include <android/native_window.h>
+
 #include <cstdint>
 #include <memory>
 #include <string>
@@ -55,6 +59,10 @@ public:
     void setNativeSurface(ANativeWindow* window);
     bool injectTouchEvent(int action, float x, float y, int pointerId);
 
+    bool initEgl();
+    void destroyEgl();
+    void swapBuffers();
+
     PerformanceGovernor& getGovernor() { return governor_; }
     uc_engine* getUnicorn() const { return uc_; }
 
@@ -69,10 +77,16 @@ private:
     PerformanceGovernor governor_;
     ANativeWindow* nativeWindow_{nullptr};
 
+    EGLDisplay eglDisplay_{EGL_NO_DISPLAY};
+    EGLSurface eglSurface_{EGL_NO_SURFACE};
+    EGLContext eglContext_{EGL_NO_CONTEXT};
+    EGLConfig  eglConfig_{nullptr};
+
     uint32_t guestStackBase_{0x7E000000};
     uint32_t guestStackSize_{2 * 1024 * 1024}; // 2MB Stack dedicato al processo ospite
     uint32_t guestStackPointer_{0};
     bool isInitialized_{false};
+    std::atomic<bool> stopRequested_{false};
 };
 
 } // namespace emux

@@ -6,9 +6,19 @@
 #include <vector>
 #include <memory>
 #include <jni.h>
+#include <EGL/egl.h>
+#include <GLES2/gl2.h>
 #include "unicorn/unicorn.h"
 
 namespace emux {
+
+struct PerformanceGovernor;
+
+struct RegisteredNativeMethod {
+    std::string name;
+    std::string signature;
+    uint32_t fnPtr{0};
+};
 
 using jint32_t = int32_t;
 using jlong32_t = int64_t;
@@ -161,6 +171,28 @@ public:
     uint32_t registerSymbolTrampoline(const std::string& symbolName, uc_engine* uc);
     void handleTrampolineCall(uint32_t trampolineId, uc_engine* uc);
 
+    const std::vector<RegisteredNativeMethod>& getRegisteredMethods() const { return registeredMethods_; }
+    void addRegisteredMethod(const std::string& name, const std::string& sig, uint32_t fnPtr) {
+        registeredMethods_.push_back({name, sig, fnPtr});
+    }
+
+    void setEglState(EGLDisplay dpy, EGLSurface surf, EGLContext ctx, PerformanceGovernor* gov) {
+        eglDisplay_ = dpy;
+        eglSurface_ = surf;
+        eglContext_ = ctx;
+        governor_ = gov;
+    }
+
+    void swapBuffers() {
+        if (eglDisplay_ != EGL_NO_DISPLAY && eglSurface_ != EGL_NO_SURFACE) {
+            ::eglSwapBuffers(eglDisplay_, eglSurface_);
+        }
+    }
+
+    EGLDisplay getEglDisplay() const { return eglDisplay_; }
+    EGLSurface getEglSurface() const { return eglSurface_; }
+    EGLContext getEglContext() const { return eglContext_; }
+
 private:
     GuestRuntimeEnvironment();
 
@@ -173,6 +205,12 @@ private:
 
     std::unordered_map<std::string, uint32_t> symbolToTrampolineMap_;
     std::unordered_map<uint32_t, std::string> trampolineToSymbolMap_;
+
+    std::vector<RegisteredNativeMethod> registeredMethods_;
+    EGLDisplay eglDisplay_{EGL_NO_DISPLAY};
+    EGLSurface eglSurface_{EGL_NO_SURFACE};
+    EGLContext eglContext_{EGL_NO_CONTEXT};
+    PerformanceGovernor* governor_{nullptr};
 };
 
 } // namespace emux

@@ -30,6 +30,11 @@ struct ElfSegment {
     uint32_t uc_prot;
 };
 
+struct ExportedSymbol {
+    std::string name;
+    uint32_t vaddr{0};
+};
+
 struct LoadedLibrary {
     std::string path;
     uintptr_t base_address{0};
@@ -39,6 +44,7 @@ struct LoadedLibrary {
     uint32_t entry_point{0};
     uint32_t load_bias{0};
     std::vector<ElfSegment> segments;
+    std::vector<ExportedSymbol> symbols;
     std::vector<uint8_t> raw_binary;
     bool is_pie{false};
 

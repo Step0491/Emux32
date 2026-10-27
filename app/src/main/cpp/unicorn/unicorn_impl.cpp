@@ -82,6 +82,48 @@ struct UnicornInstance {
     uint32_t cpsr{0x00000010};
     uint32_t fpscr{0};
 
+    // Registri VFP (32 registri singola precisione s0..s31, e 16 registri doppia precisione estesi d16..d31)
+    uint32_t vfp_s[32]{0};
+    uint64_t vfp_d_ext[16]{0};
+
+    inline float getVfpS(uint32_t regIdx) const {
+        if (regIdx >= 32) return 0.0f;
+        float val;
+        std::memcpy(&val, &vfp_s[regIdx], 4);
+        return val;
+    }
+
+    inline void setVfpS(uint32_t regIdx, float val) {
+        if (regIdx < 32) {
+            std::memcpy(&vfp_s[regIdx], &val, 4);
+        }
+    }
+
+    inline double getVfpD(uint32_t regIdx) const {
+        if (regIdx < 16) {
+            uint64_t raw = (static_cast<uint64_t>(vfp_s[regIdx * 2 + 1]) << 32) | vfp_s[regIdx * 2];
+            double val;
+            std::memcpy(&val, &raw, 8);
+            return val;
+        } else if (regIdx < 32) {
+            double val;
+            std::memcpy(&val, &vfp_d_ext[regIdx - 16], 8);
+            return val;
+        }
+        return 0.0;
+    }
+
+    inline void setVfpD(uint32_t regIdx, double val) {
+        uint64_t raw;
+        std::memcpy(&raw, &val, 8);
+        if (regIdx < 16) {
+            vfp_s[regIdx * 2] = static_cast<uint32_t>(raw & 0xFFFFFFFFU);
+            vfp_s[regIdx * 2 + 1] = static_cast<uint32_t>(raw >> 32);
+        } else if (regIdx < 32) {
+            vfp_d_ext[regIdx - 16] = raw;
+        }
+    }
+
     // Mappe memoria virtuale guest
     std::vector<MemoryRegion> regions;
     std::mutex mem_mutex;
@@ -246,6 +288,16 @@ uc_err uc_reg_read(uc_engine *uc, int regid, void *value) {
         *reinterpret_cast<uint32_t*>(value) = inst->cpsr;
         return UC_ERR_OK;
     }
+    if (regid >= UC_ARM_REG_D0 && regid <= UC_ARM_REG_D31) {
+        uint32_t dIdx = regid - UC_ARM_REG_D0;
+        double dVal = inst->getVfpD(dIdx);
+        std::memcpy(value, &dVal, 8);
+        return UC_ERR_OK;
+    }
+    if (regid == UC_ARM_REG_FPSCR || regid == UC_ARM_REG_FPSCR_NZCV) {
+        *reinterpret_cast<uint32_t*>(value) = inst->fpscr;
+        return UC_ERR_OK;
+    }
 
     return UC_ERR_ARG;
 }
@@ -273,6 +325,17 @@ uc_err uc_reg_write(uc_engine *uc, int regid, const void *value) {
     }
     if (regid == UC_ARM_REG_CPSR) {
         inst->cpsr = val;
+        return UC_ERR_OK;
+    }
+    if (regid >= UC_ARM_REG_D0 && regid <= UC_ARM_REG_D31) {
+        uint32_t dIdx = regid - UC_ARM_REG_D0;
+        double dVal = 0.0;
+        std::memcpy(&dVal, value, 8);
+        inst->setVfpD(dIdx, dVal);
+        return UC_ERR_OK;
+    }
+    if (regid == UC_ARM_REG_FPSCR || regid == UC_ARM_REG_FPSCR_NZCV) {
+        inst->fpscr = *reinterpret_cast<const uint32_t*>(value);
         return UC_ERR_OK;
     }
 
@@ -686,17 +749,267 @@ uc_err uc_emu_start(uc_engine *uc, uint64_t begin, uint64_t until, uint64_t time
                 continue;
             }
 
+            // 7. VFP / NEON Instructions (CP10 e CP11)
+            // 7a. VMRS / VMSR
+            if ((insn & 0x0FFF0FFF) == 0x0EF10A10) {
+                // VMRS APSR_nzcv, FPSCR (0xEEF1FA10)
+                inst->cpsr = (inst->cpsr & ~0xF0000000U) | (inst->fpscr & 0xF0000000U);
+                inst->regs[15] += 4;
+                instructionsExecuted++;
+                continue;
+            }
+            if ((insn & 0x0FF00FFF) == 0x0EF00A10) { // VMRS Rt, FPSCR
+                uint32_t rt = (insn >> 12) & 0xF;
+                if (rt != 15) inst->regs[rt] = inst->fpscr;
+                inst->regs[15] += 4;
+                instructionsExecuted++;
+                continue;
+            }
+            if ((insn & 0x0FF00FFF) == 0x0EE00A10) { // VMSR FPSCR, Rt
+                uint32_t rt = (insn >> 12) & 0xF;
+                inst->fpscr = inst->regs[rt];
+                inst->regs[15] += 4;
+                instructionsExecuted++;
+                continue;
+            }
+
+            // 7b. VMOV core <-> single
+            if ((insn & 0x0FE00FD0) == 0x0E000A10) {
+                bool isToCore = (insn & (1 << 20)) != 0;
+                uint32_t vn = (insn >> 16) & 0xF;
+                uint32_t rt = (insn >> 12) & 0xF;
+                uint32_t n = (insn >> 7) & 1;
+                uint32_t sn = (vn << 1) | n;
+                if (isToCore) {
+                    inst->regs[rt] = inst->vfp_s[sn];
+                } else {
+                    inst->vfp_s[sn] = inst->regs[rt];
+                }
+                inst->regs[15] += 4;
+                instructionsExecuted++;
+                continue;
+            }
+
+            // 7c. VMOV core pair <-> double / two singles
+            if ((insn & 0x0FE00FD0) == 0x0C400A10 || (insn & 0x0FE00FD0) == 0x0C400B10) {
+                bool isToCore = (insn & (1 << 20)) != 0;
+                uint32_t rt = (insn >> 12) & 0xF;
+                uint32_t rt2 = (insn >> 16) & 0xF;
+                uint32_t vm = insn & 0xF;
+                uint32_t sBase = vm * 2;
+                if (isToCore) {
+                    inst->regs[rt] = inst->vfp_s[sBase];
+                    inst->regs[rt2] = inst->vfp_s[sBase + 1];
+                } else {
+                    inst->vfp_s[sBase] = inst->regs[rt];
+                    inst->vfp_s[sBase + 1] = inst->regs[rt2];
+                }
+                inst->regs[15] += 4;
+                instructionsExecuted++;
+                continue;
+            }
+
+            // 7d. VLDR / VSTR (Single / Double) & VPUSH / VPOP
+            if (((insn & 0x0E200F00) == 0x0D000A00) || ((insn & 0x0E200F00) == 0x0D000B00)) {
+                bool isDouble = ((insn >> 8) & 1) != 0;
+                bool isLoad = (insn & (1 << 20)) != 0;
+                bool writeBack = (insn & (1 << 21)) != 0;
+                bool up = (insn & (1 << 23)) != 0;
+                uint32_t rn = (insn >> 16) & 0xF;
+                uint32_t vd = (insn >> 12) & 0xF;
+                uint32_t d = (insn >> 22) & 1;
+                uint32_t imm8 = insn & 0xFF;
+
+                uint32_t base = (rn == 15) ? (pc + 8) : inst->regs[rn];
+
+                if (writeBack) {
+                    // VPUSH / VPOP (VSTM / VLDM)
+                    uint32_t count = imm8; // numero di registri 32-bit
+                    if (isDouble) count /= 2;
+                    uint32_t bytesTotal = count * (isDouble ? 8 : 4);
+                    uint32_t curAddr = up ? base : (base - bytesTotal);
+
+                    for (uint32_t idx = 0; idx < count; ++idx) {
+                        if (!isDouble) {
+                            uint32_t regIdx = ((vd << 1) | d) + idx;
+                            if (regIdx < 32) {
+                                if (isLoad) inst->vfp_s[regIdx] = inst->readU32(curAddr);
+                                else inst->writeU32(curAddr, inst->vfp_s[regIdx]);
+                            }
+                            curAddr += 4;
+                        } else {
+                            uint32_t regIdx = ((d << 4) | vd) + idx;
+                            if (regIdx < 32) {
+                                if (isLoad) {
+                                    uint32_t lo = inst->readU32(curAddr);
+                                    uint32_t hi = inst->readU32(curAddr + 4);
+                                    uint64_t raw = (static_cast<uint64_t>(hi) << 32) | lo;
+                                    inst->setVfpD(regIdx, *reinterpret_cast<double*>(&raw));
+                                } else {
+                                    double dval = inst->getVfpD(regIdx);
+                                    uint64_t raw = *reinterpret_cast<uint64_t*>(&dval);
+                                    inst->writeU32(curAddr, static_cast<uint32_t>(raw & 0xFFFFFFFFU));
+                                    inst->writeU32(curAddr + 4, static_cast<uint32_t>(raw >> 32));
+                                }
+                            }
+                            curAddr += 8;
+                        }
+                    }
+
+                    if (up) inst->regs[rn] += bytesTotal;
+                    else inst->regs[rn] -= bytesTotal;
+                } else {
+                    // VLDR / VSTR singolo
+                    uint32_t offset = imm8 * 4;
+                    uint32_t effAddr = up ? (base + offset) : (base - offset);
+
+                    if (!isDouble) {
+                        uint32_t regIdx = (vd << 1) | d;
+                        if (regIdx < 32) {
+                            if (isLoad) inst->vfp_s[regIdx] = inst->readU32(effAddr);
+                            else inst->writeU32(effAddr, inst->vfp_s[regIdx]);
+                        }
+                    } else {
+                        uint32_t regIdx = (d << 4) | vd;
+                        if (regIdx < 32) {
+                            if (isLoad) {
+                                uint32_t lo = inst->readU32(effAddr);
+                                uint32_t hi = inst->readU32(effAddr + 4);
+                                uint64_t raw = (static_cast<uint64_t>(hi) << 32) | lo;
+                                inst->setVfpD(regIdx, *reinterpret_cast<double*>(&raw));
+                            } else {
+                                double dval = inst->getVfpD(regIdx);
+                                uint64_t raw = *reinterpret_cast<uint64_t*>(&dval);
+                                inst->writeU32(effAddr, static_cast<uint32_t>(raw & 0xFFFFFFFFU));
+                                inst->writeU32(effAddr + 4, static_cast<uint32_t>(raw >> 32));
+                            }
+                        }
+                    }
+                }
+
+                inst->regs[15] += 4;
+                instructionsExecuted++;
+                continue;
+            }
+
+            // 7e. VADD.F32, VSUB.F32, VMUL.F32, VDIV.F32
+            if ((insn & 0x0E000E00) == 0x0E000A00) {
+                uint32_t d = (insn >> 22) & 1;
+                uint32_t n = (insn >> 7) & 1;
+                uint32_t m = (insn >> 5) & 1;
+                uint32_t sd = (((insn >> 12) & 0xF) << 1) | d;
+                uint32_t sn = (((insn >> 16) & 0xF) << 1) | n;
+                uint32_t sm = ((insn & 0xF) << 1) | m;
+
+                float a = inst->getVfpS(sn);
+                float b = inst->getVfpS(sm);
+                float res = 0.0f;
+
+                if ((insn & 0x0F300F50) == 0x0E300A00) res = a + b;           // VADD.F32
+                else if ((insn & 0x0F300F50) == 0x0E300A40) res = a - b;      // VSUB.F32
+                else if ((insn & 0x0F300F50) == 0x0E200A00) res = a * b;      // VMUL.F32
+                else if ((insn & 0x0F300F50) == 0x0E800A00) res = (b != 0.0f) ? (a / b) : 0.0f; // VDIV.F32
+                else res = a;
+
+                inst->setVfpS(sd, res);
+                inst->regs[15] += 4;
+                instructionsExecuted++;
+                continue;
+            }
+
+            // 7f. VCMP.F32
+            if ((insn & 0x0FF00FD0) == 0x0EB40A40 || (insn & 0x0FF00FD0) == 0x0EB50A40) {
+                bool withZero = (insn & (1 << 16)) != 0;
+                uint32_t d = (insn >> 22) & 1;
+                uint32_t m = (insn >> 5) & 1;
+                uint32_t sd = (((insn >> 12) & 0xF) << 1) | d;
+                uint32_t sm = ((insn & 0xF) << 1) | m;
+
+                float fa = inst->getVfpS(sd);
+                float fb = withZero ? 0.0f : inst->getVfpS(sm);
+
+                inst->fpscr &= ~0xF0000000U;
+                if (fa == fb) inst->fpscr |= (FLAG_Z | FLAG_C);
+                else if (fa < fb) inst->fpscr |= FLAG_N;
+                else inst->fpscr |= FLAG_C;
+
+                inst->regs[15] += 4;
+                instructionsExecuted++;
+                continue;
+            }
+
+            // 8. MUL / MLA
+            if ((insn & 0x0FC000F0) == 0x00000090) { // MUL Rd, Rm, Rs
+                uint32_t rd = (insn >> 16) & 0xF;
+                uint32_t rs = (insn >> 8) & 0xF;
+                uint32_t rm = insn & 0xF;
+                inst->regs[rd] = inst->regs[rm] * inst->regs[rs];
+                inst->regs[15] += 4;
+                instructionsExecuted++;
+                continue;
+            }
+            if ((insn & 0x0FC000F0) == 0x00200090) { // MLA Rd, Rm, Rs, Rn
+                uint32_t rd = (insn >> 16) & 0xF;
+                uint32_t rn = (insn >> 12) & 0xF;
+                uint32_t rs = (insn >> 8) & 0xF;
+                uint32_t rm = insn & 0xF;
+                inst->regs[rd] = (inst->regs[rm] * inst->regs[rs]) + inst->regs[rn];
+                inst->regs[15] += 4;
+                instructionsExecuted++;
+                continue;
+            }
+
             // Fallback avanzamento PC ARM standard
             inst->regs[15] += 4;
             instructionsExecuted++;
         } else {
-            // ==================== DECODIFICA & ESECUZIONE THUMB (16-bit) ====================
+            // ==================== DECODIFICA & ESECUZIONE THUMB ====================
             uint16_t tInsn = 0;
             uc_err tReadErr = inst->readMem(pc, &tInsn, 2);
             if (tReadErr != UC_ERR_OK) {
                 LOGE("uc_emu_start [Thumb]: Fault lettura istruzione al PC=0x%08x", pc);
                 inst->is_running.store(false);
                 return tReadErr;
+            }
+
+            // Verifica istruzione Thumb a 32-bit (Thumb-2)
+            bool isThumb32 = ((tInsn & 0xF800) == 0xE800) || ((tInsn & 0xF000) == 0xF000);
+            if (isThumb32) {
+                uint16_t tInsn2 = 0;
+                inst->readMem(pc + 2, &tInsn2, 2);
+
+                // Thumb-2 BL / BLX
+                if ((tInsn & 0xF800) == 0xF000 && (tInsn2 & 0xD000) == 0xD000) {
+                    uint32_t s = (tInsn >> 10) & 1;
+                    uint32_t imm10 = tInsn & 0x3FF;
+                    uint32_t j1 = (tInsn2 >> 13) & 1;
+                    uint32_t j2 = (tInsn2 >> 11) & 1;
+                    uint32_t imm11 = tInsn2 & 0x7FF;
+
+                    uint32_t i1 = !(j1 ^ s);
+                    uint32_t i2 = !(j2 ^ s);
+                    int32_t offset = (s << 24) | (i1 << 23) | (i2 << 22) | (imm10 << 12) | (imm11 << 1);
+                    if (s) offset |= 0xFE000000;
+
+                    bool isBlx = (tInsn2 & (1 << 12)) == 0;
+                    inst->regs[14] = (pc + 4) | 1U;
+
+                    uint32_t target = pc + 4 + offset;
+                    if (isBlx) {
+                        inst->cpsr &= ~FLAG_T;
+                        inst->regs[15] = target & ~3U;
+                    } else {
+                        inst->cpsr |= FLAG_T;
+                        inst->regs[15] = target & ~1U;
+                    }
+                    instructionsExecuted++;
+                    continue;
+                }
+
+                // Per qualsiasi altra istruzione Thumb-2 (inclusi VFP a 32-bit), avanziamo di 4 byte
+                inst->regs[15] += 4;
+                instructionsExecuted++;
+                continue;
             }
 
             // 1. Thumb PUSH (0xB400 / 0xB500) & POP (0xBC00 / 0xBD00)
@@ -823,12 +1136,6 @@ uc_err uc_emu_start(uc_engine *uc, uint64_t begin, uint64_t until, uint64_t time
             // Fallback avanzamento PC Thumb standard (2 byte)
             inst->regs[15] += 2;
             instructionsExecuted++;
-        }
-
-        // Limite di guardia cicli
-        if (instructionsExecuted >= 5000000) {
-            LOGI("uc_emu_start: Raggiunto limite cicli protetto (5M istruzioni).");
-            break;
         }
     }
 
