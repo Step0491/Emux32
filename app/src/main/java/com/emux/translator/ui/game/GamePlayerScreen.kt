@@ -39,8 +39,14 @@ fun GamePlayerScreen(
     onExitGame: () -> Unit,
     onShowLogs: () -> Unit = {}
 ) {
-    var showHud by remember { mutableStateOf(false) }
+    var showHud by remember { mutableStateOf(true) }
     val context = LocalContext.current
+
+    // Mostra l'HUD informativa per 4 secondi all'avvio, poi sfuma per lasciare il fullscreen
+    LaunchedEffect(Unit) {
+        kotlinx.coroutines.delay(4000)
+        showHud = false
+    }
 
     // Modalità Immersiva Fullscreen completa (nasconde Navigation Bar e Status Bar)
     DisposableEffect(Unit) {

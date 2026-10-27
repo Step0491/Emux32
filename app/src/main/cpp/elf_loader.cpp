@@ -97,6 +97,98 @@ bool LoadedLibrary::applyRelocations(uc_engine* uc) const {
     }
 
     const auto* ehdr = reinterpret_cast<const Elf32_Ehdr*>(raw_binary.data());
+    size_t totalRelocsApplied = 0;
+
+    auto vaddrToPtr = [this](uint32_t vaddr) -> const uint8_t* {
+        for (const auto& seg : segments) {
+            if (vaddr >= seg.vaddr && vaddr < (seg.vaddr + seg.filesz)) {
+                size_t off = seg.offset + (vaddr - seg.vaddr);
+                if (off < raw_binary.size()) return raw_binary.data() + off;
+            }
+        }
+        return nullptr;
+    };
+
+    // 1. TENTATIVO VIA PT_DYNAMIC (Essenziale per binari Android di produzione stripped)
+    const Elf32_Phdr* phdrTable = (ehdr->e_phoff + (ehdr->e_phnum * sizeof(Elf32_Phdr)) <= raw_binary.size())
+        ? reinterpret_cast<const Elf32_Phdr*>(raw_binary.data() + ehdr->e_phoff)
+        : nullptr;
+
+    const Elf32_Phdr* dynPhdr = nullptr;
+    if (phdrTable) {
+        for (uint16_t i = 0; i < ehdr->e_phnum; ++i) {
+            if (phdrTable[i].p_type == PT_DYNAMIC) {
+                dynPhdr = &phdrTable[i];
+                break;
+            }
+        }
+    }
+
+    if (dynPhdr && (dynPhdr->p_offset + dynPhdr->p_filesz <= raw_binary.size())) {
+        const auto* dyn = reinterpret_cast<const Elf32_Dyn*>(raw_binary.data() + dynPhdr->p_offset);
+        size_t numDyn = dynPhdr->p_filesz / sizeof(Elf32_Dyn);
+        uint32_t relVaddr = 0, relSz = 0, jmpRelVaddr = 0, jmpRelSz = 0;
+        uint32_t symtabVaddr = 0, strtabVaddr = 0, strtabSz = 0;
+
+        for (size_t d = 0; d < numDyn && dyn[d].d_tag != DT_NULL; ++d) {
+            switch (dyn[d].d_tag) {
+                case DT_REL: relVaddr = dyn[d].d_un.d_ptr; break;
+                case DT_RELSZ: relSz = dyn[d].d_un.d_val; break;
+                case DT_JMPREL: jmpRelVaddr = dyn[d].d_un.d_ptr; break;
+                case DT_PLTRELSZ: jmpRelSz = dyn[d].d_un.d_val; break;
+                case DT_SYMTAB: symtabVaddr = dyn[d].d_un.d_ptr; break;
+                case DT_STRTAB: strtabVaddr = dyn[d].d_un.d_ptr; break;
+                case DT_STRSZ: strtabSz = dyn[d].d_un.d_val; break;
+            }
+        }
+
+        const char* dynstr = strtabVaddr ? reinterpret_cast<const char*>(vaddrToPtr(strtabVaddr)) : nullptr;
+        const auto* symtab = symtabVaddr ? reinterpret_cast<const Elf32_Sym*>(vaddrToPtr(symtabVaddr)) : nullptr;
+
+        auto processRelTable = [&](uint32_t tblVaddr, uint32_t tblSz) {
+            if (!tblVaddr || !tblSz) return;
+            const auto* rels = reinterpret_cast<const Elf32_Rel*>(vaddrToPtr(tblVaddr));
+            if (!rels) return;
+            size_t count = tblSz / sizeof(Elf32_Rel);
+
+            for (size_t r = 0; r < count; ++r) {
+                const auto& rel = rels[r];
+                uint32_t type = ELF32_R_TYPE(rel.r_info);
+                uint32_t symIdx = ELF32_R_SYM(rel.r_info);
+                uint64_t targetAddr = load_bias + rel.r_offset;
+
+                if (type == 23) { // R_ARM_RELATIVE
+                    uint32_t addend = 0;
+                    uc_mem_read(uc, targetAddr, &addend, sizeof(addend));
+                    uint32_t relocated = load_bias + addend;
+                    uc_mem_write(uc, targetAddr, &relocated, sizeof(relocated));
+                    totalRelocsApplied++;
+                } else if (type == 21 || type == 22 || type == 2) { // R_ARM_GLOB_DAT, R_ARM_JUMP_SLOT, R_ARM_ABS32
+                    if (symtab && dynstr) {
+                        const auto& sym = symtab[symIdx];
+                        if (strtabSz == 0 || sym.st_name < strtabSz) {
+                            const char* symName = dynstr + sym.st_name;
+                            if (symName && symName[0] != '\0') {
+                                uint32_t tramp = GuestRuntimeEnvironment::getInstance().registerSymbolTrampoline(symName, uc);
+                                uc_mem_write(uc, targetAddr, &tramp, sizeof(tramp));
+                                totalRelocsApplied++;
+                            }
+                        }
+                    }
+                }
+            }
+        };
+
+        processRelTable(relVaddr, relSz);
+        processRelTable(jmpRelVaddr, jmpRelSz);
+
+        if (totalRelocsApplied > 0) {
+            LOGI("applyRelocations (via PT_DYNAMIC) per [%s]: %zu simboli rilocati con successo.",
+                 path.c_str(), totalRelocsApplied);
+            return true;
+        }
+    }
+
     if (ehdr->e_shoff == 0 || ehdr->e_shnum == 0) {
         LOGI("applyRelocations: Nessuna tabella sezioni presente, rilocazioni statiche");
         return true;
@@ -233,7 +325,66 @@ uint32_t Elf32Loader::convertElfFlagsToUcProt(uint32_t p_flags) const {
 }
 
 uint32_t Elf32Loader::findJniOnLoadSymbol(const uint8_t* buffer, size_t bufferSize, const Elf32_Ehdr& ehdr) const {
-    if (!buffer || bufferSize == 0 || ehdr.e_shoff == 0 || ehdr.e_shnum == 0) {
+    if (!buffer || bufferSize < sizeof(Elf32_Ehdr)) {
+        return 0;
+    }
+
+    // 1. TENTATIVO VIA PROGRAM HEADER PT_DYNAMIC (Garantito per binari Android commerciali stripped)
+    if (ehdr.e_phoff != 0 && ehdr.e_phnum != 0 && (ehdr.e_phoff + (ehdr.e_phnum * sizeof(Elf32_Phdr)) <= bufferSize)) {
+        const auto* phdrTable = reinterpret_cast<const Elf32_Phdr*>(buffer + ehdr.e_phoff);
+        const Elf32_Phdr* dynPhdr = nullptr;
+        for (uint16_t i = 0; i < ehdr.e_phnum; ++i) {
+            if (phdrTable[i].p_type == PT_DYNAMIC) {
+                dynPhdr = &phdrTable[i];
+                break;
+            }
+        }
+
+        if (dynPhdr && (dynPhdr->p_offset + dynPhdr->p_filesz <= bufferSize)) {
+            const auto* dyn = reinterpret_cast<const Elf32_Dyn*>(buffer + dynPhdr->p_offset);
+            size_t numDyn = dynPhdr->p_filesz / sizeof(Elf32_Dyn);
+            uint32_t symtabVaddr = 0, strtabVaddr = 0, strtabSz = 0;
+
+            for (size_t d = 0; d < numDyn && dyn[d].d_tag != DT_NULL; ++d) {
+                if (dyn[d].d_tag == DT_SYMTAB) symtabVaddr = dyn[d].d_un.d_ptr;
+                else if (dyn[d].d_tag == DT_STRTAB) strtabVaddr = dyn[d].d_un.d_ptr;
+                else if (dyn[d].d_tag == DT_STRSZ) strtabSz = dyn[d].d_un.d_val;
+            }
+
+            auto vaddrToBuf = [&](uint32_t vaddr) -> const uint8_t* {
+                for (uint16_t i = 0; i < ehdr.e_phnum; ++i) {
+                    const auto& ph = phdrTable[i];
+                    if (ph.p_type == PT_LOAD && vaddr >= ph.p_vaddr && vaddr < (ph.p_vaddr + ph.p_filesz)) {
+                        size_t off = ph.p_offset + (vaddr - ph.p_vaddr);
+                        if (off < bufferSize) return buffer + off;
+                    }
+                }
+                return nullptr;
+            };
+
+            const char* dynstr = strtabVaddr ? reinterpret_cast<const char*>(vaddrToBuf(strtabVaddr)) : nullptr;
+            const auto* syms = symtabVaddr ? reinterpret_cast<const Elf32_Sym*>(vaddrToBuf(symtabVaddr)) : nullptr;
+
+            if (dynstr && syms) {
+                for (size_t i = 0; i < 4096; ++i) {
+                    if (strtabSz > 0 && syms[i].st_name >= strtabSz) break;
+                    const char* symName = dynstr + syms[i].st_name;
+                    if (!symName || symName[0] == '\0') continue;
+
+                    if (std::strcmp(symName, "JNI_OnLoad") == 0) {
+                        LOGI("PT_DYNAMIC: Trovato 'JNI_OnLoad' a 0x%08x", syms[i].st_value);
+                        return syms[i].st_value;
+                    }
+                    if (std::strcmp(symName, "ANativeActivity_onCreate") == 0) {
+                        LOGI("PT_DYNAMIC: Trovato 'ANativeActivity_onCreate' a 0x%08x", syms[i].st_value);
+                        return syms[i].st_value;
+                    }
+                }
+            }
+        }
+    }
+
+    if (ehdr.e_shoff == 0 || ehdr.e_shnum == 0) {
         return 0;
     }
 
@@ -409,7 +560,16 @@ std::shared_ptr<LoadedLibrary> Elf32Loader::loadFromMemory(
         if (jniOnLoad != 0) {
             loadedLib->entry_point = loadedLib->load_bias + jniOnLoad;
         } else {
-            loadedLib->entry_point = loadedLib->load_bias + loadSegments[0].vaddr;
+            uint32_t execVaddr = 0;
+            for (const auto& seg : loadSegments) {
+                if (seg.flags & PF_X) {
+                    execVaddr = seg.vaddr;
+                    break;
+                }
+            }
+            loadedLib->entry_point = loadedLib->load_bias + (execVaddr != 0 ? execVaddr : loadSegments[0].vaddr);
+            LOGW("JNI_OnLoad non trovato in %s: punto di ingresso impostato a segmento eseguibile 0x%08x",
+                 name.c_str(), loadedLib->entry_point);
         }
     }
 

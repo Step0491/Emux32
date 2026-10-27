@@ -85,14 +85,20 @@ class MainActivity : ComponentActivity() {
         EmuxLogger.startLogcatCapture(lifecycleScope)
         EmuxLogger.i("Emux32", "Emux32 avviato su Android SDK ${Build.VERSION.SDK_INT}. Cartella storage: ${emuxDir.absolutePath}")
 
-        NativeEngine.nativeSetStoragePath(emuxDir.absolutePath)
-
-        val initialized = NativeEngine.nativeInitEngine(512)
-        if (!initialized) {
-            EmuxLogger.e("Emux32", "Inizializzazione nativa iniziale dell'engine fallita.")
-            Toast.makeText(this, "Inizializzazione Engine ARM32 fallita", Toast.LENGTH_LONG).show()
-        } else {
-            EmuxLogger.i("Emux32", "Unicorn ARM32 DBT Engine pre-inizializzato (512 MB guest RAM).")
+        // GESTIONE DELLA CONCORRENZA (DIRETTIVA 1): Inizializzazione asincrona isolata su Dispatchers.IO.
+        // Mai bloccare o eseguire chiamate JNI pesanti all'interno di onCreate() sul Main Thread.
+        lifecycleScope.launch(Dispatchers.IO) {
+            try {
+                NativeEngine.nativeSetStoragePath(emuxDir.absolutePath)
+                val initialized = NativeEngine.nativeInitEngine(512)
+                if (initialized) {
+                    EmuxLogger.i("Emux32", "Unicorn ARM32 DBT Engine pre-inizializzato con successo (512 MB guest RAM).")
+                } else {
+                    EmuxLogger.w("Emux32", "Pre-inizializzazione Unicorn differita all'avvio del titolo.")
+                }
+            } catch (t: Throwable) {
+                EmuxLogger.e("Emux32", "Eccezione durante pre-inizializzazione JNI asincrona: ${t.message}")
+            }
         }
 
         setContent {
