@@ -1,5 +1,6 @@
 #include "linker_hook.h"
 #include "elf_loader.h"
+#include "core/syscall_thunker.h"
 #include "unicorn/arm.h"
 
 #include <EGL/egl.h>
@@ -466,15 +467,18 @@ int32_t SyscallDispatcher::handleSyscall(
         }
         case ARM_NR_munmap:
         case ARM_NR_mprotect:
-        case ARM_NR_nanosleep:
         case ARM_NR_prctl:
-        case ARM_NR_futex:
         case 174: // rt_sigaction
         case 175: // rt_sigprocmask
         case 186: // sigaltstack
         case 238: // tkill
         case 268: // tgkill
             return 0;
+        case ARM_NR_nanosleep:
+        case ARM_NR_futex:
+        case 145: // readv
+        case 146: // writev:
+            return SyscallThunker::dispatch(uc, sysno, r0, r1, r2, r3, r4, r5);
         case ARM_NR_sched_yield:
             sched_yield();
             return 0;

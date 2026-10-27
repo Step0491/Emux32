@@ -10,6 +10,8 @@ add_library(
     emux_engine
     SHARED
     core/guest_memory.cpp
+    core/tb_cache.cpp
+    core/syscall_thunker.cpp
     unicorn/unicorn_impl.cpp
     elf_loader.cpp
     linker_hook.cpp
