@@ -4,6 +4,7 @@
 #include "core/audio_thunker.h"
 #include "core/guest_thread.h"
 #include "core/guest_memory.h"
+#include "core/gles_virtualizer.h"
 #include "unicorn/arm.h"
 
 #include <EGL/egl.h>
@@ -3031,11 +3032,19 @@ void GuestRuntimeEnvironment::handleTrampolineCall(uint32_t trampolineId, uc_eng
     if (name == "glEnable" || name == "glDisable" || name == "glIsEnabled") {
         uint32_t cap = 0;
         uc_reg_read(uc, UC_ARM_REG_R0, &cap);
-        if (name == "glEnable") glEnable(static_cast<GLenum>(cap));
-        else if (name == "glDisable") glDisable(static_cast<GLenum>(cap));
-        else {
-            uint32_t res = glIsEnabled(static_cast<GLenum>(cap));
-            uc_reg_write(uc, UC_ARM_REG_R0, &res);
+        if (name == "glIsEnabled") {
+            uint32_t res = 0;
+            if (GlesVirtualizer::getInstance().handleIsEnabled(static_cast<GLenum>(cap), res)) {
+                uc_reg_write(uc, UC_ARM_REG_R0, &res);
+            } else {
+                uint32_t hostRes = glIsEnabled(static_cast<GLenum>(cap));
+                uc_reg_write(uc, UC_ARM_REG_R0, &hostRes);
+            }
+        } else {
+            if (!GlesVirtualizer::getInstance().handleEnableDisable(name, static_cast<GLenum>(cap))) {
+                if (name == "glEnable") glEnable(static_cast<GLenum>(cap));
+                else glDisable(static_cast<GLenum>(cap));
+            }
         }
         return;
     }
@@ -3098,7 +3107,10 @@ void GuestRuntimeEnvironment::handleTrampolineCall(uint32_t trampolineId, uc_eng
         uc_reg_read(uc, UC_ARM_REG_R0, &target);
         uc_reg_read(uc, UC_ARM_REG_R1, &id);
         if (name == "glBindTexture") glBindTexture(target, id);
-        else if (name == "glBindBuffer") glBindBuffer(target, id);
+        else if (name == "glBindBuffer") {
+            GlesVirtualizer::getInstance().notifyBindBuffer(target, id);
+            glBindBuffer(target, id);
+        }
         else if (name.rfind("glBindFramebuffer", 0) == 0) glBindFramebuffer(target, id);
         else glBindRenderbuffer(target, id);
         return;
@@ -3446,8 +3458,13 @@ void GuestRuntimeEnvironment::handleTrampolineCall(uint32_t trampolineId, uc_eng
     if (name == "glEnableVertexAttribArray" || name == "glDisableVertexAttribArray") {
         uint32_t idx = 0;
         uc_reg_read(uc, UC_ARM_REG_R0, &idx);
-        if (name == "glEnableVertexAttribArray") glEnableVertexAttribArray(idx);
-        else glDisableVertexAttribArray(idx);
+        if (name == "glEnableVertexAttribArray") {
+            GlesVirtualizer::getInstance().enableVertexAttribArray(idx);
+            glEnableVertexAttribArray(idx);
+        } else {
+            GlesVirtualizer::getInstance().disableVertexAttribArray(idx);
+            glDisableVertexAttribArray(idx);
+        }
         return;
     }
     if (name == "glVertexAttribPointer") {
@@ -3460,18 +3477,9 @@ void GuestRuntimeEnvironment::handleTrampolineCall(uint32_t trampolineId, uc_eng
         uc_mem_read(uc, sp + 0, &stride, 4);
         uc_mem_read(uc, sp + 4, &ptr, 4);
 
-        GLint boundVbo = 0;
-        glGetIntegerv(GL_ARRAY_BUFFER_BINDING, &boundVbo);
-        if (boundVbo != 0) {
-            glVertexAttribPointer(idx, static_cast<GLint>(size), type, static_cast<GLboolean>(norm),
-                                  static_cast<GLsizei>(stride), reinterpret_cast<const void*>(static_cast<uintptr_t>(ptr)));
-        } else if (ptr != 0 && idx < 16) {
-            static std::vector<uint8_t> sClientAttribBuffers[16];
-            sClientAttribBuffers[idx].resize(65536);
-            uc_mem_read(uc, ptr, sClientAttribBuffers[idx].data(), 65536);
-            glVertexAttribPointer(idx, static_cast<GLint>(size), type, static_cast<GLboolean>(norm),
-                                  static_cast<GLsizei>(stride), sClientAttribBuffers[idx].data());
-        }
+        GlesVirtualizer::getInstance().setVertexAttribPointer(idx, static_cast<GLint>(size), type,
+                                                              static_cast<GLboolean>(norm),
+                                                              static_cast<GLsizei>(stride), ptr);
         return;
     }
     if (name == "glDrawArrays") {
@@ -3483,7 +3491,7 @@ void GuestRuntimeEnvironment::handleTrampolineCall(uint32_t trampolineId, uc_eng
         uc_reg_read(uc, UC_ARM_REG_R0, &mode);
         uc_reg_read(uc, UC_ARM_REG_R1, &first);
         uc_reg_read(uc, UC_ARM_REG_R2, &count);
-        glDrawArrays(mode, static_cast<GLint>(first), static_cast<GLsizei>(count));
+        GlesVirtualizer::getInstance().drawArrays(mode, static_cast<GLint>(first), static_cast<GLsizei>(count), uc);
         return;
     }
     if (name == "glDrawElements") {
@@ -3497,16 +3505,7 @@ void GuestRuntimeEnvironment::handleTrampolineCall(uint32_t trampolineId, uc_eng
         uc_reg_read(uc, UC_ARM_REG_R2, &type);
         uc_reg_read(uc, UC_ARM_REG_R3, &indicesPtr);
 
-        GLint boundEbo = 0;
-        glGetIntegerv(GL_ELEMENT_ARRAY_BUFFER_BINDING, &boundEbo);
-        if (boundEbo != 0) {
-            glDrawElements(mode, static_cast<GLsizei>(count), type, reinterpret_cast<const void*>(static_cast<uintptr_t>(indicesPtr)));
-        } else if (indicesPtr != 0 && count > 0 && count <= 65536) {
-            size_t idxSize = (type == GL_UNSIGNED_SHORT) ? 2 : ((type == GL_UNSIGNED_INT) ? 4 : 1);
-            std::vector<uint8_t> idxBuf(count * idxSize);
-            uc_mem_read(uc, indicesPtr, idxBuf.data(), idxBuf.size());
-            glDrawElements(mode, static_cast<GLsizei>(count), type, idxBuf.data());
-        }
+        GlesVirtualizer::getInstance().drawElements(mode, static_cast<GLsizei>(count), type, indicesPtr, uc);
         return;
     }
     if (name == "glRenderbufferStorage" || name == "glRenderbufferStorageOES") {
@@ -3596,9 +3595,14 @@ void GuestRuntimeEnvironment::handleTrampolineCall(uint32_t trampolineId, uc_eng
         else if (glEnum == GL_RENDERER) strVal = "Adreno / Mali Hardware Accelerated";
         else if (glEnum == GL_VERSION) strVal = "OpenGL ES 2.0 Emux32";
         else if (glEnum == GL_SHADING_LANGUAGE_VERSION) strVal = "OpenGL ES GLSL ES 1.00";
-        else if (glEnum == GL_EXTENSIONS) strVal = "GL_OES_compressed_ETC1_RGB8_texture GL_OES_depth24 GL_OES_depth_texture GL_OES_texture_npot GL_OES_packed_depth_stencil GL_OES_rgb8_rgba8 GL_OES_vertex_half_float GL_EXT_texture_format_BGRA8888 GL_OES_framebuffer_object GL_OES_element_index_uint GL_OES_standard_derivatives GL_EXT_discard_framebuffer GL_OES_mapbuffer";
+        else if (glEnum == GL_EXTENSIONS) strVal = "GL_OES_compressed_ETC1_RGB8_texture GL_OES_depth24 GL_OES_depth_texture GL_OES_texture_npot GL_OES_packed_depth_stencil GL_OES_rgb8_rgba8 GL_OES_vertex_half_float GL_EXT_texture_format_BGRA8888 GL_OES_framebuffer_object GL_OES_element_index_uint GL_OES_standard_derivatives GL_EXT_discard_framebuffer GL_OES_mapbuffer GL_OES_point_size_array GL_OES_matrix_palette GL_OES_fixed_point";
         uint32_t strGuestAddr = createGuestString(uc, strVal);
         uc_reg_write(uc, UC_ARM_REG_R0, &strGuestAddr);
+        return;
+    }
+
+    // 11b. Dispatcher OpenGL ES 1.1 Fixed-Function (Matrix Stacks, Client States & Pointers)
+    if (GlesVirtualizer::getInstance().handleGles1(name, uc)) {
         return;
     }
 

@@ -14,6 +14,7 @@ add_library(
     core/syscall_thunker.cpp
     core/audio_thunker.cpp
     core/guest_thread.cpp
+    core/gles_virtualizer.cpp
     unicorn/unicorn_impl.cpp
     elf_loader.cpp
     linker_hook.cpp

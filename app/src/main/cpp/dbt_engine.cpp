@@ -1,6 +1,7 @@
 #include "dbt_engine.h"
 #include "linker_hook.h"
 #include "core/guest_thread.h"
+#include "core/gles_virtualizer.h"
 
 #include <android/log.h>
 #include <android/native_window.h>
@@ -175,6 +176,7 @@ bool DbtEngine::initEgl() {
 
 void DbtEngine::destroyEgl() {
     if (eglDisplay_ != EGL_NO_DISPLAY) {
+        GlesVirtualizer::getInstance().shutdown();
         eglMakeCurrent(eglDisplay_, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
         if (eglSurface_ != EGL_NO_SURFACE) {
             eglDestroySurface(eglDisplay_, eglSurface_);
@@ -398,6 +400,9 @@ bool DbtEngine::startEmulation() {
 
     // 2. Inizializzazione EGL esclusivamente sul Worker Thread (attende fino a 1.2s se SurfaceView in creazione)
     ensureWorkerEgl(true);
+
+    // Inizializzazione Layer Virtualizzazione Vertex Array & Shadow VBO
+    GlesVirtualizer::getInstance().initialize();
 
     // 3. Esecuzione costruttori statici C++ (DT_PREINIT_ARRAY / DT_INIT / DT_INIT_ARRAY) per tutte le librerie
     for (const auto& lib : loadedLibs_) {
