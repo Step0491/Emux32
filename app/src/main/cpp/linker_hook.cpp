@@ -138,9 +138,11 @@ std::string SyscallDispatcher::resolveFilePath(const char* guestPath) {
     if (!env.getNativeLibDir().empty()) {
         candidates.push_back(env.getNativeLibDir() + "/" + filename);
     }
+    candidates.push_back(sCustomStoragePath + "/obb/" + pkg + "/" + filename);
     candidates.push_back(sCustomStoragePath + "/obb/" + filename);
     candidates.push_back(sCustomStoragePath + "/apk/" + filename);
     candidates.push_back(sCustomStoragePath + "/" + filename);
+    candidates.push_back("/storage/emulated/0/Emux32/obb/" + pkg + "/" + filename);
     candidates.push_back("/storage/emulated/0/Emux32/obb/" + filename);
     candidates.push_back("/storage/emulated/0/Emux32/apk/" + filename);
     candidates.push_back("/storage/emulated/0/Android/obb/" + pkg + "/" + filename);
@@ -570,6 +572,9 @@ bool GuestRuntimeEnvironment::initialize(uc_engine* uc) {
     // 3. Mappa regione Trampoline (0x70000000, 1MB -> fino a 131.072 simboli)
     uc_mem_map(uc, guestTrampolineBase_, 0x100000, UC_PROT_ALL);
 
+    // 3b. Mappa pool stack dei thread worker (0x7A000000, 4MB)
+    uc_mem_map(uc, guestWorkerStackBase_, 0x00400000, UC_PROT_READ | UC_PROT_WRITE);
+
     // 4. Mappa Heap Guest iniziale a 0x58000000 (128MB, demand-paged)
     uc_mem_map(uc, 0x58000000, 0x08000000, UC_PROT_READ | UC_PROT_WRITE);
 
@@ -938,6 +943,7 @@ void GuestRuntimeEnvironment::handleJniCall(uint32_t slotIndex, uc_engine* uc) {
                 if (mName == "getX") fVal = lastTouchX_.load();
                 else if (mName == "getY") fVal = lastTouchY_.load();
                 else if (mName == "getPressure" || mName == "getSize") fVal = 1.0f;
+                else if (mName == "getRefreshRate") fVal = 60.0f;
             }
             uint32_t raw = 0;
             std::memcpy(&raw, &fVal, 4);
@@ -976,15 +982,34 @@ void GuestRuntimeEnvironment::handleJniCall(uint32_t slotIndex, uc_engine* uc) {
             return;
         }
 
-        //GetStaticIntField (es. Build$VERSION.SDK_INT -> 27)
+        // GetIntField / GetStaticIntField (es. Build$VERSION.SDK_INT, DisplayMetrics width/height/densityDpi)
         case 100:
         case 150: {
             auto fit = fieldHandleMap_.find(r2);
-            if (fit != fieldHandleMap_.end() && fit->second.name == "SDK_INT") {
-                setReturnU32(27);
-                return;
+            if (fit != fieldHandleMap_.end()) {
+                const auto& fName = fit->second.name;
+                if (fName == "SDK_INT") { setReturnU32(27); return; }
+                if (fName == "widthPixels") { setReturnU32(1920); return; }
+                if (fName == "heightPixels") { setReturnU32(1080); return; }
+                if (fName == "densityDpi") { setReturnU32(480); return; }
             }
             setReturnU32(0);
+            return;
+        }
+
+        // GetFloatField / GetStaticFloatField (DisplayMetrics density, scaledDensity, xdpi, ydpi)
+        case 102:
+        case 152: {
+            float fVal = 0.0f;
+            auto fit = fieldHandleMap_.find(r2);
+            if (fit != fieldHandleMap_.end()) {
+                const auto& fName = fit->second.name;
+                if (fName == "density" || fName == "scaledDensity") fVal = 3.0f;
+                else if (fName == "xdpi" || fName == "ydpi") fVal = 440.0f;
+            }
+            uint32_t raw = 0;
+            std::memcpy(&raw, &fVal, 4);
+            setReturnU32(raw);
             return;
         }
 
@@ -1190,6 +1215,25 @@ static std::string formatGuestPrintf(uc_engine* uc, const std::string& fmt, uint
         return val;
     };
 
+    auto nextU64 = [&]() -> uint64_t {
+        if (!useVaPtr) {
+            if (regCursor == 1 || regCursor == 3) {
+                regCursor++;
+            }
+            if (regCursor == 0 || regCursor == 2) {
+                uint32_t lo = rArgs[regCursor++];
+                uint32_t hi = rArgs[regCursor++];
+                return (static_cast<uint64_t>(hi) << 32) | lo;
+            }
+        }
+        memCursor = (memCursor + 7U) & ~7U;
+        uint32_t lo = 0, hi = 0;
+        uc_mem_read(uc, memCursor, &lo, 4);
+        uc_mem_read(uc, memCursor + 4, &hi, 4);
+        memCursor += 8;
+        return (static_cast<uint64_t>(hi) << 32) | lo;
+    };
+
     std::string out;
     out.reserve(fmt.size() + 64);
 
@@ -1233,9 +1277,7 @@ static std::string formatGuestPrintf(uc_engine* uc, const std::string& fmt, uint
             case 'd':
             case 'i': {
                 if (isLongLong) {
-                    uint32_t lo = nextU32();
-                    uint32_t hi = nextU32();
-                    long long v = static_cast<long long>((static_cast<uint64_t>(hi) << 32) | lo);
+                    long long v = static_cast<long long>(nextU64());
                     std::snprintf(buf, sizeof(buf), "%lld", v);
                 } else {
                     std::snprintf(buf, sizeof(buf), "%d", static_cast<int32_t>(nextU32()));
@@ -1245,9 +1287,7 @@ static std::string formatGuestPrintf(uc_engine* uc, const std::string& fmt, uint
             }
             case 'u': {
                 if (isLongLong) {
-                    uint32_t lo = nextU32();
-                    uint32_t hi = nextU32();
-                    unsigned long long v = (static_cast<uint64_t>(hi) << 32) | lo;
+                    unsigned long long v = nextU64();
                     std::snprintf(buf, sizeof(buf), "%llu", v);
                 } else {
                     std::snprintf(buf, sizeof(buf), "%u", nextU32());
@@ -1270,9 +1310,7 @@ static std::string formatGuestPrintf(uc_engine* uc, const std::string& fmt, uint
             case 'f':
             case 'g':
             case 'e': {
-                uint32_t lo = nextU32();
-                uint32_t hi = nextU32();
-                uint64_t raw = (static_cast<uint64_t>(hi) << 32) | lo;
+                uint64_t raw = nextU64();
                 double d = 0.0;
                 std::memcpy(&d, &raw, 8);
                 std::snprintf(buf, sizeof(buf), "%g", d);
@@ -1284,6 +1322,71 @@ static std::string formatGuestPrintf(uc_engine* uc, const std::string& fmt, uint
         }
     }
     return out;
+}
+
+static bool disarmGuestTrapFlag(uc_engine* uc, uint32_t lr) {
+    if (!uc || lr < 0x1000) return false;
+
+    uint32_t startAddr = (lr >= 64) ? (lr - 64) : 0;
+    uint32_t countBytes = lr - startAddr;
+    std::vector<uint8_t> codeBuf(countBytes);
+    if (uc_mem_read(uc, startAddr, codeBuf.data(), countBytes) != UC_ERR_OK) {
+        return false;
+    }
+
+    bool disarmed = false;
+    // Scan istruzioni ARM (LDR Rd, [PC, #imm])
+    for (uint32_t off = 0; off + 4 <= countBytes; off += 4) {
+        uint32_t pc = startAddr + off;
+        uint32_t insn = 0;
+        std::memcpy(&insn, codeBuf.data() + off, 4);
+
+        if ((insn & 0xFE5F0000U) == 0x051F0000U || (insn & 0xFE5F0000U) == 0x059F0000U) {
+            bool add = (insn & (1U << 23)) != 0;
+            uint32_t imm12 = insn & 0xFFFU;
+            uint32_t poolAddr = add ? (pc + 8 + imm12) : (pc + 8 - imm12);
+            uint32_t targetVarAddr = 0;
+            if (uc_mem_read(uc, poolAddr, &targetVarAddr, 4) == UC_ERR_OK) {
+                if (targetVarAddr >= 0x40000000U && targetVarAddr < 0x55000000U) {
+                    uint32_t currentVal = 0;
+                    if (uc_mem_read(uc, targetVarAddr, &currentVal, 4) == UC_ERR_OK && currentVal != 0) {
+                        uint32_t zero = 0;
+                        uc_mem_write(uc, targetVarAddr, &zero, 4);
+                        LOGI("DisarmTrap [ARM]: Neutralizzato flag trappola guest a 0x%08x (era 0x%08x)",
+                             targetVarAddr, currentVal);
+                        disarmed = true;
+                    }
+                }
+            }
+        }
+    }
+
+    // Scan istruzioni Thumb-2 (LDR Rd, [PC, #imm])
+    for (uint32_t off = 0; off + 2 <= countBytes; off += 2) {
+        uint32_t pc = startAddr + off;
+        uint16_t tInsn = 0;
+        std::memcpy(&tInsn, codeBuf.data() + off, 2);
+        if ((tInsn & 0xF800U) == 0x4800U) { // LDR Rd, [PC, #imm8*4]
+            uint32_t imm = (tInsn & 0xFFU) * 4;
+            uint32_t poolAddr = ((pc + 4) & ~3U) + imm;
+            uint32_t targetVarAddr = 0;
+            if (uc_mem_read(uc, poolAddr, &targetVarAddr, 4) == UC_ERR_OK) {
+                if (targetVarAddr >= 0x40000000U && targetVarAddr < 0x55000000U) {
+                    uint32_t currentVal = 0;
+                    if (uc_mem_read(uc, targetVarAddr, &currentVal, 4) == UC_ERR_OK && currentVal != 0) {
+                        uint32_t zero = 0;
+                        uc_mem_write(uc, targetVarAddr, &zero, 4);
+                        LOGI("DisarmTrap [Thumb]: Neutralizzato flag trappola guest a 0x%08x (era 0x%08x)",
+                             targetVarAddr, currentVal);
+                        disarmed = true;
+                    }
+                }
+            }
+        }
+    }
+
+    return disarmed;
+}
 }
 
 #pragma pack(push, 4)
@@ -1348,6 +1451,7 @@ void GuestRuntimeEnvironment::handleTrampolineCall(uint32_t trampolineId, uc_eng
             uc_reg_read(uc, UC_ARM_REG_PC, &pc);
             LOGW("[GuestLogCrashDiagnostic] Trap detect: tag='%s', fmt='%s', PC=0x%08x, LR=0x%08x, SP=0x%08x",
                  tag.c_str(), fmt.c_str(), pc, lr, sp);
+            disarmGuestTrapFlag(uc, lr);
         }
         uint32_t ret = 1;
         uc_reg_write(uc, UC_ARM_REG_R0, &ret);
@@ -1964,11 +2068,93 @@ void GuestRuntimeEnvironment::handleTrampolineCall(uint32_t trampolineId, uc_eng
         return;
     }
     if (name == "pthread_once") {
-        uint32_t onceCtrl = 0;
+        uint32_t onceCtrl = 0, initRoutine = 0;
         uc_reg_read(uc, UC_ARM_REG_R0, &onceCtrl);
+        uc_reg_read(uc, UC_ARM_REG_R1, &initRoutine);
+        uint32_t val = 0;
         if (onceCtrl != 0) {
-            uint32_t done = 1;
-            uc_mem_write(uc, onceCtrl, &done, 4);
+            uc_mem_read(uc, onceCtrl, &val, 4);
+        }
+        if (val == 0) {
+            if (onceCtrl != 0) {
+                uint32_t done = 1;
+                uc_mem_write(uc, onceCtrl, &done, 4);
+            }
+            if (initRoutine != 0) {
+                uint32_t savedSp = 0, savedLr = 0, savedCpsr = 0;
+                uint32_t savedR0 = 0, savedR1 = 0, savedR2 = 0, savedR3 = 0;
+                uc_reg_read(uc, UC_ARM_REG_SP, &savedSp);
+                uc_reg_read(uc, UC_ARM_REG_LR, &savedLr);
+                uc_reg_read(uc, UC_ARM_REG_CPSR, &savedCpsr);
+                uc_reg_read(uc, UC_ARM_REG_R0, &savedR0);
+                uc_reg_read(uc, UC_ARM_REG_R1, &savedR1);
+                uc_reg_read(uc, UC_ARM_REG_R2, &savedR2);
+                uc_reg_read(uc, UC_ARM_REG_R3, &savedR3);
+
+                uint32_t lr = 0xDEADBEEFU;
+                uint32_t cpsr = (initRoutine & 1U) ? (savedCpsr | 0x20U) : (savedCpsr & ~0x20U);
+                uc_reg_write(uc, UC_ARM_REG_LR, &lr);
+                uc_reg_write(uc, UC_ARM_REG_CPSR, &cpsr);
+
+                LOGI("pthread_once: Esecuzione init_routine @ 0x%08x...", initRoutine);
+                uc_emu_start(uc, initRoutine, lr, 0, 500000);
+
+                uc_reg_write(uc, UC_ARM_REG_SP, &savedSp);
+                uc_reg_write(uc, UC_ARM_REG_LR, &savedLr);
+                uc_reg_write(uc, UC_ARM_REG_CPSR, &savedCpsr);
+                uc_reg_write(uc, UC_ARM_REG_R1, &savedR1);
+                uc_reg_write(uc, UC_ARM_REG_R2, &savedR2);
+                uc_reg_write(uc, UC_ARM_REG_R3, &savedR3);
+            }
+        }
+        uint32_t zero = 0;
+        uc_reg_write(uc, UC_ARM_REG_R0, &zero);
+        return;
+    }
+    if (name == "pthread_getattr_np") {
+        uint32_t attrPtr = 0;
+        uc_reg_read(uc, UC_ARM_REG_R1, &attrPtr);
+        if (attrPtr != 0) {
+            uint8_t zeroAttr[64] = {0};
+            uc_mem_write(uc, attrPtr, zeroAttr, sizeof(zeroAttr));
+        }
+        uint32_t zero = 0;
+        uc_reg_write(uc, UC_ARM_REG_R0, &zero);
+        return;
+    }
+    if (name == "pthread_attr_getstack") {
+        uint32_t stackAddrPtr = 0, stackSizePtr = 0;
+        uc_reg_read(uc, UC_ARM_REG_R1, &stackAddrPtr);
+        uc_reg_read(uc, UC_ARM_REG_R2, &stackSizePtr);
+        if (stackAddrPtr != 0) {
+            uint32_t base = 0x7E000000U; // guestStackBase_
+            uc_mem_write(uc, stackAddrPtr, &base, 4);
+        }
+        if (stackSizePtr != 0) {
+            uint32_t size = 0x00200000U; // 2MB guestStackSize_
+            uc_mem_write(uc, stackSizePtr, &size, 4);
+        }
+        uint32_t zero = 0;
+        uc_reg_write(uc, UC_ARM_REG_R0, &zero);
+        return;
+    }
+    if (name == "pthread_attr_getstacksize") {
+        uint32_t stackSizePtr = 0;
+        uc_reg_read(uc, UC_ARM_REG_R1, &stackSizePtr);
+        if (stackSizePtr != 0) {
+            uint32_t size = 0x00200000U; // 2MB
+            uc_mem_write(uc, stackSizePtr, &size, 4);
+        }
+        uint32_t zero = 0;
+        uc_reg_write(uc, UC_ARM_REG_R0, &zero);
+        return;
+    }
+    if (name == "pthread_attr_getguardsize") {
+        uint32_t guardPtr = 0;
+        uc_reg_read(uc, UC_ARM_REG_R1, &guardPtr);
+        if (guardPtr != 0) {
+            uint32_t guard = 0x1000U; // 4KB
+            uc_mem_write(uc, guardPtr, &guard, 4);
         }
         uint32_t zero = 0;
         uc_reg_write(uc, UC_ARM_REG_R0, &zero);
@@ -1976,7 +2162,7 @@ void GuestRuntimeEnvironment::handleTrampolineCall(uint32_t trampolineId, uc_eng
     }
     if (name.rfind("pthread_mutex", 0) == 0 || name.rfind("pthread_cond", 0) == 0 ||
         name.rfind("pthread_attr", 0) == 0 || name.rfind("pthread_rwlock", 0) == 0 ||
-        name == "pthread_getattr_np" || name == "pthread_setname_np" || name == "pthread_detach" || name == "pthread_join") {
+        name == "pthread_setname_np" || name == "pthread_detach" || name == "pthread_join") {
         uint32_t zero = 0;
         uc_reg_write(uc, UC_ARM_REG_R0, &zero);
         return;
@@ -2922,15 +3108,56 @@ void GuestRuntimeEnvironment::handleTrampolineCall(uint32_t trampolineId, uc_eng
         return;
     }
 
-    // 13. Pthread Create
+    // 13. Pthread Create con esecuzione cooperativa della routine di avvio worker
     if (name == "pthread_create") {
-        uint32_t tidPtr = 0;
+        uint32_t tidPtr = 0, attrPtr = 0, startRoutine = 0, arg = 0;
         uc_reg_read(uc, UC_ARM_REG_R0, &tidPtr);
+        uc_reg_read(uc, UC_ARM_REG_R1, &attrPtr);
+        uc_reg_read(uc, UC_ARM_REG_R2, &startRoutine);
+        uc_reg_read(uc, UC_ARM_REG_R3, &arg);
+
+        uint32_t workerIndex = nextWorkerThreadId_++;
+        uint32_t tid = 0x60001000U + workerIndex;
         if (tidPtr != 0) {
-            static uint32_t sFakeTid = 0x60001000U;
-            uint32_t tid = sFakeTid++;
             uc_mem_write(uc, tidPtr, &tid, 4);
         }
+
+        LOGI("pthread_create: Inizializzazione thread 0x%08x (Routine: 0x%08x, Arg: 0x%08x)...",
+             tid, startRoutine, arg);
+
+        // Se la routine di avvio è valida, esegui il setup cooperativo sul proprio stack
+        if (startRoutine != 0) {
+            uint32_t savedSp = 0, savedLr = 0, savedCpsr = 0;
+            uint32_t savedR0 = 0, savedR1 = 0, savedR2 = 0, savedR3 = 0;
+            uc_reg_read(uc, UC_ARM_REG_SP, &savedSp);
+            uc_reg_read(uc, UC_ARM_REG_LR, &savedLr);
+            uc_reg_read(uc, UC_ARM_REG_CPSR, &savedCpsr);
+            uc_reg_read(uc, UC_ARM_REG_R0, &savedR0);
+            uc_reg_read(uc, UC_ARM_REG_R1, &savedR1);
+            uc_reg_read(uc, UC_ARM_REG_R2, &savedR2);
+            uc_reg_read(uc, UC_ARM_REG_R3, &savedR3);
+
+            // Stack dedicato al worker thread: 256KB per thread all'interno del pool
+            uint32_t workerStackTop = (guestWorkerStackBase_ + ((workerIndex + 1) * 0x40000U) - 0x1000U) & ~7U;
+            uint32_t workerLr = 0xDEADBEEFU;
+            uint32_t workerCpsr = (startRoutine & 1U) ? (savedCpsr | 0x20U) : (savedCpsr & ~0x20U);
+
+            uc_reg_write(uc, UC_ARM_REG_R0, &arg);
+            uc_reg_write(uc, UC_ARM_REG_SP, &workerStackTop);
+            uc_reg_write(uc, UC_ARM_REG_LR, &workerLr);
+            uc_reg_write(uc, UC_ARM_REG_CPSR, &workerCpsr);
+
+            uc_emu_start(uc, startRoutine, workerLr, 0, 100000);
+
+            // Ripristina contesto del thread chiamante
+            uc_reg_write(uc, UC_ARM_REG_SP, &savedSp);
+            uc_reg_write(uc, UC_ARM_REG_LR, &savedLr);
+            uc_reg_write(uc, UC_ARM_REG_CPSR, &savedCpsr);
+            uc_reg_write(uc, UC_ARM_REG_R1, &savedR1);
+            uc_reg_write(uc, UC_ARM_REG_R2, &savedR2);
+            uc_reg_write(uc, UC_ARM_REG_R3, &savedR3);
+        }
+
         uint32_t zero = 0;
         uc_reg_write(uc, UC_ARM_REG_R0, &zero);
         return;

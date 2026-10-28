@@ -402,8 +402,8 @@ bool DbtEngine::startEmulation() {
     uint32_t jniEnvPtr = env.getJNIEnvPointer();
     uint32_t lr = 0xDEADBEEF;
 
-    auto invokeGuestFunction = [&](uint32_t fnAddr, uint32_t r0, uint32_t r1, uint32_t r2, uint32_t r3, size_t maxInsns) {
-        if (fnAddr == 0) return;
+    auto invokeGuestFunction = [&](uint32_t fnAddr, uint32_t r0, uint32_t r1, uint32_t r2, uint32_t r3, size_t maxInsns) -> uint32_t {
+        if (fnAddr == 0) return 0;
         uint32_t sp = guestStackPointer_;
         uint32_t cpsr = (fnAddr & 1U) ? 0x00000030U : 0x00000010U;
         uc_reg_write(uc_, UC_ARM_REG_R0, &r0);
@@ -414,6 +414,9 @@ bool DbtEngine::startEmulation() {
         uc_reg_write(uc_, UC_ARM_REG_LR, &lr);
         uc_reg_write(uc_, UC_ARM_REG_CPSR, &cpsr);
         uc_emu_start(uc_, fnAddr, lr, 0, maxInsns);
+        uint32_t ret = 0;
+        uc_reg_read(uc_, UC_ARM_REG_R0, &ret);
+        return ret;
     };
 
     // 4. Invocazione JNI_OnLoad della libreria primaria
@@ -530,7 +533,10 @@ bool DbtEngine::startEmulation() {
         env.consumeFrameSwapFlag();
 
         if (targetRenderPtr != 0) {
-            invokeGuestFunction(targetRenderPtr, jniEnvPtr, dummyInstance, 0, 0, 3000000);
+            uint32_t renderRet = invokeGuestFunction(targetRenderPtr, jniEnvPtr, dummyInstance, 0, 0, 3000000);
+            if (frameCount < 5 || frameCount % 600 == 0) {
+                LOGI("DbtEngine: Frame %zu invocato su %s -> r0=0x%x", frameCount + 1, targetRenderName.c_str(), renderRet);
+            }
         }
 
         if (!env.consumeFrameSwapFlag()) {

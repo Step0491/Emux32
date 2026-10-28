@@ -166,6 +166,9 @@ private:
     uint32_t guestTrampolineBase_{0x70000000};
     uint32_t nextTrampolineId_{1};
 
+    uint32_t guestWorkerStackBase_{0x7A000000};
+    uint32_t nextWorkerThreadId_{0};
+
     std::unordered_map<std::string, uint32_t> symbolToTrampolineMap_;
     std::unordered_map<uint32_t, std::string> trampolineToSymbolMap_;
 
