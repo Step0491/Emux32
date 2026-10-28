@@ -902,6 +902,12 @@ void GuestRuntimeEnvironment::handleJniCall(uint32_t slotIndex, uc_engine* uc) {
                     setReturnU32(dirObj);
                     return;
                 }
+                if (info.name == "newInterfaceProxy") {
+                    uint32_t proxyH = nextMockHandle_++;
+                    LOGI("JNI bitter/jnibridge/JNIBridge.newInterfaceProxy generato proxy 0x%x", proxyH);
+                    setReturnU32(proxyH);
+                    return;
+                }
                 if (info.name == "getAbsolutePath" || info.name == "getPath" || info.name == "toString") {
                     std::string pathVal = jstringMap_.count(r1) ? jstringMap_[r1] : (obbDir_.empty() ? filesDir_ : obbDir_);
                     setReturnU32(createGuestJString(uc, pathVal));
@@ -956,6 +962,24 @@ void GuestRuntimeEnvironment::handleJniCall(uint32_t slotIndex, uc_engine* uc) {
                 if (mName == "getWidth") { setReturnU32(1920); return; }
                 if (mName == "getHeight") { setReturnU32(1080); return; }
                 if (mName == "getRotation") { setReturnU32(1); return; }
+                if (mName == "getSplashMode") { setReturnU32(0); return; }
+            }
+            setReturnU32(0);
+            return;
+        }
+
+        // CallVoidMethod / CallNonvirtualVoidMethod / CallStaticVoidMethod
+        case 61: case 62: case 63:
+        case 91: case 92: case 93:
+        case 141: case 142: case 143: {
+            auto mit = methodHandleMap_.find(r2);
+            if (mit != methodHandleMap_.end()) {
+                const auto& info = mit->second;
+                if (info.name == "runOnUiThread") {
+                    LOGI("JNI Context.runOnUiThread invocato con Runnable=0x%x", r3);
+                } else if (info.name == "executeGLThreadJobs") {
+                    // Poll periodico da Unity per i job di rendering
+                }
             }
             setReturnU32(0);
             return;

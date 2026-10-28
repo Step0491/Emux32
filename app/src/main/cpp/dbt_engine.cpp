@@ -436,9 +436,6 @@ bool DbtEngine::startEmulation() {
                 break;
             }
         }
-        if (jniOnLoadAddr == 0 && lib->entry_point != 0) {
-            jniOnLoadAddr = lib->entry_point;
-        }
 
         if (jniOnLoadAddr != 0) {
             LOGI("Avvio JNI_OnLoad per '%s': PC=0x%08x, SP=0x%08x, JavaVM=0x%08x...",
@@ -504,10 +501,12 @@ bool DbtEngine::startEmulation() {
         } else if (lower.find("surfacechanged") != std::string::npos || lower.find("resize") != std::string::npos || lower.find("onsurfacechanged") != std::string::npos) {
             LOGI("Invocazione resize grafico '%s' (1920x1080)...", m.name.c_str());
             invokeGuestFunction(m.fnPtr, jniEnvPtr, dummyInstance, 1920, 1080, 1500000);
-        } else if (lower.find("focuschanged") != std::string::npos) {
-            invokeGuestFunction(m.fnPtr, jniEnvPtr, dummyInstance, 1, 0, 500000);
         } else if (lower.find("resume") != std::string::npos) {
+            LOGI("Invocazione metodo di unpause/resume '%s'...", m.name.c_str());
             invokeGuestFunction(m.fnPtr, jniEnvPtr, dummyInstance, 0, 0, 500000);
+        } else if (lower.find("focuschanged") != std::string::npos) {
+            LOGI("Invocazione metodo di window focus '%s' (focus=true)...", m.name.c_str());
+            invokeGuestFunction(m.fnPtr, jniEnvPtr, dummyInstance, 1, 0, 500000);
         }
     }
 
@@ -550,6 +549,9 @@ bool DbtEngine::startEmulation() {
          targetRenderName.empty() ? "EGL-PresentLoop" : targetRenderName.c_str(), targetRenderPtr);
 
     size_t frameCount = 0;
+    auto lastHeartbeat = std::chrono::steady_clock::now();
+    size_t framesSinceHeartbeat = 0;
+
     while (governor_.isRunning.load(std::memory_order_relaxed) && !stopRequested_.load(std::memory_order_relaxed)) {
         auto frameStart = std::chrono::steady_clock::now();
 
@@ -559,8 +561,8 @@ bool DbtEngine::startEmulation() {
 
         if (targetRenderPtr != 0) {
             uint32_t renderRet = invokeGuestFunction(targetRenderPtr, jniEnvPtr, dummyInstance, 0, 0, 3000000);
-            if (frameCount < 5 || frameCount % 600 == 0) {
-                LOGI("DbtEngine: Frame %zu invocato su %s -> r0=0x%x", frameCount + 1, targetRenderName.c_str(), renderRet);
+            if (frameCount < 10 || frameCount % 30 == 0) {
+                LOGI("DbtEngine: Frame %zu eseguito su %s (status=0x%x)", frameCount + 1, targetRenderName.c_str(), renderRet);
             }
         }
 
@@ -569,8 +571,16 @@ bool DbtEngine::startEmulation() {
         }
 
         frameCount++;
-        if (frameCount == 1 || frameCount % 300 == 0) {
-            LOGI("DbtEngine: Frame %zu renderizzato a 60 FPS.", frameCount);
+        framesSinceHeartbeat++;
+
+        auto now = std::chrono::steady_clock::now();
+        auto elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(now - lastHeartbeat).count();
+        if (elapsedMs >= 2000) {
+            float fps = (framesSinceHeartbeat * 1000.0f) / static_cast<float>(elapsedMs);
+            LOGI("DbtEngine Heartbeat: %zu frame renderizzati (velocità media: %.1f FPS, touch in coda: %zu)",
+                 frameCount, fps, pendingTouches_.size());
+            lastHeartbeat = now;
+            framesSinceHeartbeat = 0;
         }
 
         governor_.syncFrame(frameStart);
