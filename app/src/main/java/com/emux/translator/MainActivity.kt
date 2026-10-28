@@ -412,6 +412,32 @@ class MainActivity : ComponentActivity() {
                     }
                 }
             }
+
+            // Estrazione completa cartella assets/ dell'APK in filesDir/assets/$pkg
+            val assetsTargetDir = File(filesDir, "assets/$pkg")
+            if (!assetsTargetDir.exists()) {
+                assetsTargetDir.mkdirs()
+            }
+            var extractedAssetCount = 0
+            var extractedAssetBytes = 0L
+
+            for (entry in allEntries) {
+                if (entry.name.startsWith("assets/") && !entry.isDirectory) {
+                    val relPath = entry.name.removePrefix("assets/")
+                    val targetAssetFile = File(assetsTargetDir, relPath)
+                    if (!targetAssetFile.exists() || targetAssetFile.length() != entry.size) {
+                        targetAssetFile.parentFile?.mkdirs()
+                        zip.getInputStream(entry).use { inStream ->
+                            targetAssetFile.outputStream().use { outStream ->
+                                inStream.copyTo(outStream)
+                            }
+                        }
+                    }
+                    extractedAssetCount++
+                    extractedAssetBytes += targetAssetFile.length()
+                }
+            }
+            EmuxLogger.i("Emux32", "[FASE 3/5] Estratti $extractedAssetCount asset di gioco in ${assetsTargetDir.absolutePath} ($extractedAssetBytes byte totali).")
             zip.close()
 
             if (extractedSos.isEmpty()) {

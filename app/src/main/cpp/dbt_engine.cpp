@@ -444,7 +444,7 @@ bool DbtEngine::startEmulation() {
         if (jniOnLoadAddr != 0) {
             LOGI("Avvio JNI_OnLoad per '%s': PC=0x%08x, SP=0x%08x, JavaVM=0x%08x...",
                  lib->path.c_str(), jniOnLoadAddr, guestStackPointer_, javaVMPtr);
-            uint32_t jniVer = invokeGuestFunction(jniOnLoadAddr, javaVMPtr, 0, 0, 0, 3000000);
+            uint32_t jniVer = invokeGuestFunction(jniOnLoadAddr, javaVMPtr, 0, 0, 0, 50000000);
             LOGI("JNI_OnLoad '%s' completato (Versione ritornata: 0x%08x, Metodi registrati finora: %zu).",
                  lib->path.c_str(), jniVer, env.getRegisteredMethods().size());
         }
@@ -460,7 +460,7 @@ bool DbtEngine::startEmulation() {
         if (m.name == "nativeFile" && !env.getApkPath().empty()) {
             uint32_t jstrApk = env.createGuestJString(uc_, env.getApkPath());
             LOGI("Invocazione metodo guest '%s' con APK '%s'...", m.name.c_str(), env.getApkPath().c_str());
-            invokeGuestFunction(m.fnPtr, jniEnvPtr, dummyInstance, jstrApk, 0, 500000);
+            invokeGuestFunction(m.fnPtr, jniEnvPtr, dummyInstance, jstrApk, 0, 20000000);
         }
     }
 
@@ -474,19 +474,21 @@ bool DbtEngine::startEmulation() {
 
         if (lower == "initjni" || lower == "nativeinitjni") {
             LOGI("Invocazione metodo guest '%s' (Context=0x1001)...", m.name.c_str());
-            invokeGuestFunction(m.fnPtr, jniEnvPtr, dummyInstance, 0x1001, 0, 1000000);
+            invokeGuestFunction(m.fnPtr, jniEnvPtr, dummyInstance, 0x1001, 0, 20000000);
         } else if (lower == "init" && m.signature == "(IZ)V") {
             LOGI("Invocazione metodo guest '%s' (0, false)...", m.name.c_str());
-            invokeGuestFunction(m.fnPtr, jniEnvPtr, dummyInstance, 0, 0, 1000000);
-        } else if (lower == "nativeinit" || lower == "init" || lower == "nativecreate" || lower == "create") {
+            invokeGuestFunction(m.fnPtr, jniEnvPtr, dummyInstance, 0, 0, 20000000);
+        } else if (lower == "nativeinit" || lower == "init" || lower == "nativecreate" || lower == "create" || lower.find("init") != std::string::npos) {
             LOGI("Invocazione metodo guest di setup '%s' (0x%08x, sig='%s')...", m.name.c_str(), m.fnPtr, m.signature.c_str());
             if (m.signature.find("(II)") != std::string::npos) {
                 // Metodi tipo Cocos2d-x nativeInit(int w, int h)
-                invokeGuestFunction(m.fnPtr, jniEnvPtr, dummyInstance, 1920, 1080, 2000000);
+                invokeGuestFunction(m.fnPtr, jniEnvPtr, dummyInstance, 1920, 1080, 50000000);
             } else if (m.signature.find("(Landroid/content/Context;)") != std::string::npos) {
-                invokeGuestFunction(m.fnPtr, jniEnvPtr, dummyInstance, 0x1001, 0, 1000000);
+                invokeGuestFunction(m.fnPtr, jniEnvPtr, dummyInstance, 0x1001, 0, 20000000);
             } else if (m.signature.empty() || m.signature == "()V" || m.signature == "()Z") {
-                invokeGuestFunction(m.fnPtr, jniEnvPtr, dummyInstance, 0, 0, 1000000);
+                invokeGuestFunction(m.fnPtr, jniEnvPtr, dummyInstance, 0, 0, 20000000);
+            } else {
+                invokeGuestFunction(m.fnPtr, jniEnvPtr, dummyInstance, 0x1001, 0, 20000000);
             }
         }
     }
@@ -498,19 +500,19 @@ bool DbtEngine::startEmulation() {
         if (lower.find("recreategfxstate") != std::string::npos || lower.find("setsurface") != std::string::npos) {
             LOGI("Invocazione metodo grafico Surface '%s' (0x%08x)...", m.name.c_str(), m.fnPtr);
             if (m.signature.find("(IL") != std::string::npos) {
-                invokeGuestFunction(m.fnPtr, jniEnvPtr, dummyInstance, 0, dummySurface, 1500000);
+                invokeGuestFunction(m.fnPtr, jniEnvPtr, dummyInstance, 0, dummySurface, 30000000);
             } else {
-                invokeGuestFunction(m.fnPtr, jniEnvPtr, dummyInstance, dummySurface, 0, 1500000);
+                invokeGuestFunction(m.fnPtr, jniEnvPtr, dummyInstance, dummySurface, 0, 30000000);
             }
         } else if (lower.find("surfacechanged") != std::string::npos || lower.find("resize") != std::string::npos || lower.find("onsurfacechanged") != std::string::npos) {
             LOGI("Invocazione resize grafico '%s' (1920x1080)...", m.name.c_str());
-            invokeGuestFunction(m.fnPtr, jniEnvPtr, dummyInstance, 1920, 1080, 1500000);
+            invokeGuestFunction(m.fnPtr, jniEnvPtr, dummyInstance, 1920, 1080, 30000000);
         } else if (lower.find("resume") != std::string::npos) {
             LOGI("Invocazione metodo di unpause/resume '%s'...", m.name.c_str());
-            invokeGuestFunction(m.fnPtr, jniEnvPtr, dummyInstance, 0, 0, 500000);
+            invokeGuestFunction(m.fnPtr, jniEnvPtr, dummyInstance, 0, 0, 10000000);
         } else if (lower.find("focuschanged") != std::string::npos) {
             LOGI("Invocazione metodo di window focus '%s' (focus=true)...", m.name.c_str());
-            invokeGuestFunction(m.fnPtr, jniEnvPtr, dummyInstance, 1, 0, 500000);
+            invokeGuestFunction(m.fnPtr, jniEnvPtr, dummyInstance, 1, 0, 10000000);
         }
     }
 
@@ -564,7 +566,7 @@ bool DbtEngine::startEmulation() {
         env.consumeFrameSwapFlag();
 
         if (targetRenderPtr != 0) {
-            uint32_t renderRet = invokeGuestFunction(targetRenderPtr, jniEnvPtr, dummyInstance, 0, 0, 3000000);
+            uint32_t renderRet = invokeGuestFunction(targetRenderPtr, jniEnvPtr, dummyInstance, 0, 0, 25000000);
             if (frameCount < 10 || frameCount % 30 == 0) {
                 LOGI("DbtEngine: Frame %zu eseguito su %s (status=0x%x)", frameCount + 1, targetRenderName.c_str(), renderRet);
             }

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <cstdio>
 #include <unordered_map>
 #include <string>
 #include <vector>
@@ -117,6 +118,8 @@ public:
     uint32_t createGuestString(uc_engine* uc, const std::string& str);
     uint32_t createGuestJString(uc_engine* uc, const std::string& str);
 
+    std::string resolveAssetPath(const std::string& relativePath);
+
     void handleTrampolineCall(uint32_t trampolineId, uc_engine* uc);
     bool disarmGuestTrapFlag(uc_engine* uc, uint32_t lr);
     const std::vector<std::shared_ptr<LoadedLibrary>>& getLoadedLibraries() const { return loadedLibraries_; }
@@ -185,6 +188,35 @@ private:
     std::vector<std::shared_ptr<LoadedLibrary>> loadedLibraries_;
     std::unordered_map<uint32_t, std::shared_ptr<LoadedLibrary>> dlopenHandleMap_;
     uint32_t nextDlHandle_{0x50000010};
+
+    struct GuestAsset {
+        uint32_t id{0};
+        FILE* fp{nullptr};
+        std::string path;
+        size_t length{0};
+        uint32_t bufferGuestAddr{0};
+    };
+
+    struct GuestAssetDir {
+        uint32_t id{0};
+        std::vector<std::string> files;
+        size_t currentIndex{0};
+    };
+
+    struct GuestInputStream {
+        uint32_t id{0};
+        FILE* fp{nullptr};
+        size_t length{0};
+    };
+
+    std::unordered_map<uint32_t, GuestAsset> guestAssetMap_;
+    uint32_t nextAssetHandle_{0x7D100000U};
+
+    std::unordered_map<uint32_t, GuestAssetDir> guestAssetDirMap_;
+    uint32_t nextAssetDirHandle_{0x7D200000U};
+
+    std::unordered_map<uint32_t, GuestInputStream> guestInputStreamMap_;
+    uint32_t nextInputStreamHandle_{0x7D300000U};
 
     std::string packageName_{"com.turner.cardwars"};
     std::string apkPath_;

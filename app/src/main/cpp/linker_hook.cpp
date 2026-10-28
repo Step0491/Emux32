@@ -18,6 +18,7 @@
 #include <sys/types.h>
 #include <time.h>
 #include <fcntl.h>
+#include <dirent.h>
 #include <sys/mman.h>
 #include <zlib.h>
 #include <cstring>
@@ -99,6 +100,34 @@ static void ensureParentDirs(const std::string& filePath) {
     }
 }
 
+std::string GuestRuntimeEnvironment::resolveAssetPath(const std::string& relativePath) {
+    if (relativePath.empty()) return "";
+    std::string clean = relativePath;
+    if (clean.rfind("assets/", 0) == 0) {
+        clean = clean.substr(7);
+    }
+    const std::vector<std::string> tries = {
+        filesDir_ + "/assets/" + packageName_ + "/" + clean,
+        filesDir_ + "/assets/" + clean,
+        filesDir_ + "/assets/" + packageName_ + "/" + relativePath,
+        filesDir_ + "/assets/" + relativePath,
+        obbDir_ + "/" + clean,
+        obbDir_ + "/" + relativePath
+    };
+    for (const auto& p : tries) {
+        if (access(p.c_str(), F_OK) == 0) {
+            return p;
+        }
+    }
+    size_t lastSlash = clean.find_last_of('/');
+    std::string fname = (lastSlash != std::string::npos) ? clean.substr(lastSlash + 1) : clean;
+    std::string fallback = filesDir_ + "/assets/" + packageName_ + "/" + fname;
+    if (access(fallback.c_str(), F_OK) == 0) {
+        return fallback;
+    }
+    return "";
+}
+
 std::string SyscallDispatcher::resolveFilePath(const char* guestPath) {
     if (!guestPath || guestPath[0] == '\0') return "";
     std::string pathStr(guestPath);
@@ -125,6 +154,13 @@ std::string SyscallDispatcher::resolveFilePath(const char* guestPath) {
         return pathStr;
     }
 
+    // Risoluzione prioritaria tramite la cartella assets estratta dall'APK
+    std::string assetCand = env.resolveAssetPath(pathStr);
+    if (!assetCand.empty()) {
+        LOGI("Risoluzione asset guest via SyscallDispatcher: '%s' -> '%s'", guestPath, assetCand.c_str());
+        return assetCand;
+    }
+
     size_t lastSlash = pathStr.find_last_of('/');
     std::string filename = (lastSlash != std::string::npos) ? pathStr.substr(lastSlash + 1) : pathStr;
 
@@ -134,6 +170,8 @@ std::string SyscallDispatcher::resolveFilePath(const char* guestPath) {
     }
     if (!env.getFilesDir().empty() && !pkg.empty()) {
         candidates.push_back(env.getFilesDir() + "/obb/" + pkg + "/" + filename);
+        candidates.push_back(env.getFilesDir() + "/assets/" + pkg + "/" + filename);
+        candidates.push_back(env.getFilesDir() + "/assets/" + filename);
     }
     if (!env.getNativeLibDir().empty()) {
         candidates.push_back(env.getNativeLibDir() + "/" + filename);
@@ -913,6 +951,110 @@ void GuestRuntimeEnvironment::handleJniCall(uint32_t slotIndex, uc_engine* uc) {
                     setReturnU32(createGuestJString(uc, pathVal));
                     return;
                 }
+                if (info.name == "getAssets") {
+                    uint32_t assetMgrHandle = 0x7D005000U;
+                    classHandleMap_[assetMgrHandle] = "android/content/res/AssetManager";
+                    setReturnU32(assetMgrHandle);
+                    return;
+                }
+                if (info.name == "getResources") {
+                    uint32_t resHandle = 0x7D005100U;
+                    classHandleMap_[resHandle] = "android/content/res/Resources";
+                    setReturnU32(resHandle);
+                    return;
+                }
+                if (info.name == "getDisplayMetrics") {
+                    uint32_t dmHandle = 0x7D005200U;
+                    classHandleMap_[dmHandle] = "android/util/DisplayMetrics";
+                    setReturnU32(dmHandle);
+                    return;
+                }
+                if (info.name == "getWindowManager") {
+                    uint32_t wmHandle = 0x7D005300U;
+                    classHandleMap_[wmHandle] = "android/view/WindowManager";
+                    setReturnU32(wmHandle);
+                    return;
+                }
+                if (info.name == "getDefaultDisplay") {
+                    uint32_t dispHandle = 0x7D005400U;
+                    classHandleMap_[dispHandle] = "android/view/Display";
+                    setReturnU32(dispHandle);
+                    return;
+                }
+                if (info.name == "open") {
+                    // AssetManager.open(String filename)
+                    std::string assetPath = jstringMap_.count(r3) ? jstringMap_[r3] : readGuestCString(uc, r3, 256);
+                    std::string resolved = resolveAssetPath(assetPath);
+                    if (!resolved.empty()) {
+                        FILE* fp = fopen(resolved.c_str(), "rb");
+                        if (fp) {
+                            fseek(fp, 0, SEEK_END);
+                            size_t sz = static_cast<size_t>(ftell(fp));
+                            fseek(fp, 0, SEEK_SET);
+                            uint32_t sHandle = nextInputStreamHandle_++;
+                            guestInputStreamMap_[sHandle] = {sHandle, fp, sz};
+                            classHandleMap_[sHandle] = "java/io/InputStream";
+                            LOGI("JNI AssetManager.open('%s') -> handle 0x%08x (dim=%zu)", assetPath.c_str(), sHandle, sz);
+                            setReturnU32(sHandle);
+                            return;
+                        }
+                    }
+                    LOGW("JNI AssetManager.open('%s') fallito: asset non trovato!", assetPath.c_str());
+                    setReturnU32(0);
+                    return;
+                }
+                if (info.name == "openFd") {
+                    uint32_t fdObj = nextMockHandle_++;
+                    classHandleMap_[fdObj] = "android/content/res/AssetFileDescriptor";
+                    setReturnU32(fdObj);
+                    return;
+                }
+                if (info.name == "getFileData" || info.name == "getFileDataFromZip") {
+                    std::string assetPath;
+                    if (info.name == "getFileData") {
+                        assetPath = jstringMap_.count(r3) ? jstringMap_[r3] : readGuestCString(uc, r3, 256);
+                    } else {
+                        uint32_t sp = 0, p1 = 0;
+                        uc_reg_read(uc, UC_ARM_REG_SP, &sp);
+                        uc_mem_read(uc, sp, &p1, 4);
+                        assetPath = jstringMap_.count(p1) ? jstringMap_[p1] : readGuestCString(uc, p1, 256);
+                        if (assetPath.empty()) {
+                            assetPath = jstringMap_.count(r3) ? jstringMap_[r3] : readGuestCString(uc, r3, 256);
+                        }
+                    }
+                    std::string resolved = resolveAssetPath(assetPath);
+                    if (!resolved.empty()) {
+                        FILE* fp = fopen(resolved.c_str(), "rb");
+                        if (fp) {
+                            fseek(fp, 0, SEEK_END);
+                            long fsz = ftell(fp);
+                            fseek(fp, 0, SEEK_SET);
+                            if (fsz >= 0) {
+                                size_t sz = static_cast<size_t>(fsz);
+                                std::vector<uint8_t> bytes(sz);
+                                if (sz > 0) {
+                                    fread(bytes.data(), 1, sz, fp);
+                                }
+                                fclose(fp);
+
+                                uint32_t arrH = nextMockHandle_++;
+                                uint32_t buf = allocGuestHeap(uc, static_cast<uint32_t>(sz + 16U), 16);
+                                if (sz > 0) {
+                                    uc_mem_write(uc, buf, bytes.data(), sz);
+                                }
+                                arrayHandleMap_[arrH] = {buf, static_cast<uint32_t>(sz)};
+                                LOGI("JNI %s('%s') -> byte[%zu] @ 0x%08x (handle=0x%x)",
+                                     info.name.c_str(), assetPath.c_str(), sz, buf, arrH);
+                                setReturnU32(arrH);
+                                return;
+                            }
+                            fclose(fp);
+                        }
+                    }
+                    LOGW("JNI %s('%s') fallito: file non trovato!", info.name.c_str(), assetPath.c_str());
+                    setReturnU32(0);
+                    return;
+                }
                 if (info.signature.find(")Ljava/lang/String;") != std::string::npos) {
                     setReturnU32(createGuestJString(uc, ""));
                     return;
@@ -936,13 +1078,59 @@ void GuestRuntimeEnvironment::handleJniCall(uint32_t slotIndex, uc_engine* uc) {
             setReturnU32(1);
             return;
 
-        // CallIntMethod / CallStaticIntMethod (inclusi metodi MotionEvent)
+        // CallIntMethod / CallStaticIntMethod (inclusi metodi MotionEvent e InputStream)
         case 49: case 50: case 51:
         case 79: case 80: case 81:
         case 129: case 130: case 131: {
             auto mit = methodHandleMap_.find(r2);
             if (mit != methodHandleMap_.end()) {
                 const std::string& mName = mit->second.name;
+                if (mName == "read") {
+                    // InputStream.read(byte[] b) o read(byte[] b, int off, int len)
+                    auto sit = guestInputStreamMap_.find(r1);
+                    if (sit != guestInputStreamMap_.end() && sit->second.fp) {
+                        auto ait = arrayHandleMap_.find(r3);
+                        if (ait != arrayHandleMap_.end()) {
+                            uint32_t off = 0, len = ait->second.second;
+                            if (mit->second.signature.find("([BII)") != std::string::npos) {
+                                uint32_t sp = 0, pOff = 0, pLen = 0;
+                                uc_reg_read(uc, UC_ARM_REG_SP, &sp);
+                                uc_mem_read(uc, sp, &pOff, 4);
+                                uc_mem_read(uc, sp + 4, &pLen, 4);
+                                off = pOff;
+                                if (pLen < len) len = pLen;
+                            }
+                            if (len > 0 && off < ait->second.second) {
+                                uint32_t maxRead = std::min(len, ait->second.second - off);
+                                std::vector<uint8_t> tmp(maxRead);
+                                size_t nRead = fread(tmp.data(), 1, maxRead, sit->second.fp);
+                                if (nRead > 0) {
+                                    uc_mem_write(uc, ait->second.first + off, tmp.data(), nRead);
+                                    setReturnU32(static_cast<uint32_t>(nRead));
+                                    return;
+                                }
+                            }
+                            if (feof(sit->second.fp)) {
+                                setReturnU32(0xFFFFFFFFU); // -1 EOF
+                                return;
+                            }
+                        }
+                    }
+                    setReturnU32(0xFFFFFFFFU);
+                    return;
+                }
+                if (mName == "available") {
+                    auto sit = guestInputStreamMap_.find(r1);
+                    if (sit != guestInputStreamMap_.end() && sit->second.fp) {
+                        long cur = ftell(sit->second.fp);
+                        long rem = (cur >= 0 && static_cast<size_t>(cur) < sit->second.length)
+                            ? (sit->second.length - cur) : 0;
+                        setReturnU32(static_cast<uint32_t>(rem));
+                        return;
+                    }
+                    setReturnU32(0);
+                    return;
+                }
                 if (mName == "getAction" || mName == "getActionMasked") {
                     setReturnU32(static_cast<uint32_t>(lastTouchAction_.load()));
                     return;
@@ -985,7 +1173,7 @@ void GuestRuntimeEnvironment::handleJniCall(uint32_t slotIndex, uc_engine* uc) {
             return;
         }
 
-        // CallFloatMethod / CallStaticFloatMethod (MotionEvent.getX / getY / getPressure)
+        // CallFloatMethod / CallStaticFloatMethod (MotionEvent.getX/getY, DisplayMetrics.density)
         case 55: case 56: case 57:
         case 85: case 86: case 87:
         case 135: case 136: case 137: {
@@ -997,10 +1185,32 @@ void GuestRuntimeEnvironment::handleJniCall(uint32_t slotIndex, uc_engine* uc) {
                 else if (mName == "getY") fVal = lastTouchY_.load();
                 else if (mName == "getPressure" || mName == "getSize") fVal = 1.0f;
                 else if (mName == "getRefreshRate") fVal = 60.0f;
+                else if (mName == "getDensity" || mName == "getScaledDensity") fVal = 2.0f;
+                else if (mName == "getXdpi" || mName == "getYdpi") fVal = 320.0f;
             }
             uint32_t raw = 0;
             std::memcpy(&raw, &fVal, 4);
             setReturnU32(raw);
+            uint64_t d0Val = static_cast<uint64_t>(raw);
+            uc_reg_write(uc, UC_ARM_REG_D0, &d0Val);
+            return;
+        }
+
+        // CallVoidMethod / CallStaticVoidMethod (InputStream.close, Display.getMetrics)
+        case 61: case 62: case 63:
+        case 141: case 142: case 143: {
+            auto mit = methodHandleMap_.find(r2);
+            if (mit != methodHandleMap_.end()) {
+                const std::string& mName = mit->second.name;
+                if (mName == "close") {
+                    auto sit = guestInputStreamMap_.find(r1);
+                    if (sit != guestInputStreamMap_.end()) {
+                        if (sit->second.fp) fclose(sit->second.fp);
+                        guestInputStreamMap_.erase(sit);
+                    }
+                }
+            }
+            setReturnU32(0);
             return;
         }
 
@@ -1035,7 +1245,13 @@ void GuestRuntimeEnvironment::handleJniCall(uint32_t slotIndex, uc_engine* uc) {
             return;
         }
 
-        // GetIntField / GetStaticIntField (es. Build$VERSION.SDK_INT, DisplayMetrics width/height/densityDpi)
+        // GetBooleanField / GetStaticBooleanField
+        case 96:
+        case 146:
+            setReturnU32(1);
+            return;
+
+        // GetIntField / GetStaticIntField (es. Build$VERSION.SDK_INT, DisplayMetrics.widthPixels)
         case 100:
         case 150: {
             auto fit = fieldHandleMap_.find(r2);
@@ -1044,25 +1260,30 @@ void GuestRuntimeEnvironment::handleJniCall(uint32_t slotIndex, uc_engine* uc) {
                 if (fName == "SDK_INT") { setReturnU32(27); return; }
                 if (fName == "widthPixels") { setReturnU32(1920); return; }
                 if (fName == "heightPixels") { setReturnU32(1080); return; }
-                if (fName == "densityDpi") { setReturnU32(480); return; }
+                if (fName == "densityDpi") { setReturnU32(320); return; }
             }
             setReturnU32(0);
             return;
         }
 
-        // GetFloatField / GetStaticFloatField (DisplayMetrics density, scaledDensity, xdpi, ydpi)
+        // GetFloatField / GetStaticFloatField (DisplayMetrics.density, scaledDensity, xdpi, ydpi)
         case 102:
         case 152: {
-            float fVal = 0.0f;
+            float fVal = 1.0f;
             auto fit = fieldHandleMap_.find(r2);
             if (fit != fieldHandleMap_.end()) {
                 const auto& fName = fit->second.name;
-                if (fName == "density" || fName == "scaledDensity") fVal = 3.0f;
-                else if (fName == "xdpi" || fName == "ydpi") fVal = 440.0f;
+                if (fName == "density" || fName == "scaledDensity") {
+                    fVal = 2.0f;
+                } else if (fName == "xdpi" || fName == "ydpi") {
+                    fVal = 320.0f;
+                }
             }
             uint32_t raw = 0;
             std::memcpy(&raw, &fVal, 4);
             setReturnU32(raw);
+            uint64_t d0Val = static_cast<uint64_t>(raw);
+            uc_reg_write(uc, UC_ARM_REG_D0, &d0Val);
             return;
         }
 
@@ -3325,6 +3546,270 @@ void GuestRuntimeEnvironment::handleTrampolineCall(uint32_t trampolineId, uc_eng
 
         uint32_t zero = 0;
         uc_reg_write(uc, UC_ARM_REG_R0, &zero);
+        return;
+    }
+
+    // 14. Android NDK AssetManager & Asset APIs
+    if (name == "AAssetManager_fromJava") {
+        uint32_t mockMgr = 0x7D005000U;
+        uc_reg_write(uc, UC_ARM_REG_R0, &mockMgr);
+        return;
+    }
+
+    if (name == "AAssetManager_open") {
+        uint32_t mgr = 0, namePtr = 0, mode = 0;
+        uc_reg_read(uc, UC_ARM_REG_R0, &mgr);
+        uc_reg_read(uc, UC_ARM_REG_R1, &namePtr);
+        uc_reg_read(uc, UC_ARM_REG_R2, &mode);
+        std::string filename = readGuestCString(uc, namePtr, 256);
+        std::string resolved = resolveAssetPath(filename);
+        if (resolved.empty()) {
+            LOGW("AAssetManager_open: Asset '%s' non trovato!", filename.c_str());
+            uint32_t zero = 0;
+            uc_reg_write(uc, UC_ARM_REG_R0, &zero);
+            return;
+        }
+
+        FILE* fp = fopen(resolved.c_str(), "rb");
+        if (!fp) {
+            LOGE("AAssetManager_open: Impossibile aprire file risolto '%s'!", resolved.c_str());
+            uint32_t zero = 0;
+            uc_reg_write(uc, UC_ARM_REG_R0, &zero);
+            return;
+        }
+
+        fseek(fp, 0, SEEK_END);
+        size_t len = static_cast<size_t>(ftell(fp));
+        fseek(fp, 0, SEEK_SET);
+
+        uint32_t assetH = nextAssetHandle_++;
+        guestAssetMap_[assetH] = {assetH, fp, resolved, len, 0};
+
+        LOGI("AAssetManager_open('%s') -> Handle 0x%08x (%zu byte)", filename.c_str(), assetH, len);
+        uc_reg_write(uc, UC_ARM_REG_R0, &assetH);
+        return;
+    }
+
+    if (name == "AAsset_read") {
+        uint32_t assetH = 0, bufPtr = 0, count = 0;
+        uc_reg_read(uc, UC_ARM_REG_R0, &assetH);
+        uc_reg_read(uc, UC_ARM_REG_R1, &bufPtr);
+        uc_reg_read(uc, UC_ARM_REG_R2, &count);
+
+        auto it = guestAssetMap_.find(assetH);
+        if (it == guestAssetMap_.end() || !it->second.fp || bufPtr == 0 || count == 0) {
+            uint32_t zero = 0;
+            uc_reg_write(uc, UC_ARM_REG_R0, &zero);
+            return;
+        }
+
+        std::vector<uint8_t> tmp(count);
+        size_t nRead = fread(tmp.data(), 1, count, it->second.fp);
+        if (nRead > 0) {
+            uc_mem_write(uc, bufPtr, tmp.data(), nRead);
+        }
+        uint32_t res = static_cast<uint32_t>(nRead);
+        uc_reg_write(uc, UC_ARM_REG_R0, &res);
+        return;
+    }
+
+    if (name == "AAsset_seek" || name == "AAsset_seek64") {
+        uint32_t assetH = 0, offset = 0, whence = 0;
+        uc_reg_read(uc, UC_ARM_REG_R0, &assetH);
+        uc_reg_read(uc, UC_ARM_REG_R1, &offset);
+        uc_reg_read(uc, UC_ARM_REG_R2, &whence);
+
+        auto it = guestAssetMap_.find(assetH);
+        if (it == guestAssetMap_.end() || !it->second.fp) {
+            uint32_t err = 0xFFFFFFFFU;
+            uc_reg_write(uc, UC_ARM_REG_R0, &err);
+            return;
+        }
+
+        int w = (whence == 0) ? SEEK_SET : ((whence == 1) ? SEEK_CUR : SEEK_END);
+        fseek(it->second.fp, static_cast<long>(static_cast<int32_t>(offset)), w);
+        long cur = ftell(it->second.fp);
+        uint32_t res = static_cast<uint32_t>(cur);
+        uc_reg_write(uc, UC_ARM_REG_R0, &res);
+        return;
+    }
+
+    if (name == "AAsset_getLength" || name == "AAsset_getLength64") {
+        uint32_t assetH = 0;
+        uc_reg_read(uc, UC_ARM_REG_R0, &assetH);
+        auto it = guestAssetMap_.find(assetH);
+        uint32_t len = (it != guestAssetMap_.end()) ? static_cast<uint32_t>(it->second.length) : 0U;
+        uc_reg_write(uc, UC_ARM_REG_R0, &len);
+        return;
+    }
+
+    if (name == "AAsset_getRemainingLength" || name == "AAsset_getRemainingLength64") {
+        uint32_t assetH = 0;
+        uc_reg_read(uc, UC_ARM_REG_R0, &assetH);
+        auto it = guestAssetMap_.find(assetH);
+        uint32_t rem = 0;
+        if (it != guestAssetMap_.end() && it->second.fp) {
+            long cur = ftell(it->second.fp);
+            rem = (cur >= 0 && static_cast<size_t>(cur) < it->second.length) ? static_cast<uint32_t>(it->second.length - cur) : 0U;
+        }
+        uc_reg_write(uc, UC_ARM_REG_R0, &rem);
+        return;
+    }
+
+    if (name == "AAsset_getBuffer") {
+        uint32_t assetH = 0;
+        uc_reg_read(uc, UC_ARM_REG_R0, &assetH);
+        auto it = guestAssetMap_.find(assetH);
+        if (it == guestAssetMap_.end() || !it->second.fp) {
+            uint32_t zero = 0;
+            uc_reg_write(uc, UC_ARM_REG_R0, &zero);
+            return;
+        }
+
+        if (it->second.bufferGuestAddr == 0) {
+            uint32_t gBuf = allocGuestHeap(uc, static_cast<uint32_t>(it->second.length + 16U), 16);
+            fseek(it->second.fp, 0, SEEK_SET);
+            std::vector<uint8_t> data(it->second.length);
+            if (it->second.length > 0) {
+                fread(data.data(), 1, it->second.length, it->second.fp);
+                uc_mem_write(uc, gBuf, data.data(), it->second.length);
+            }
+            it->second.bufferGuestAddr = gBuf;
+        }
+
+        uc_reg_write(uc, UC_ARM_REG_R0, &it->second.bufferGuestAddr);
+        return;
+    }
+
+    if (name == "AAsset_openFileDescriptor" || name == "AAsset_openFileDescriptor64") {
+        uint32_t assetH = 0, outStart = 0, outLength = 0;
+        uc_reg_read(uc, UC_ARM_REG_R0, &assetH);
+        uc_reg_read(uc, UC_ARM_REG_R1, &outStart);
+        uc_reg_read(uc, UC_ARM_REG_R2, &outLength);
+
+        auto it = guestAssetMap_.find(assetH);
+        if (it == guestAssetMap_.end() || !it->second.fp) {
+            int err = -1;
+            uc_reg_write(uc, UC_ARM_REG_R0, reinterpret_cast<uint32_t*>(&err));
+            return;
+        }
+
+        int fd = fileno(it->second.fp);
+        uint32_t start = 0;
+        uint32_t len = static_cast<uint32_t>(it->second.length);
+        if (outStart != 0) uc_mem_write(uc, outStart, &start, 4);
+        if (outLength != 0) uc_mem_write(uc, outLength, &len, 4);
+
+        int dupFd = dup(fd);
+        uint32_t retFd = static_cast<uint32_t>(dupFd >= 0 ? dupFd : fd);
+        uc_reg_write(uc, UC_ARM_REG_R0, &retFd);
+        return;
+    }
+
+    if (name == "AAsset_isAllocated") {
+        uint32_t one = 1;
+        uc_reg_write(uc, UC_ARM_REG_R0, &one);
+        return;
+    }
+
+    if (name == "AAsset_close") {
+        uint32_t assetH = 0;
+        uc_reg_read(uc, UC_ARM_REG_R0, &assetH);
+        auto it = guestAssetMap_.find(assetH);
+        if (it != guestAssetMap_.end()) {
+            if (it->second.fp) fclose(it->second.fp);
+            guestAssetMap_.erase(it);
+        }
+        uint32_t zero = 0;
+        uc_reg_write(uc, UC_ARM_REG_R0, &zero);
+        return;
+    }
+
+    if (name == "AAssetManager_openDir") {
+        uint32_t mgr = 0, dirNamePtr = 0;
+        uc_reg_read(uc, UC_ARM_REG_R0, &mgr);
+        uc_reg_read(uc, UC_ARM_REG_R1, &dirNamePtr);
+        std::string dirName = readGuestCString(uc, dirNamePtr, 256);
+
+        std::string resolvedDir = filesDir_ + "/assets/" + packageName_ + "/" + dirName;
+        uint32_t dirH = nextAssetDirHandle_++;
+        GuestAssetDir gad;
+        gad.id = dirH;
+        gad.currentIndex = 0;
+
+        DIR* d = opendir(resolvedDir.c_str());
+        if (d) {
+            struct dirent* entry;
+            while ((entry = readdir(d)) != nullptr) {
+                if (entry->d_name[0] != '.') {
+                    gad.files.push_back(entry->d_name);
+                }
+            }
+            closedir(d);
+        }
+        guestAssetDirMap_[dirH] = gad;
+        uc_reg_write(uc, UC_ARM_REG_R0, &dirH);
+        return;
+    }
+
+    if (name == "AAssetDir_getNextFileName") {
+        uint32_t dirH = 0;
+        uc_reg_read(uc, UC_ARM_REG_R0, &dirH);
+        auto it = guestAssetDirMap_.find(dirH);
+        if (it != guestAssetDirMap_.end() && it->second.currentIndex < it->second.files.size()) {
+            std::string f = it->second.files[it->second.currentIndex++];
+            uint32_t strPtr = createGuestString(uc, f);
+            uc_reg_write(uc, UC_ARM_REG_R0, &strPtr);
+            return;
+        }
+        uint32_t zero = 0;
+        uc_reg_write(uc, UC_ARM_REG_R0, &zero);
+        return;
+    }
+
+    if (name == "AAssetDir_rewind") {
+        uint32_t dirH = 0;
+        uc_reg_read(uc, UC_ARM_REG_R0, &dirH);
+        auto it = guestAssetDirMap_.find(dirH);
+        if (it != guestAssetDirMap_.end()) {
+            it->second.currentIndex = 0;
+        }
+        uint32_t zero = 0;
+        uc_reg_write(uc, UC_ARM_REG_R0, &zero);
+        return;
+    }
+
+    if (name == "AAssetDir_close") {
+        uint32_t dirH = 0;
+        uc_reg_read(uc, UC_ARM_REG_R0, &dirH);
+        guestAssetDirMap_.erase(dirH);
+        uint32_t zero = 0;
+        uc_reg_write(uc, UC_ARM_REG_R0, &zero);
+        return;
+    }
+
+    // 15. Android AConfiguration APIs
+    if (name == "AConfiguration_new") {
+        uint32_t configH = 0x7D006000U;
+        uc_reg_write(uc, UC_ARM_REG_R0, &configH);
+        return;
+    }
+
+    if (name == "AConfiguration_fromAssetManager" || name == "AConfiguration_delete") {
+        uint32_t zero = 0;
+        uc_reg_write(uc, UC_ARM_REG_R0, &zero);
+        return;
+    }
+
+    if (name == "AConfiguration_getDensity") {
+        uint32_t densityDpi = 320; // ACONFIGURATION_DENSITY_XHIGH
+        uc_reg_write(uc, UC_ARM_REG_R0, &densityDpi);
+        return;
+    }
+
+    if (name == "AConfiguration_getOrientation") {
+        uint32_t orientation = 1; // ACONFIGURATION_ORIENTATION_PORT
+        uc_reg_write(uc, UC_ARM_REG_R0, &orientation);
         return;
     }
 
