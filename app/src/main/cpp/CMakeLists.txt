@@ -28,6 +28,7 @@ add_library(
     core/audio_thunker.cpp
     core/guest_thread.cpp
     core/gles_virtualizer.cpp
+    core/guest_signal.cpp
     unicorn/unicorn_impl.cpp
     elf_loader.cpp
     linker_hook.cpp

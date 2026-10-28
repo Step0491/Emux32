@@ -2,6 +2,7 @@
 #include "unicorn/arm.h"
 #include "core/guest_memory.h"
 #include "core/tb_cache.h"
+#include "core/guest_signal.h"
 
 #include <android/log.h>
 #include <sys/mman.h>
@@ -1243,6 +1244,19 @@ public:
 
     void ExceptionRaised(Dynarmic::A32::VAddr pc, Dynarmic::A32::Exception exception) override {
         LOGW("Dynarmic: ExceptionRaised a PC=0x%08x (tipo=%d)", pc, static_cast<int>(exception));
+        int sig = emux::GUEST_SIGSEGV;
+        int code = 1;
+        if (exception == Dynarmic::A32::Exception::Breakpoint) {
+            sig = emux::GUEST_SIGTRAP;
+        } else if (exception == Dynarmic::A32::Exception::UndefinedInstruction) {
+            sig = emux::GUEST_SIGILL;
+        }
+        if (emux::GuestSignalManager::getInstance().deliverSignal(reinterpret_cast<uc_engine*>(inst_), sig, pc, code)) {
+            auto& jRegs = inst_->dynarmic_jit->Regs();
+            for (int i = 0; i < 16; ++i) jRegs[i] = inst_->regs[i];
+            inst_->dynarmic_jit->SetCpsr(inst_->cpsr);
+            return;
+        }
         inst_->dynarmic_jit->HaltExecution(Dynarmic::HaltReason::UserDefined2);
     }
 
@@ -1956,6 +1970,9 @@ uc_err runInterpreter(UnicornInstance* inst, uint64_t begin, uint64_t until, siz
             uint32_t lr = inst->regs[14];
             LOGW("uc_emu_start: Salto a NULL/LowAddr PC=0x%08x da lastPC=0x%08x (LR=0x%08x, SP=0x%08x, r0=0x%08x, insns=%zu)",
                  pc, lastValidPc, lr, inst->regs[13], inst->regs[0], instructionsExecuted);
+            if (emux::GuestSignalManager::getInstance().deliverSignal(reinterpret_cast<uc_engine*>(inst), emux::GUEST_SIGSEGV, pc, 1)) {
+                continue;
+            }
             if (lr >= 0x1000U && lr != 0xDEADBEEFU && lr != lastValidPc && nullRecoveries < 64) {
                 nullRecoveries++;
                 inst->regs[0] = 0;
@@ -1981,6 +1998,9 @@ uc_err runInterpreter(UnicornInstance* inst, uint64_t begin, uint64_t until, siz
             }
             if (!fetchOk) {
                 LOGE("uc_emu_start [ARM]: Fault lettura PC=0x%08x (LR=0x%08x)", pc, inst->regs[14]);
+                if (emux::GuestSignalManager::getInstance().deliverSignal(reinterpret_cast<uc_engine*>(inst), emux::GUEST_SIGSEGV, pc, 1)) {
+                    continue;
+                }
                 if (inst->regs[14] >= 0x1000U && inst->regs[14] != 0xDEADBEEFU && nullRecoveries < 32) {
                     nullRecoveries++;
                     inst->regs[0] = 0;
@@ -2371,6 +2391,9 @@ uc_err runInterpreter(UnicornInstance* inst, uint64_t begin, uint64_t until, siz
             }
             if (!tFetchOk) {
                 LOGE("uc_emu_start [Thumb]: Fault lettura PC=0x%08x (LR=0x%08x)", pc, inst->regs[14]);
+                if (emux::GuestSignalManager::getInstance().deliverSignal(reinterpret_cast<uc_engine*>(inst), emux::GUEST_SIGSEGV, pc, 1)) {
+                    continue;
+                }
                 if (inst->regs[14] >= 0x1000U && inst->regs[14] != 0xDEADBEEFU && nullRecoveries < 32) {
                     nullRecoveries++;
                     inst->regs[0] = 0;

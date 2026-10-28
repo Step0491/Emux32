@@ -5,6 +5,7 @@
 #include "core/guest_thread.h"
 #include "core/guest_memory.h"
 #include "core/gles_virtualizer.h"
+#include "core/guest_signal.h"
 #include "unicorn/arm.h"
 
 #include <EGL/egl.h>
@@ -502,12 +503,21 @@ int32_t SyscallDispatcher::handleSyscall(
         }
         case ARM_NR_mprotect:
         case ARM_NR_prctl:
-        case 174: // rt_sigaction
-        case 175: // rt_sigprocmask
-        case 186: // sigaltstack
-        case 238: // tkill
-        case 268: // tgkill
             return 0;
+        case 173: // rt_sigreturn
+            return GuestSignalManager::getInstance().handleSigReturn(uc);
+        case 174: // rt_sigaction
+            return GuestSignalManager::getInstance().handleSigAction(r0, r1, r2, r3, uc);
+        case 175: // rt_sigprocmask
+            return GuestSignalManager::getInstance().handleSigProcMask(static_cast<int>(r0), r1, r2, r3, uc);
+        case 186: // sigaltstack
+            return GuestSignalManager::getInstance().handleSigAltStack(r0, r1, uc);
+        case 238: // tkill
+            return GuestSignalManager::getInstance().deliverSignal(uc, static_cast<int>(r1)) ? 0 : -EINVAL;
+        case 268: // tgkill
+            return GuestSignalManager::getInstance().deliverSignal(uc, static_cast<int>(r2)) ? 0 : -EINVAL;
+        case 37:  // kill
+            return GuestSignalManager::getInstance().deliverSignal(uc, static_cast<int>(r1)) ? 0 : -EINVAL;
         case ARM_NR_nanosleep:
         case ARM_NR_futex:
         case 145: // readv
@@ -588,6 +598,7 @@ bool GuestRuntimeEnvironment::initialize(uc_engine* uc) {
     if (!uc) return false;
 
     // Reset completo dello stato runtime per evitare puntatori di istanze uc_ precedenti
+    GuestSignalManager::getInstance().reset();
     sHeapCurrent = 0x58000000;
     nextTrampolineId_ = 1;
     symbolToTrampolineMap_.clear();
@@ -639,6 +650,9 @@ bool GuestRuntimeEnvironment::initialize(uc_engine* uc) {
 
     // 3. Mappa regione Trampoline (0x70000000, 1MB -> fino a 131.072 simboli)
     uc_mem_map(uc, guestTrampolineBase_, 0x100000, UC_PROT_ALL);
+
+    // Inizializza il Gestore dei Segnali e installa il restorer trampoline rt_sigreturn
+    GuestSignalManager::getInstance().initialize(uc, guestTrampolineBase_ + 0x10U);
 
     // 3b. Mappa pool stack dei thread worker (0x7A000000, 4MB)
     uc_mem_map(uc, guestWorkerStackBase_, 0x00400000, UC_PROT_READ | UC_PROT_WRITE);
@@ -2757,45 +2771,61 @@ void GuestRuntimeEnvironment::handleTrampolineCall(uint32_t trampolineId, uc_eng
         return;
     }
 
-    // 8b. Signal Handling & Assertion Safety (Evita che crash handler intrappolino il Main Thread)
+    // 8b. Signal Handling Virtualizzato (GuestSignalManager)
     if (name == "sigaction" || name == "__sigaction") {
         uint32_t sig = 0, actPtr = 0, oldActPtr = 0;
         uc_reg_read(uc, UC_ARM_REG_R0, &sig);
         uc_reg_read(uc, UC_ARM_REG_R1, &actPtr);
         uc_reg_read(uc, UC_ARM_REG_R2, &oldActPtr);
-        if (actPtr != 0) {
-            uint32_t sa_handler = 0;
-            uc_mem_read(uc, actPtr, &sa_handler, 4);
-            LOGI("Guest sigaction intercettata (sig=%u, sa_handler=0x%08x)", sig, sa_handler);
-        }
-        if (oldActPtr != 0) {
-            uint32_t zero = 0;
-            uc_mem_write(uc, oldActPtr, &zero, 4);
-        }
-        uint32_t zero = 0;
-        uc_reg_write(uc, UC_ARM_REG_R0, &zero);
+        int32_t ret = GuestSignalManager::getInstance().handleSigAction(sig, actPtr, oldActPtr, sizeof(GuestSigSet), uc);
+        uint32_t retVal = static_cast<uint32_t>(ret);
+        uc_reg_write(uc, UC_ARM_REG_R0, &retVal);
         return;
     }
     if (name == "signal" || name == "bsd_signal") {
         uint32_t sig = 0, handler = 0;
         uc_reg_read(uc, UC_ARM_REG_R0, &sig);
         uc_reg_read(uc, UC_ARM_REG_R1, &handler);
-        LOGI("Guest signal intercettata (sig=%u, handler=0x%08x)", sig, handler);
-        uint32_t zero = 0;
-        uc_reg_write(uc, UC_ARM_REG_R0, &zero);
+        uint32_t oldHandler = GuestSignalManager::getInstance().handleSignal(sig, handler, uc);
+        uc_reg_write(uc, UC_ARM_REG_R0, &oldHandler);
         return;
     }
-    if (name == "sigaltstack" || name == "sigprocmask" || name == "pthread_sigmask") {
-        uint32_t zero = 0;
-        uc_reg_write(uc, UC_ARM_REG_R0, &zero);
+    if (name == "sigaltstack") {
+        uint32_t ssPtr = 0, ossPtr = 0;
+        uc_reg_read(uc, UC_ARM_REG_R0, &ssPtr);
+        uc_reg_read(uc, UC_ARM_REG_R1, &ossPtr);
+        int32_t ret = GuestSignalManager::getInstance().handleSigAltStack(ssPtr, ossPtr, uc);
+        uint32_t retVal = static_cast<uint32_t>(ret);
+        uc_reg_write(uc, UC_ARM_REG_R0, &retVal);
         return;
     }
-    if (name == "raise" || name == "kill" || name == "tkill" || name == "tgkill") {
+    if (name == "sigprocmask" || name == "pthread_sigmask") {
+        uint32_t how = 0, setPtr = 0, oldSetPtr = 0;
+        uc_reg_read(uc, UC_ARM_REG_R0, &how);
+        uc_reg_read(uc, UC_ARM_REG_R1, &setPtr);
+        uc_reg_read(uc, UC_ARM_REG_R2, &oldSetPtr);
+        int32_t ret = GuestSignalManager::getInstance().handleSigProcMask(static_cast<int>(how), setPtr, oldSetPtr, sizeof(GuestSigSet), uc);
+        uint32_t retVal = static_cast<uint32_t>(ret);
+        uc_reg_write(uc, UC_ARM_REG_R0, &retVal);
+        return;
+    }
+    if (name == "raise") {
         uint32_t sig = 0;
         uc_reg_read(uc, UC_ARM_REG_R0, &sig);
-        LOGW("Guest %s intercettata (sig=%u) - neutralizzata", name.c_str(), sig);
-        uint32_t zero = 0;
-        uc_reg_write(uc, UC_ARM_REG_R0, &zero);
+        int32_t ret = GuestSignalManager::getInstance().deliverSignal(uc, static_cast<int>(sig)) ? 0 : -EINVAL;
+        uint32_t retVal = static_cast<uint32_t>(ret);
+        uc_reg_write(uc, UC_ARM_REG_R0, &retVal);
+        return;
+    }
+    if (name == "kill" || name == "tkill" || name == "tgkill") {
+        uint32_t r0 = 0, r1 = 0, r2 = 0;
+        uc_reg_read(uc, UC_ARM_REG_R0, &r0);
+        uc_reg_read(uc, UC_ARM_REG_R1, &r1);
+        uc_reg_read(uc, UC_ARM_REG_R2, &r2);
+        int sig = (name == "tgkill") ? static_cast<int>(r2) : static_cast<int>(r1);
+        int32_t ret = GuestSignalManager::getInstance().deliverSignal(uc, sig) ? 0 : -EINVAL;
+        uint32_t retVal = static_cast<uint32_t>(ret);
+        uc_reg_write(uc, UC_ARM_REG_R0, &retVal);
         return;
     }
     if (name == "abort") {
