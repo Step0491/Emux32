@@ -9,6 +9,7 @@
 #include <string>
 #include <memory>
 #include <mutex>
+#include <cmath>
 
 #define TAG "EmuxJniBridge"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, TAG, __VA_ARGS__)
@@ -390,9 +391,43 @@ Java_com_emux_translator_nativebridge_NativeEngine_nativeRunSelfTest(
         report += "  [FAIL] Test 5: Trap Neutralization (readTrap=" + std::to_string(readTrap) + ")\n";
     }
 
+    // Test 6: Advanced SIMD NEON 128-bit Vector Execution (VADD.F32 Q0, Q1, Q2)
+    // q1 = [1.5f, 2.5f, 3.5f, 4.5f]
+    // q2 = [10.0f, 20.0f, 30.0f, 40.0f]
+    // VADD.F32 Q0, Q1, Q2 (0xF2020D44)
+    // BX LR               (0xE12FFF1E)
+    float q1Init[4] = { 1.5f, 2.5f, 3.5f, 4.5f };
+    float q2Init[4] = { 10.0f, 20.0f, 30.0f, 40.0f };
+    uc_reg_write(uc, UC_ARM_REG_Q1, q1Init);
+    uc_reg_write(uc, UC_ARM_REG_Q2, q2Init);
+    uint32_t codeNeon[2] = {
+        0xF2020D44U, // VADD.F32 Q0, Q1, Q2
+        0xE12FFF1EU  // BX LR
+    };
+    uint32_t codeNeonAddr = testBase + 0x80U;
+    uc_mem_write(uc, codeNeonAddr, codeNeon, sizeof(codeNeon));
+    uc_reg_write(uc, UC_ARM_REG_LR, &lr);
+    uc_reg_write(uc, UC_ARM_REG_CPSR, &armCpsr);
+    err = uc_emu_start(uc, codeNeonAddr, lr, 0, 100);
+    float q0Res[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+    uc_reg_read(uc, UC_ARM_REG_Q0, q0Res);
+    bool neonOk = (err == UC_ERR_OK) &&
+                  std::fabs(q0Res[0] - 11.5f) < 0.01f &&
+                  std::fabs(q0Res[1] - 22.5f) < 0.01f &&
+                  std::fabs(q0Res[2] - 33.5f) < 0.01f &&
+                  std::fabs(q0Res[3] - 44.5f) < 0.01f;
+    if (neonOk) {
+        report += "  [PASS] Test 6: NEON 128-bit Vector Floating-Point [11.5, 22.5, 33.5, 44.5]\n";
+        passCount++;
+    } else {
+        report += "  [FAIL] Test 6: NEON 128-bit (res=[" +
+                  std::to_string(q0Res[0]) + ", " + std::to_string(q0Res[1]) + ", " +
+                  std::to_string(q0Res[2]) + ", " + std::to_string(q0Res[3]) + "])\n";
+    }
+
     uc_close(uc);
 
-    report += "ESITO: " + std::to_string(passCount) + "/5 TEST SUPERATI CON SUCCESSO SU HARDWARE HOST AARCH64!\n";
+    report += "ESITO: " + std::to_string(passCount) + "/6 TEST SUPERATI CON SUCCESSO SU HARDWARE HOST AARCH64!\n";
     LOGI("%s", report.c_str());
     return env->NewStringUTF(report.c_str());
 }

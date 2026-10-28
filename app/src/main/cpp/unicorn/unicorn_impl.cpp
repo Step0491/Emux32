@@ -823,6 +823,237 @@ bool executeCoprocessorInsn(UnicornInstance* inst, uint32_t insn, uint32_t pcRel
     return true;
 }
 
+// Esecutore istruzioni Advanced SIMD NEON (64-bit 'd' e 128-bit 'q' registers)
+bool executeNeonInsn(UnicornInstance* inst, uint32_t insn) {
+    // 1. NEON Load / Store: VLD1 / VST1 (insn & 0xFE000000 == 0xF4000000)
+    if ((insn & 0xFE000000U) == 0xF4000000U) {
+        bool isLoad = (insn & (1U << 21)) != 0;
+        uint32_t rn = (insn >> 16) & 0xFU;
+        uint32_t vd = ((insn >> 18) & 0x10U) | ((insn >> 12) & 0xFU); // (D << 4) | Vd
+        uint32_t itype = (insn >> 8) & 0xFU;
+        uint32_t rm = insn & 0xFU;
+
+        uint32_t numRegs = 1;
+        if (itype == 0xA || itype == 0x2 || itype == 0x6) {
+            numRegs = (itype == 0xA) ? 2 : ((itype == 0x6) ? 3 : 4);
+        } else if (itype == 0x7) {
+            numRegs = 1;
+        }
+
+        uint32_t curAddr = inst->regs[rn];
+        for (uint32_t r = 0; r < numRegs && (vd + r) < 32; ++r) {
+            uint32_t regIdx = vd + r;
+            if (isLoad) {
+                uint32_t lo = inst->readU32(curAddr);
+                uint32_t hi = inst->readU32(curAddr + 4);
+                inst->setVfpDRaw(regIdx, (static_cast<uint64_t>(hi) << 32) | lo);
+            } else {
+                uint64_t raw = inst->getVfpDRaw(regIdx);
+                inst->writeU32(curAddr, static_cast<uint32_t>(raw & 0xFFFFFFFFU));
+                inst->writeU32(curAddr + 4, static_cast<uint32_t>(raw >> 32));
+            }
+            curAddr += 8;
+        }
+
+        // Post-index writeback
+        if (rm == 13) {
+            inst->regs[rn] = curAddr;
+        } else if (rm != 15) {
+            inst->regs[rn] = inst->regs[rn] + inst->regs[rm];
+        }
+        return true;
+    }
+
+    // 2. VDUP (Scalar from ARM Core Register to all elements of vector)
+    if ((insn & 0xFFB00F10U) == 0xFE800B10U) {
+        uint32_t rt = (insn >> 12) & 0xFU;
+        uint32_t vd = ((insn >> 18) & 0x10U) | ((insn >> 16) & 0xFU);
+        bool q = (insn & (1U << 6)) != 0;
+        uint32_t val = (rt < 15) ? inst->regs[rt] : 0;
+        uint64_t dVal = (static_cast<uint64_t>(val) << 32) | val;
+        uint32_t count = q ? 2 : 1;
+        if (q) vd &= ~1U;
+        for (uint32_t r = 0; r < count && (vd + r) < 32; ++r) {
+            inst->setVfpDRaw(vd + r, dVal);
+        }
+        return true;
+    }
+
+    // 3. VDUP (Scalar from D-register lane)
+    if ((insn & 0xFFB00F90U) == 0xF3B00C00U) {
+        uint32_t vd = ((insn >> 18) & 0x10U) | ((insn >> 12) & 0xFU);
+        uint32_t vm = ((insn >> 1) & 0x10U) | (insn & 0xFU);
+        bool q = (insn & (1U << 6)) != 0;
+        uint32_t lane = (insn >> 19) & 1U;
+        uint64_t src = inst->getVfpDRaw(vm);
+        uint32_t val = lane ? static_cast<uint32_t>(src >> 32) : static_cast<uint32_t>(src & 0xFFFFFFFFU);
+        uint64_t dVal = (static_cast<uint64_t>(val) << 32) | val;
+        uint32_t count = q ? 2 : 1;
+        if (q) vd &= ~1U;
+        for (uint32_t r = 0; r < count && (vd + r) < 32; ++r) {
+            inst->setVfpDRaw(vd + r, dVal);
+        }
+        return true;
+    }
+
+    // 4. NEON Data Processing: insn & 0xFE000000 == 0xF2000000
+    if ((insn & 0xFE000000U) == 0xF2000000U) {
+        bool bit24 = (insn & (1U << 24)) != 0; // U bit
+        bool bit23 = (insn & (1U << 23)) != 0;
+        bool bit21 = (insn & (1U << 21)) != 0;
+        bool bit20 = (insn & (1U << 20)) != 0;
+        bool bit6 = (insn & (1U << 6)) != 0;   // Q bit (0 = 64-bit d registers, 1 = 128-bit q registers)
+        bool bit4 = (insn & (1U << 4)) != 0;
+        uint32_t vd = ((insn >> 18) & 0x10U) | ((insn >> 12) & 0xFU); // (D << 4) | Vd
+        uint32_t vn = ((insn >> 3) & 0x10U) | ((insn >> 16) & 0xFU);  // (N << 4) | Vn
+        uint32_t vm = ((insn >> 1) & 0x10U) | (insn & 0xFU);          // (M << 4) | Vm
+        uint32_t opc4 = (insn >> 8) & 0xFU;                            // bits 11..8
+
+        uint32_t countD = bit6 ? 2 : 1; // 128-bit usa due registri D consecutivi (q = 2 * d)
+        if (bit6) {
+            vd &= ~1U;
+            vn &= ~1U;
+            vm &= ~1U;
+        }
+
+        // 4a. Two-register misc (bit24 == 1, bit23 == 1 e bits 21:20 == 11)
+        if (bit24 && bit23 && ((insn & 0x00300000U) == 0x00300000U)) {
+            uint32_t miscOp = (insn >> 7) & 0x1FU;
+            for (uint32_t r = 0; r < countD && (vd + r) < 32 && (vm + r) < 32; ++r) {
+                uint64_t src = inst->getVfpDRaw(vm + r);
+                uint64_t dst = src;
+                if (miscOp == 0x00) { // VREV64
+                    dst = __builtin_bswap64(src);
+                } else if (miscOp == 0x01) { // VREV32
+                    uint32_t lo = static_cast<uint32_t>(src & 0xFFFFFFFFU);
+                    uint32_t hi = static_cast<uint32_t>(src >> 32);
+                    dst = (static_cast<uint64_t>(__builtin_bswap32(hi)) << 32) | __builtin_bswap32(lo);
+                } else if (miscOp == 0x03) { // VMVN (bitwise NOT)
+                    dst = ~src;
+                } else if (miscOp == 0x0F) { // VNEG (float)
+                    float f0 = 0.0f, f1 = 0.0f;
+                    std::memcpy(&f0, &src, 4);
+                    std::memcpy(&f1, reinterpret_cast<const uint8_t*>(&src) + 4, 4);
+                    f0 = -f0; f1 = -f1;
+                    std::memcpy(&dst, &f0, 4);
+                    std::memcpy(reinterpret_cast<uint8_t*>(&dst) + 4, &f1, 4);
+                } else if (miscOp == 0x0E) { // VABS (float)
+                    float f0 = 0.0f, f1 = 0.0f;
+                    std::memcpy(&f0, &src, 4);
+                    std::memcpy(&f1, reinterpret_cast<const uint8_t*>(&src) + 4, 4);
+                    f0 = std::fabs(f0); f1 = std::fabs(f1);
+                    std::memcpy(&dst, &f0, 4);
+                    std::memcpy(reinterpret_cast<uint8_t*>(&dst) + 4, &f1, 4);
+                } else if (miscOp == 0x1B || miscOp == 0x1A) { // VCVT (float <-> int)
+                    float f0 = 0.0f, f1 = 0.0f;
+                    std::memcpy(&f0, &src, 4);
+                    std::memcpy(&f1, reinterpret_cast<const uint8_t*>(&src) + 4, 4);
+                    int32_t i0 = static_cast<int32_t>(f0);
+                    int32_t i1 = static_cast<int32_t>(f1);
+                    std::memcpy(&dst, &i0, 4);
+                    std::memcpy(reinterpret_cast<uint8_t*>(&dst) + 4, &i1, 4);
+                }
+                inst->setVfpDRaw(vd + r, dst);
+            }
+            return true;
+        }
+
+        // 4b. Three-register same length
+        for (uint32_t r = 0; r < countD && (vd + r) < 32; ++r) {
+            uint64_t aRaw = inst->getVfpDRaw(vn + r);
+            uint64_t bRaw = inst->getVfpDRaw(vm + r);
+            uint64_t dRaw = inst->getVfpDRaw(vd + r);
+
+            // Floating point operations (opc4 == 0xD, 0xF, 0xC)
+            if (opc4 == 0xD || opc4 == 0xF || opc4 == 0xC) {
+                float a0 = 0.0f, a1 = 0.0f, b0 = 0.0f, b1 = 0.0f, d0 = 0.0f, d1 = 0.0f;
+                std::memcpy(&a0, &aRaw, 4);
+                std::memcpy(&a1, reinterpret_cast<const uint8_t*>(&aRaw) + 4, 4);
+                std::memcpy(&b0, &bRaw, 4);
+                std::memcpy(&b1, reinterpret_cast<const uint8_t*>(&bRaw) + 4, 4);
+                std::memcpy(&d0, &dRaw, 4);
+                std::memcpy(&d1, reinterpret_cast<const uint8_t*>(&dRaw) + 4, 4);
+
+                float res0 = 0.0f, res1 = 0.0f;
+                if (opc4 == 0xD) {
+                    if (!bit4) {
+                        if (!bit23 && !bit21) { // VADD.F32
+                            res0 = a0 + b0; res1 = a1 + b1;
+                        } else if (!bit23 && bit21) { // VSUB.F32
+                            res0 = a0 - b0; res1 = a1 - b1;
+                        } else if (bit23 && !bit21) { // VMUL.F32
+                            res0 = a0 * b0; res1 = a1 * b1;
+                        } else { // VABD.F32
+                            res0 = std::fabs(a0 - b0); res1 = std::fabs(a1 - b1);
+                        }
+                    } else {
+                        if (!bit21) { // VMLA.F32
+                            res0 = d0 + a0 * b0; res1 = d1 + a1 * b1;
+                        } else { // VMLS.F32
+                            res0 = d0 - a0 * b0; res1 = d1 - a1 * b1;
+                        }
+                    }
+                } else if (opc4 == 0xF) {
+                    if (!bit21) { // VMAX.F32
+                        res0 = std::max(a0, b0); res1 = std::max(a1, b1);
+                    } else { // VMIN.F32
+                        res0 = std::min(a0, b0); res1 = std::min(a1, b1);
+                    }
+                } else if (opc4 == 0xC) { // VMUL.F32
+                    res0 = a0 * b0; res1 = a1 * b1;
+                } else {
+                    res0 = a0 + b0; res1 = a1 + b1;
+                }
+
+                uint64_t outRaw = 0;
+                std::memcpy(&outRaw, &res0, 4);
+                std::memcpy(reinterpret_cast<uint8_t*>(&outRaw) + 4, &res1, 4);
+                inst->setVfpDRaw(vd + r, outRaw);
+            } else if (opc4 == 0x8) { // Integer Add / Sub
+                uint32_t a0 = static_cast<uint32_t>(aRaw & 0xFFFFFFFFU);
+                uint32_t a1 = static_cast<uint32_t>(aRaw >> 32);
+                uint32_t b0 = static_cast<uint32_t>(bRaw & 0xFFFFFFFFU);
+                uint32_t b1 = static_cast<uint32_t>(bRaw >> 32);
+                uint64_t outRaw = 0;
+                if (!bit24) { // VADD.I32
+                    outRaw = (static_cast<uint64_t>(a1 + b1) << 32) | (a0 + b0);
+                } else { // VSUB.I32
+                    outRaw = (static_cast<uint64_t>(a1 - b1) << 32) | (a0 - b0);
+                }
+                inst->setVfpDRaw(vd + r, outRaw);
+            } else if (opc4 == 0x9) { // Integer Mul
+                uint32_t a0 = static_cast<uint32_t>(aRaw & 0xFFFFFFFFU);
+                uint32_t a1 = static_cast<uint32_t>(aRaw >> 32);
+                uint32_t b0 = static_cast<uint32_t>(bRaw & 0xFFFFFFFFU);
+                uint32_t b1 = static_cast<uint32_t>(bRaw >> 32);
+                uint64_t outRaw = (static_cast<uint64_t>(a1 * b1) << 32) | (a0 * b0);
+                inst->setVfpDRaw(vd + r, outRaw);
+            } else if (bit4 && (opc4 == 0x1 || opc4 == 0x0)) { // Bitwise Logic
+                uint32_t logicOp = ((insn >> 20) & 3U);
+                uint64_t outRaw = 0;
+                if (!bit24) {
+                    if (logicOp == 0) outRaw = aRaw & bRaw;        // VAND
+                    else if (logicOp == 1) outRaw = aRaw & ~bRaw;  // VBIC
+                    else if (logicOp == 2) outRaw = aRaw | bRaw;   // VORR / VMOV
+                    else outRaw = aRaw | ~bRaw;                    // VORN
+                } else {
+                    if (logicOp == 0) outRaw = aRaw ^ bRaw;                    // VEOR
+                    else if (logicOp == 1) outRaw = (dRaw & aRaw) | (~dRaw & bRaw); // VBSL
+                    else if (logicOp == 2) outRaw = (bRaw & aRaw) | (dRaw & ~aRaw); // VBIT
+                    else outRaw = (bRaw & ~aRaw) | (dRaw & aRaw);             // VBIF
+                }
+                inst->setVfpDRaw(vd + r, outRaw);
+            } else {
+                // Default fallback: VMOV register pass-through
+                inst->setVfpDRaw(vd + r, bRaw);
+            }
+        }
+        return true;
+    }
+
+    return false;
+}
+
 } // namespace
 
 extern "C" {
@@ -908,6 +1139,14 @@ uc_err uc_reg_read(uc_engine *uc, int regid, void *value) {
         std::memcpy(value, &dVal, 8);
         return UC_ERR_OK;
     }
+    if (regid >= UC_ARM_REG_Q0 && regid <= UC_ARM_REG_Q15) {
+        uint32_t qIdx = regid - UC_ARM_REG_Q0;
+        uint64_t d0 = inst->getVfpDRaw(qIdx * 2);
+        uint64_t d1 = inst->getVfpDRaw(qIdx * 2 + 1);
+        std::memcpy(value, &d0, 8);
+        std::memcpy(reinterpret_cast<uint8_t*>(value) + 8, &d1, 8);
+        return UC_ERR_OK;
+    }
     if (regid == UC_ARM_REG_FPSCR || regid == UC_ARM_REG_FPSCR_NZCV) {
         *reinterpret_cast<uint32_t*>(value) = inst->fpscr;
         return UC_ERR_OK;
@@ -954,6 +1193,15 @@ uc_err uc_reg_write(uc_engine *uc, int regid, const void *value) {
         double dVal = 0.0;
         std::memcpy(&dVal, value, 8);
         inst->setVfpD(dIdx, dVal);
+        return UC_ERR_OK;
+    }
+    if (regid >= UC_ARM_REG_Q0 && regid <= UC_ARM_REG_Q15) {
+        uint32_t qIdx = regid - UC_ARM_REG_Q0;
+        uint64_t d0 = 0, d1 = 0;
+        std::memcpy(&d0, value, 8);
+        std::memcpy(&d1, reinterpret_cast<const uint8_t*>(value) + 8, 8);
+        inst->setVfpDRaw(qIdx * 2, d0);
+        inst->setVfpDRaw(qIdx * 2 + 1, d1);
         return UC_ERR_OK;
     }
     if (regid == UC_ARM_REG_FPSCR || regid == UC_ARM_REG_FPSCR_NZCV) {
@@ -1277,6 +1525,11 @@ uc_err uc_emu_start(uc_engine *uc, uint64_t begin, uint64_t until, uint64_t /* t
                     inst->regs[14] = pc + 4;
                     inst->cpsr |= FLAG_T;
                     inst->regs[15] = (pc + 8 + imm24 + hBit) & ~1U;
+                    instructionsExecuted++;
+                    continue;
+                }
+                if (executeNeonInsn(inst, insn)) {
+                    inst->regs[15] = pc + 4;
                     instructionsExecuted++;
                     continue;
                 }
@@ -1678,6 +1931,32 @@ uc_err uc_emu_start(uc_engine *uc, uint64_t begin, uint64_t until, uint64_t /* t
                     inst->regs[15] = pc + 4;
                     instructionsExecuted++;
                     continue;
+                }
+
+                // Advanced SIMD NEON Data Processing in Thumb-2 (0xEF.. o 0xFF..)
+                if ((tInsn & 0xEF00U) == 0xEF00U) {
+                    uint32_t uBit = (tInsn >> 12) & 1U;
+                    uint32_t armEquiv = 0xF2000000U | (uBit << 24) | (insn32 & 0x00FFFFFFU);
+                    if (executeNeonInsn(inst, armEquiv)) {
+                        inst->regs[15] = pc + 4;
+                        instructionsExecuted++;
+                        continue;
+                    }
+                }
+
+                // Advanced SIMD NEON Load/Store in Thumb-2 (0xF9..)
+                if ((tInsn & 0xFF00U) == 0xF900U) {
+                    bool isLoad = (tInsn & (1U << 5)) != 0;
+                    uint32_t rn = tInsn & 0xFU;
+                    uint32_t vd = (tInsn2 >> 12) & 0xFU;
+                    uint32_t itype = (tInsn2 >> 8) & 0xFU;
+                    uint32_t rm = tInsn2 & 0xFU;
+                    uint32_t armEquiv = 0xF4000000U | (isLoad ? (1U << 21) : 0U) | (rn << 16) | (vd << 12) | (itype << 8) | rm;
+                    if (executeNeonInsn(inst, armEquiv)) {
+                        inst->regs[15] = pc + 4;
+                        instructionsExecuted++;
+                        continue;
+                    }
                 }
 
                 if ((tInsn & 0xF800U) == 0xF000U && (tInsn2 & 0x8000U) != 0) { // B.W, B<cond>.W, BL, BLX
