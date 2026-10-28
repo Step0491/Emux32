@@ -141,7 +141,15 @@ if (DYNARMIC_USE_BUNDLED_EXTERNALS)
 endif()
 
 if (NOT Boost_FOUND)
-    find_package(Boost 1.57 REQUIRED)
+    if (EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/externals/boost_mini")
+        add_library(Boost::boost INTERFACE IMPORTED)
+        set_target_properties(Boost::boost PROPERTIES
+            INTERFACE_INCLUDE_DIRECTORIES "${CMAKE_CURRENT_SOURCE_DIR}/externals/boost_mini"
+        )
+        set(Boost_FOUND TRUE)
+    else()
+        find_package(Boost 1.57 REQUIRED)
+    endif()
 endif()
 find_package(fmt 9 CONFIG)
 find_package(mcl 0.1.12 EXACT CONFIG)

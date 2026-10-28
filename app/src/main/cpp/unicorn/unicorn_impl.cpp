@@ -15,6 +15,12 @@
 #include <algorithm>
 #include <new>
 
+#if defined(EMUX_ENABLE_DYNARMIC)
+#include "dynarmic/interface/A32/a32.h"
+#include "dynarmic/interface/A32/config.h"
+#include "dynarmic/interface/A32/coprocessor.h"
+#endif
+
 #define TAG "UnicornCore"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, TAG, __VA_ARGS__)
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN, TAG, __VA_ARGS__)
@@ -217,6 +223,11 @@ inline double vfpExpandImm64(uint32_t imm8) {
     return d;
 }
 
+#if defined(EMUX_ENABLE_DYNARMIC)
+class DynarmicUserCallbacks;
+class DynarmicCp15;
+#endif
+
 struct UnicornInstance {
     uc_arch arch{UC_ARCH_ARM};
     uc_mode mode{UC_MODE_ARM};
@@ -291,13 +302,31 @@ struct UnicornInstance {
     uc_hook next_hook_id{1};
     std::mutex hook_mutex;
 
+#if defined(EMUX_ENABLE_DYNARMIC)
+    std::unique_ptr<DynarmicUserCallbacks> dynarmic_cb;
+    std::shared_ptr<DynarmicCp15> dynarmic_cp15;
+    std::unique_ptr<Dynarmic::A32::Jit> dynarmic_jit;
+    void initDynarmic();
+    uc_err runDynarmic(uint64_t begin, uint64_t until, size_t count);
+    void executeInterpreterStep(uint32_t pc, size_t num_instructions);
+#endif
+    void dispatchIntr(uint32_t svcComment);
+
     UnicornInstance(uc_arch a, uc_mode m) : arch(a), mode(m), flat_mem(emux::GuestMemory::getSharedInstance()) {
         regs[13] = 0x7E1FF000;
         cpsr = 0x00000010;
         flat_mem.initialize();
+#if defined(EMUX_ENABLE_DYNARMIC)
+        initDynarmic();
+#endif
     }
 
     ~UnicornInstance() {
+#if defined(EMUX_ENABLE_DYNARMIC)
+        dynarmic_jit.reset();
+        dynarmic_cp15.reset();
+        dynarmic_cb.reset();
+#endif
         std::lock_guard<std::mutex> lock(mem_mutex);
         tb_cache.clear();
         flat_mem.destroy();
@@ -369,6 +398,11 @@ struct UnicornInstance {
                 std::memcpy(flat_mem.g2h(gaddr), src, size);
                 if (flat_mem.getPageProt(gaddr) & emux::GP_EXEC) {
                     tb_cache.invalidateRange(gaddr, static_cast<uint32_t>(size));
+#if defined(EMUX_ENABLE_DYNARMIC)
+                    if (dynarmic_jit) {
+                        dynarmic_jit->InvalidateCacheRange(gaddr, size);
+                    }
+#endif
                 }
                 return UC_ERR_OK;
             }
@@ -1054,6 +1088,323 @@ bool executeNeonInsn(UnicornInstance* inst, uint32_t insn) {
     return false;
 }
 
+uc_err runInterpreter(UnicornInstance* inst, uint64_t begin, uint64_t until, size_t count);
+
+void UnicornInstance::dispatchIntr(uint32_t svcComment) {
+    HookEntry localHooks[8];
+    size_t hookCount = 0;
+    {
+        std::lock_guard<std::mutex> lock(hook_mutex);
+        for (const auto& h : hooks) {
+            if ((h.type & UC_HOOK_INTR) && hookCount < 8) {
+                localHooks[hookCount++] = h;
+            }
+        }
+    }
+    uint32_t intnoToSend = (svcComment != 0) ? (0x80000000U | svcComment) : 2U;
+    for (size_t i = 0; i < hookCount; ++i) {
+        auto cb = reinterpret_cast<uc_cb_hookintr_t>(localHooks[i].callback);
+        cb(reinterpret_cast<uc_engine*>(this), intnoToSend, localHooks[i].user_data);
+    }
+}
+
+#if defined(EMUX_ENABLE_DYNARMIC)
+class DynarmicCp15 final : public Dynarmic::A32::Coprocessor {
+public:
+    explicit DynarmicCp15(UnicornInstance* inst) : inst_(inst) {}
+
+    std::optional<Callback> CompileInternalOperation(bool /*two*/, unsigned /*opc1*/, Dynarmic::A32::CoprocReg /*CRd*/,
+                                                     Dynarmic::A32::CoprocReg /*CRn*/, Dynarmic::A32::CoprocReg /*CRm*/,
+                                                     unsigned /*opc2*/) override {
+        return std::nullopt;
+    }
+
+    CallbackOrAccessOneWord CompileSendOneWord(bool two, unsigned opc1, Dynarmic::A32::CoprocReg CRn,
+                                              Dynarmic::A32::CoprocReg CRm, unsigned opc2) override {
+        if (!two && opc1 == 0 && CRn == Dynarmic::A32::CoprocReg::C13 && CRm == Dynarmic::A32::CoprocReg::C0) {
+            if (opc2 == 2) return &inst_->cp15_tpidr_rw;
+            if (opc2 == 3) return &inst_->cp15_tpidr_ro;
+        }
+        if (!two && opc1 == 0 && CRn == Dynarmic::A32::CoprocReg::C7) {
+            Callback cb{};
+            cb.function = [](void*, std::uint32_t, std::uint32_t) -> std::uint64_t {
+                return 0;
+            };
+            return cb;
+        }
+        return std::monostate{};
+    }
+
+    CallbackOrAccessTwoWords CompileSendTwoWords(bool /*two*/, unsigned /*opc*/, Dynarmic::A32::CoprocReg /*CRm*/) override {
+        return std::monostate{};
+    }
+
+    CallbackOrAccessOneWord CompileGetOneWord(bool two, unsigned opc1, Dynarmic::A32::CoprocReg CRn,
+                                             Dynarmic::A32::CoprocReg CRm, unsigned opc2) override {
+        if (!two && opc1 == 0 && CRn == Dynarmic::A32::CoprocReg::C13 && CRm == Dynarmic::A32::CoprocReg::C0) {
+            if (opc2 == 2) return &inst_->cp15_tpidr_rw;
+            if (opc2 == 3) return &inst_->cp15_tpidr_ro;
+        }
+        return std::monostate{};
+    }
+
+    CallbackOrAccessTwoWords CompileGetTwoWords(bool /*two*/, unsigned /*opc*/, Dynarmic::A32::CoprocReg /*CRm*/) override {
+        return std::monostate{};
+    }
+
+    std::optional<Callback> CompileLoadWords(bool /*two*/, bool /*long_transfer*/, Dynarmic::A32::CoprocReg /*CRd*/,
+                                            std::optional<std::uint8_t> /*option*/) override {
+        return std::nullopt;
+    }
+
+    std::optional<Callback> CompileStoreWords(bool /*two*/, bool /*long_transfer*/, Dynarmic::A32::CoprocReg /*CRd*/,
+                                             std::optional<std::uint8_t> /*option*/) override {
+        return std::nullopt;
+    }
+
+private:
+    UnicornInstance* inst_;
+};
+
+class DynarmicUserCallbacks final : public Dynarmic::A32::UserCallbacks {
+public:
+    explicit DynarmicUserCallbacks(UnicornInstance* inst) : inst_(inst) {}
+
+    std::uint8_t MemoryRead8(Dynarmic::A32::VAddr vaddr) override {
+        return inst_->readU8(vaddr);
+    }
+    std::uint16_t MemoryRead16(Dynarmic::A32::VAddr vaddr) override {
+        return inst_->readU16(vaddr);
+    }
+    std::uint32_t MemoryRead32(Dynarmic::A32::VAddr vaddr) override {
+        return inst_->readU32(vaddr);
+    }
+    std::uint64_t MemoryRead64(Dynarmic::A32::VAddr vaddr) override {
+        uint32_t lo = inst_->readU32(vaddr);
+        uint32_t hi = inst_->readU32(vaddr + 4);
+        return (static_cast<uint64_t>(hi) << 32) | lo;
+    }
+
+    void MemoryWrite8(Dynarmic::A32::VAddr vaddr, std::uint8_t value) override {
+        inst_->writeU8(vaddr, value);
+    }
+    void MemoryWrite16(Dynarmic::A32::VAddr vaddr, std::uint16_t value) override {
+        inst_->writeU16(vaddr, value);
+    }
+    void MemoryWrite32(Dynarmic::A32::VAddr vaddr, std::uint32_t value) override {
+        inst_->writeU32(vaddr, value);
+    }
+    void MemoryWrite64(Dynarmic::A32::VAddr vaddr, std::uint64_t value) override {
+        inst_->writeU32(vaddr, static_cast<uint32_t>(value));
+        inst_->writeU32(vaddr + 4, static_cast<uint32_t>(value >> 32));
+    }
+
+    std::optional<std::uint32_t> MemoryReadCode(Dynarmic::A32::VAddr vaddr) override {
+        if ((vaddr & 0xFFFFF000U) == 0xFFFF0000U) {
+            if (vaddr == 0xFFFF0FE0U) return 0xee1d0f70U; // mrc p15, 0, r0, c13, c0, 3
+            if (vaddr == 0xFFFF0FE4U) return 0xe12fff1eU; // bx lr
+            if (vaddr == 0xFFFF0FA0U) return 0xf57ff05eU; // dmb sy
+            if (vaddr == 0xFFFF0FA4U) return 0xe12fff1eU; // bx lr
+            if (vaddr == 0xFFFF0FC0U) return 0xe1923f9fU; // ldrex r3, [r2]
+            if (vaddr == 0xFFFF0FC4U) return 0xe1530000U; // cmp r3, r0
+            if (vaddr == 0xFFFF0FC8U) return 0x13a00001U; // movne r0, #1
+            if (vaddr == 0xFFFF0FCCU) return 0x112fff1eU; // bxne lr
+            if (vaddr == 0xFFFF0FD0U) return 0xe1823f91U; // strex r3, r1, [r2]
+            if (vaddr == 0xFFFF0FD4U) return 0xe3530000U; // cmp r3, #0
+            if (vaddr == 0xFFFF0FD8U) return 0x1a00fff8U; // bne 0xffff0fc0
+            if (vaddr == 0xFFFF0FDCU) return 0xe3a00000U; // mov r0, #0
+            if (vaddr == 0xFFFF0FE0U) return 0xe12fff1eU; // bx lr
+        }
+
+        if (inst_->flat_mem.isReady() && inst_->flat_mem.isMapped(vaddr)) {
+            uint32_t val = 0;
+            std::memcpy(&val, inst_->flat_mem.g2h(vaddr), 4);
+            return val;
+        }
+
+        uint32_t val = 0;
+        if (inst_->readMem(vaddr, &val, 4) == UC_ERR_OK) {
+            return val;
+        }
+        return std::nullopt;
+    }
+
+    void InterpreterFallback(Dynarmic::A32::VAddr pc, size_t num_instructions) override {
+        LOGW("Dynarmic: InterpreterFallback a PC=0x%08x (num_insns=%zu)", pc, num_instructions);
+        inst_->executeInterpreterStep(pc, num_instructions);
+    }
+
+    void CallSVC(std::uint32_t swi) override {
+        inst_->dispatchIntr(swi);
+        if (inst_->stop_requested.load(std::memory_order_relaxed)) {
+            inst_->dynarmic_jit->HaltExecution(Dynarmic::HaltReason::UserDefined1);
+        }
+    }
+
+    void ExceptionRaised(Dynarmic::A32::VAddr pc, Dynarmic::A32::Exception exception) override {
+        LOGW("Dynarmic: ExceptionRaised a PC=0x%08x (tipo=%d)", pc, static_cast<int>(exception));
+        inst_->dynarmic_jit->HaltExecution(Dynarmic::HaltReason::UserDefined2);
+    }
+
+    void AddTicks(std::uint64_t ticks) override {
+        ticks_ += ticks;
+    }
+
+    std::uint64_t GetTicksRemaining() override {
+        return 1000000000ULL;
+    }
+
+private:
+    UnicornInstance* inst_;
+    std::uint64_t ticks_{0};
+};
+
+void UnicornInstance::initDynarmic() {
+    try {
+        dynarmic_cb = std::make_unique<DynarmicUserCallbacks>(this);
+        dynarmic_cp15 = std::make_shared<DynarmicCp15>(this);
+
+        Dynarmic::A32::UserConfig conf;
+        conf.callbacks = dynarmic_cb.get();
+        conf.coprocessors[15] = dynarmic_cp15;
+        conf.arch_version = Dynarmic::A32::ArchVersion::v7;
+        conf.enable_cycle_counting = false;
+        conf.unsafe_optimizations = false;
+
+        if (flat_mem.isReady() && flat_mem.base() != nullptr) {
+            conf.fastmem_pointer = reinterpret_cast<uintptr_t>(flat_mem.base());
+            conf.recompile_on_fastmem_failure = true;
+            LOGI("UnicornCore: Dynarmic Fastmem agganciato all'arena base %p", flat_mem.base());
+        }
+
+        dynarmic_jit = std::make_unique<Dynarmic::A32::Jit>(conf);
+        LOGI("UnicornCore: Dynarmic ARM32 JIT compiler istanziato con successo!");
+    } catch (const std::exception& e) {
+        LOGE("UnicornCore: Eccezione durante initDynarmic: %s (fallback su interprete)", e.what());
+        dynarmic_jit.reset();
+    } catch (...) {
+        LOGE("UnicornCore: Errore sconosciuto durante initDynarmic (fallback su interprete)");
+        dynarmic_jit.reset();
+    }
+}
+
+uc_err UnicornInstance::runDynarmic(uint64_t begin, uint64_t until, size_t count) {
+    itstate = 0;
+    if (begin & 1ULL) {
+        cpsr |= FLAG_T;
+        regs[15] = static_cast<uint32_t>(begin & ~1ULL);
+    } else {
+        cpsr &= ~FLAG_T;
+        regs[15] = static_cast<uint32_t>(begin & ~3ULL);
+    }
+
+    auto& jitRegs = dynarmic_jit->Regs();
+    for (int i = 0; i < 16; ++i) {
+        jitRegs[i] = regs[i];
+    }
+    dynarmic_jit->SetCpsr(cpsr);
+    dynarmic_jit->SetFpscr(fpscr);
+
+    auto& extRegs = dynarmic_jit->ExtRegs();
+    for (int i = 0; i < 32; ++i) {
+        extRegs[i] = vfp_s[i];
+    }
+    for (int i = 0; i < 16; ++i) {
+        extRegs[32 + i * 2] = static_cast<uint32_t>(vfp_d_ext[i]);
+        extRegs[32 + i * 2 + 1] = static_cast<uint32_t>(vfp_d_ext[i] >> 32);
+    }
+
+    dynarmic_jit->ClearHalt(Dynarmic::HaltReason::UserDefined1 | Dynarmic::HaltReason::UserDefined2);
+
+    bool wasRunning = is_running.exchange(true);
+    bool prevStop = stop_requested.exchange(false);
+
+    uint32_t targetUntil = static_cast<uint32_t>(until);
+
+    while (is_running.load(std::memory_order_relaxed) &&
+           !stop_requested.load(std::memory_order_relaxed)) {
+        uint32_t curPc = dynarmic_jit->Regs()[15];
+
+        if (targetUntil != 0 && curPc == targetUntil) {
+            break;
+        }
+        if (curPc == 0xDEADBEEFU || curPc == 0) {
+            break;
+        }
+
+        Dynarmic::HaltReason hr = dynarmic_jit->Run();
+
+        curPc = dynarmic_jit->Regs()[15];
+        if (targetUntil != 0 && curPc == targetUntil) {
+            break;
+        }
+        if (curPc == 0xDEADBEEFU || curPc == 0) {
+            break;
+        }
+
+        if (stop_requested.load(std::memory_order_relaxed)) {
+            break;
+        }
+
+        if (Dynarmic::Has(hr, Dynarmic::HaltReason::UserDefined2)) {
+            break;
+        }
+
+        if (count > 0) {
+            break;
+        }
+    }
+
+    auto& finalRegs = dynarmic_jit->Regs();
+    for (int i = 0; i < 16; ++i) {
+        regs[i] = finalRegs[i];
+    }
+    cpsr = dynarmic_jit->Cpsr();
+    fpscr = dynarmic_jit->Fpscr();
+
+    auto& finalExt = dynarmic_jit->ExtRegs();
+    for (int i = 0; i < 32; ++i) {
+        vfp_s[i] = finalExt[i];
+    }
+    for (int i = 0; i < 16; ++i) {
+        vfp_d_ext[i] = (static_cast<uint64_t>(finalExt[32 + i * 2 + 1]) << 32) | finalExt[32 + i * 2];
+    }
+
+    is_running.store(wasRunning);
+    if (prevStop) stop_requested.store(true);
+    return UC_ERR_OK;
+}
+
+void UnicornInstance::executeInterpreterStep(uint32_t pc, size_t num_instructions) {
+    if (dynarmic_jit) {
+        auto& jRegs = dynarmic_jit->Regs();
+        for (int i = 0; i < 16; ++i) regs[i] = jRegs[i];
+        cpsr = dynarmic_jit->Cpsr();
+        fpscr = dynarmic_jit->Fpscr();
+        auto& jExt = dynarmic_jit->ExtRegs();
+        for (int i = 0; i < 32; ++i) vfp_s[i] = jExt[i];
+        for (int i = 0; i < 16; ++i) {
+            vfp_d_ext[i] = (static_cast<uint64_t>(jExt[32 + i * 2 + 1]) << 32) | jExt[32 + i * 2];
+        }
+    }
+
+    runInterpreter(this, pc, 0, num_instructions);
+
+    if (dynarmic_jit) {
+        auto& jRegs = dynarmic_jit->Regs();
+        for (int i = 0; i < 16; ++i) jRegs[i] = regs[i];
+        dynarmic_jit->SetCpsr(cpsr);
+        dynarmic_jit->SetFpscr(fpscr);
+        auto& jExt = dynarmic_jit->ExtRegs();
+        for (int i = 0; i < 32; ++i) jExt[i] = vfp_s[i];
+        for (int i = 0; i < 16; ++i) {
+            jExt[32 + i * 2] = static_cast<uint32_t>(vfp_d_ext[i]);
+            jExt[32 + i * 2 + 1] = static_cast<uint32_t>(vfp_d_ext[i] >> 32);
+        }
+    }
+}
+#endif
+
 } // namespace
 
 extern "C" {
@@ -1113,6 +1464,63 @@ uc_err uc_reg_read(uc_engine *uc, int regid, void *value) {
     if (!uc || !value) return UC_ERR_HANDLE;
     auto* inst = reinterpret_cast<UnicornInstance*>(uc);
 
+#if defined(EMUX_ENABLE_DYNARMIC)
+    if (inst->dynarmic_jit) {
+        if (regid >= UC_ARM_REG_R0 && regid <= UC_ARM_REG_R12) {
+            *reinterpret_cast<uint32_t*>(value) = inst->dynarmic_jit->Regs()[regid - UC_ARM_REG_R0];
+            return UC_ERR_OK;
+        }
+        if (regid == UC_ARM_REG_SP || regid == UC_ARM_REG_R13) {
+            *reinterpret_cast<uint32_t*>(value) = inst->dynarmic_jit->Regs()[13];
+            return UC_ERR_OK;
+        }
+        if (regid == UC_ARM_REG_LR || regid == UC_ARM_REG_R14) {
+            *reinterpret_cast<uint32_t*>(value) = inst->dynarmic_jit->Regs()[14];
+            return UC_ERR_OK;
+        }
+        if (regid == UC_ARM_REG_PC || regid == UC_ARM_REG_R15) {
+            *reinterpret_cast<uint32_t*>(value) = inst->dynarmic_jit->Regs()[15];
+            return UC_ERR_OK;
+        }
+        if (regid == UC_ARM_REG_CPSR || regid == UC_ARM_REG_APSR) {
+            *reinterpret_cast<uint32_t*>(value) = inst->dynarmic_jit->Cpsr();
+            return UC_ERR_OK;
+        }
+        if (regid >= UC_ARM_REG_D0 && regid <= UC_ARM_REG_D31) {
+            uint32_t dIdx = regid - UC_ARM_REG_D0;
+            uint64_t raw = 0;
+            if (dIdx < 16) {
+                raw = (static_cast<uint64_t>(inst->dynarmic_jit->ExtRegs()[dIdx * 2 + 1]) << 32) | inst->dynarmic_jit->ExtRegs()[dIdx * 2];
+            } else {
+                raw = (static_cast<uint64_t>(inst->dynarmic_jit->ExtRegs()[32 + (dIdx - 16) * 2 + 1]) << 32) | inst->dynarmic_jit->ExtRegs()[32 + (dIdx - 16) * 2];
+            }
+            std::memcpy(value, &raw, 8);
+            return UC_ERR_OK;
+        }
+        if (regid >= UC_ARM_REG_Q0 && regid <= UC_ARM_REG_Q15) {
+            uint32_t qIdx = regid - UC_ARM_REG_Q0;
+            uint64_t d0 = (static_cast<uint64_t>(inst->dynarmic_jit->ExtRegs()[qIdx * 4 + 1]) << 32) | inst->dynarmic_jit->ExtRegs()[qIdx * 4];
+            uint64_t d1 = (static_cast<uint64_t>(inst->dynarmic_jit->ExtRegs()[qIdx * 4 + 3]) << 32) | inst->dynarmic_jit->ExtRegs()[qIdx * 4 + 2];
+            std::memcpy(value, &d0, 8);
+            std::memcpy(reinterpret_cast<uint8_t*>(value) + 8, &d1, 8);
+            return UC_ERR_OK;
+        }
+        if (regid == UC_ARM_REG_FPSCR || regid == UC_ARM_REG_FPSCR_NZCV) {
+            *reinterpret_cast<uint32_t*>(value) = inst->dynarmic_jit->Fpscr();
+            return UC_ERR_OK;
+        }
+        if (regid == UC_ARM_REG_C13_C0_2) {
+            *reinterpret_cast<uint32_t*>(value) = inst->cp15_tpidr_rw;
+            return UC_ERR_OK;
+        }
+        if (regid == UC_ARM_REG_C13_C0_3) {
+            *reinterpret_cast<uint32_t*>(value) = inst->cp15_tpidr_ro;
+            return UC_ERR_OK;
+        }
+        return UC_ERR_ARG;
+    }
+#endif
+
     if (regid >= UC_ARM_REG_R0 && regid <= UC_ARM_REG_R12) {
         *reinterpret_cast<uint32_t*>(value) = inst->regs[regid - UC_ARM_REG_R0];
         return UC_ERR_OK;
@@ -1167,6 +1575,79 @@ uc_err uc_reg_write(uc_engine *uc, int regid, const void *value) {
     if (!uc || !value) return UC_ERR_HANDLE;
     auto* inst = reinterpret_cast<UnicornInstance*>(uc);
     uint32_t val = *reinterpret_cast<const uint32_t*>(value);
+
+#if defined(EMUX_ENABLE_DYNARMIC)
+    if (inst->dynarmic_jit) {
+        if (regid >= UC_ARM_REG_R0 && regid <= UC_ARM_REG_R12) {
+            inst->dynarmic_jit->Regs()[regid - UC_ARM_REG_R0] = val;
+            inst->regs[regid - UC_ARM_REG_R0] = val;
+            return UC_ERR_OK;
+        }
+        if (regid == UC_ARM_REG_SP || regid == UC_ARM_REG_R13) {
+            inst->dynarmic_jit->Regs()[13] = val;
+            inst->regs[13] = val;
+            return UC_ERR_OK;
+        }
+        if (regid == UC_ARM_REG_LR || regid == UC_ARM_REG_R14) {
+            inst->dynarmic_jit->Regs()[14] = val;
+            inst->regs[14] = val;
+            return UC_ERR_OK;
+        }
+        if (regid == UC_ARM_REG_PC || regid == UC_ARM_REG_R15) {
+            inst->dynarmic_jit->Regs()[15] = val;
+            inst->regs[15] = val;
+            return UC_ERR_OK;
+        }
+        if (regid == UC_ARM_REG_CPSR || regid == UC_ARM_REG_APSR) {
+            inst->dynarmic_jit->SetCpsr(val);
+            inst->cpsr = val;
+            return UC_ERR_OK;
+        }
+        if (regid >= UC_ARM_REG_D0 && regid <= UC_ARM_REG_D31) {
+            uint32_t dIdx = regid - UC_ARM_REG_D0;
+            uint64_t raw = 0;
+            std::memcpy(&raw, value, 8);
+            if (dIdx < 16) {
+                inst->dynarmic_jit->ExtRegs()[dIdx * 2] = static_cast<uint32_t>(raw);
+                inst->dynarmic_jit->ExtRegs()[dIdx * 2 + 1] = static_cast<uint32_t>(raw >> 32);
+            } else {
+                inst->dynarmic_jit->ExtRegs()[32 + (dIdx - 16) * 2] = static_cast<uint32_t>(raw);
+                inst->dynarmic_jit->ExtRegs()[32 + (dIdx - 16) * 2 + 1] = static_cast<uint32_t>(raw >> 32);
+            }
+            double dVal = 0.0;
+            std::memcpy(&dVal, value, 8);
+            inst->setVfpD(dIdx, dVal);
+            return UC_ERR_OK;
+        }
+        if (regid >= UC_ARM_REG_Q0 && regid <= UC_ARM_REG_Q15) {
+            uint32_t qIdx = regid - UC_ARM_REG_Q0;
+            uint64_t d0 = 0, d1 = 0;
+            std::memcpy(&d0, value, 8);
+            std::memcpy(&d1, reinterpret_cast<const uint8_t*>(value) + 8, 8);
+            inst->dynarmic_jit->ExtRegs()[qIdx * 4] = static_cast<uint32_t>(d0);
+            inst->dynarmic_jit->ExtRegs()[qIdx * 4 + 1] = static_cast<uint32_t>(d0 >> 32);
+            inst->dynarmic_jit->ExtRegs()[qIdx * 4 + 2] = static_cast<uint32_t>(d1);
+            inst->dynarmic_jit->ExtRegs()[qIdx * 4 + 3] = static_cast<uint32_t>(d1 >> 32);
+            inst->setVfpDRaw(qIdx * 2, d0);
+            inst->setVfpDRaw(qIdx * 2 + 1, d1);
+            return UC_ERR_OK;
+        }
+        if (regid == UC_ARM_REG_FPSCR || regid == UC_ARM_REG_FPSCR_NZCV) {
+            inst->dynarmic_jit->SetFpscr(val);
+            inst->fpscr = val;
+            return UC_ERR_OK;
+        }
+        if (regid == UC_ARM_REG_C13_C0_2) {
+            inst->cp15_tpidr_rw = val;
+            return UC_ERR_OK;
+        }
+        if (regid == UC_ARM_REG_C13_C0_3) {
+            inst->cp15_tpidr_ro = val;
+            return UC_ERR_OK;
+        }
+        return UC_ERR_ARG;
+    }
+#endif
 
     if (regid >= UC_ARM_REG_R0 && regid <= UC_ARM_REG_R12) {
         inst->regs[regid - UC_ARM_REG_R0] = val;
@@ -1295,9 +1776,13 @@ uc_err uc_mem_unmap(uc_engine *uc, uint64_t address, size_t size) {
     std::lock_guard<std::mutex> lock(inst->mem_mutex);
 
     if (inst->flat_mem.isReady() && (address + size) <= emux::GuestMemory::kAddressSpaceSize) {
-        return inst->flat_mem.unmap(static_cast<uint32_t>(address), static_cast<uint32_t>(size))
-            ? UC_ERR_OK
-            : UC_ERR_NOMEM;
+        bool res = inst->flat_mem.unmap(static_cast<uint32_t>(address), static_cast<uint32_t>(size));
+#if defined(EMUX_ENABLE_DYNARMIC)
+        if (inst->dynarmic_jit) {
+            inst->dynarmic_jit->InvalidateCacheRange(static_cast<uint32_t>(address), size);
+        }
+#endif
+        return res ? UC_ERR_OK : UC_ERR_NOMEM;
     }
 
     for (auto it = inst->regions.begin(); it != inst->regions.end(); ++it) {
@@ -1378,9 +1863,8 @@ uc_err uc_hook_del(uc_engine *uc, uc_hook hh) {
     return UC_ERR_HOOK;
 }
 
-uc_err uc_emu_start(uc_engine *uc, uint64_t begin, uint64_t until, uint64_t /* timeout */, size_t count) {
-    if (!uc) return UC_ERR_HANDLE;
-    auto* inst = reinterpret_cast<UnicornInstance*>(uc);
+uc_err runInterpreter(UnicornInstance* inst, uint64_t begin, uint64_t until, size_t count) {
+    if (!inst) return UC_ERR_HANDLE;
 
     inst->itstate = 0;
     if (begin & 1ULL) {
@@ -2505,11 +2989,29 @@ uc_err uc_emu_start(uc_engine *uc, uint64_t begin, uint64_t until, uint64_t /* t
     return UC_ERR_OK;
 }
 
+uc_err uc_emu_start(uc_engine *uc, uint64_t begin, uint64_t until, uint64_t /* timeout */, size_t count) {
+    if (!uc) return UC_ERR_HANDLE;
+    auto* inst = reinterpret_cast<UnicornInstance*>(uc);
+
+#if defined(EMUX_ENABLE_DYNARMIC)
+    if (inst->dynarmic_jit) {
+        return inst->runDynarmic(begin, until, count);
+    }
+#endif
+
+    return runInterpreter(inst, begin, until, count);
+}
+
 uc_err uc_emu_stop(uc_engine *uc) {
     if (!uc) return UC_ERR_HANDLE;
     auto* inst = reinterpret_cast<UnicornInstance*>(uc);
     inst->stop_requested.store(true);
     inst->is_running.store(false);
+#if defined(EMUX_ENABLE_DYNARMIC)
+    if (inst->dynarmic_jit) {
+        inst->dynarmic_jit->HaltExecution(Dynarmic::HaltReason::UserDefined1);
+    }
+#endif
     return UC_ERR_OK;
 }
 
