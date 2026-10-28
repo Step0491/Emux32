@@ -192,6 +192,10 @@ void DbtEngine::destroyEgl() {
 
 void DbtEngine::swapBuffers() {
     if (eglDisplay_ != EGL_NO_DISPLAY && eglSurface_ != EGL_NO_SURFACE) {
+        static size_t sHostSwapCount = 0;
+        if (sHostSwapCount++ < 5) {
+            LOGI("DbtEngine: swapBuffers() eseguito su ANativeWindow EGLSurface (swapCount=%zu)", sHostSwapCount);
+        }
         eglSwapBuffers(eglDisplay_, eglSurface_);
     }
 }

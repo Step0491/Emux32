@@ -3070,6 +3070,10 @@ void GuestRuntimeEnvironment::handleTrampolineCall(uint32_t trampolineId, uc_eng
         return;
     }
     if (name == "glDrawArrays") {
+        static size_t sDrawArraysCount = 0;
+        if (sDrawArraysCount++ < 5) {
+            LOGI("GLES Passthrough: glDrawArrays #%zu eseguito su GPU host", sDrawArraysCount);
+        }
         uint32_t mode = 0, first = 0, count = 0;
         uc_reg_read(uc, UC_ARM_REG_R0, &mode);
         uc_reg_read(uc, UC_ARM_REG_R1, &first);
@@ -3078,6 +3082,10 @@ void GuestRuntimeEnvironment::handleTrampolineCall(uint32_t trampolineId, uc_eng
         return;
     }
     if (name == "glDrawElements") {
+        static size_t sDrawElementsCount = 0;
+        if (sDrawElementsCount++ < 5) {
+            LOGI("GLES Passthrough: glDrawElements #%zu eseguito su GPU host", sDrawElementsCount);
+        }
         uint32_t mode = 0, count = 0, type = 0, indicesPtr = 0;
         uc_reg_read(uc, UC_ARM_REG_R0, &mode);
         uc_reg_read(uc, UC_ARM_REG_R1, &count);
@@ -3191,6 +3199,10 @@ void GuestRuntimeEnvironment::handleTrampolineCall(uint32_t trampolineId, uc_eng
 
     // 12. EGL Guest Calls (Coordinate col Worker Thread EGL in DbtEngine)
     if (name == "eglSwapBuffers") {
+        static size_t sGuestSwapCount = 0;
+        if (sGuestSwapCount++ < 5) {
+            LOGI("GLES Passthrough: eglSwapBuffers invocato da guest (#%zu)", sGuestSwapCount);
+        }
         GuestRuntimeEnvironment::getInstance().swapBuffers();
         uint32_t one = 1;
         uc_reg_write(uc, UC_ARM_REG_R0, &one);

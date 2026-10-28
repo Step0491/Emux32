@@ -98,14 +98,14 @@ fun GamePlayerScreen(
     }
 
     Box(
-        modifier = Modifier
-            .fillMaxSize()
-            .background(Color.Black)
+        modifier = Modifier.fillMaxSize()
     ) {
         // SurfaceView nativa con inoltro diretto touch screen 1:1 e buffer fisso Full HD 1080p
         AndroidView(
             factory = { ctx ->
                 SurfaceView(ctx).apply {
+                    setZOrderMediaOverlay(true)
+                    holder.setFormat(android.graphics.PixelFormat.RGBA_8888)
                     holder.setFixedSize(1920, 1080)
                     holder.addCallback(object : SurfaceHolder.Callback {
                         override fun surfaceCreated(holder: SurfaceHolder) {

@@ -1391,8 +1391,8 @@ uc_err uc_emu_start(uc_engine *uc, uint64_t begin, uint64_t until, uint64_t /* t
         inst->regs[15] = static_cast<uint32_t>(begin & ~3ULL);
     }
 
-    inst->is_running.store(true);
-    inst->stop_requested.store(false);
+    bool wasRunning = inst->is_running.exchange(true);
+    bool prevStop = inst->stop_requested.exchange(false);
 
     uint32_t lastValidPc = inst->regs[15];
     size_t instructionsExecuted = 0;
@@ -2500,7 +2500,8 @@ uc_err uc_emu_start(uc_engine *uc, uint64_t begin, uint64_t until, uint64_t /* t
         }
     }
 
-    inst->is_running.store(false);
+    inst->is_running.store(wasRunning);
+    if (prevStop) inst->stop_requested.store(true);
     return UC_ERR_OK;
 }
 
