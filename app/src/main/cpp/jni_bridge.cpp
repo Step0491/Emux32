@@ -351,10 +351,10 @@ Java_com_emux_translator_nativebridge_NativeEngine_nativeRunSelfTest(
     // Test 4: Syscall / Interrupt Hooking (SVC #0)
     bool svcHookCalled = false;
     uc_hook hook = 0;
-    auto svcCallback = [](uc_engine* /* uc */, uint32_t /* intno */, void* user_data) {
-        *static_cast<bool*>(user_data) = true;
+    void (*svcFn)(uc_engine*, uint32_t, void*) = [](uc_engine*, uint32_t, void* ud) {
+        *static_cast<bool*>(ud) = true;
     };
-    uc_hook_add(uc, &hook, UC_HOOK_INTR, (void*)svcCallback, &svcHookCalled, 1, 0);
+    uc_hook_add(uc, &hook, UC_HOOK_INTR, reinterpret_cast<void*>(svcFn), &svcHookCalled, 1, 0);
     // SVC #0            (0xEF000000)
     // BX LR             (0xE12FFF1E)
     uint32_t codeSvc[2] = {
