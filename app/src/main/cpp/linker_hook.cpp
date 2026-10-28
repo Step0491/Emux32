@@ -616,8 +616,7 @@ bool GuestRuntimeEnvironment::initialize(uc_engine* uc) {
     jstringGuestPtrMap_.clear();
     arrayHandleMap_.clear();
 
-    sPthreadTlsMap.clear();
-    sNextPthreadKey = 1;
+    GuestThreadScheduler::getInstance().shutdown();
 
     {
         std::lock_guard<std::mutex> lock(sFileMutex);
@@ -1217,6 +1216,12 @@ void GuestRuntimeEnvironment::handleJniCall(uint32_t slotIndex, uc_engine* uc) {
                     LOGI("JNI Context.runOnUiThread invocato con Runnable=0x%x", r3);
                 } else if (info.name == "executeGLThreadJobs") {
                     // Poll periodico da Unity per i job di rendering
+                } else if (info.name == "close") {
+                    auto sit = guestInputStreamMap_.find(r1);
+                    if (sit != guestInputStreamMap_.end()) {
+                        if (sit->second.fp) fclose(sit->second.fp);
+                        guestInputStreamMap_.erase(sit);
+                    }
                 }
             }
             setReturnU32(0);
@@ -1243,24 +1248,6 @@ void GuestRuntimeEnvironment::handleJniCall(uint32_t slotIndex, uc_engine* uc) {
             setReturnU32(raw);
             uint64_t d0Val = static_cast<uint64_t>(raw);
             uc_reg_write(uc, UC_ARM_REG_D0, &d0Val);
-            return;
-        }
-
-        // CallVoidMethod / CallStaticVoidMethod (InputStream.close, Display.getMetrics)
-        case 61: case 62: case 63:
-        case 141: case 142: case 143: {
-            auto mit = methodHandleMap_.find(r2);
-            if (mit != methodHandleMap_.end()) {
-                const std::string& mName = mit->second.name;
-                if (mName == "close") {
-                    auto sit = guestInputStreamMap_.find(r1);
-                    if (sit != guestInputStreamMap_.end()) {
-                        if (sit->second.fp) fclose(sit->second.fp);
-                        guestInputStreamMap_.erase(sit);
-                    }
-                }
-            }
-            setReturnU32(0);
             return;
         }
 
