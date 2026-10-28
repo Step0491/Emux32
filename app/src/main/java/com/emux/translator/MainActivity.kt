@@ -453,8 +453,12 @@ class MainActivity : ComponentActivity() {
             EmuxLogger.i("Emux32", "[FASE 3/5] Libreria principale selezionata per l'esecuzione: ${mainSo.name} (${mainSo.length()} byte)")
 
             // ==========================================
-            // FASE 4: Setup Motore Nativo DBT Unicorn
+            // FASE 4: Setup Motore Nativo DBT Unicorn & Self-Test
             // ==========================================
+            EmuxLogger.i("Emux32", "[FASE 4/5] Esecuzione Architectural Self-Test DBT ARM32 -> AArch64...")
+            val testReport = NativeEngine.nativeRunSelfTest()
+            EmuxLogger.i("Emux32", testReport)
+
             EmuxLogger.i("Emux32", "[FASE 4/5] Configurazione e avvio Unicorn ARM32 DBT Engine...")
             NativeEngine.nativeSetStoragePath(resolveEmuxDirectory().absolutePath)
             val engineReady = NativeEngine.nativeInitEngine(512)

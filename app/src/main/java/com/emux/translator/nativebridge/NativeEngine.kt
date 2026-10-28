@@ -31,4 +31,5 @@ object NativeEngine {
     external fun nativeSetSurface(surface: Any?)
     external fun nativeSendTouchEvent(action: Int, x: Float, y: Float, pointerId: Int): Boolean
     external fun nativeReleaseEngine()
+    external fun nativeRunSelfTest(): String
 }
