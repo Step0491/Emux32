@@ -475,33 +475,45 @@ class MainActivity : ComponentActivity() {
             // ==========================================
             // FASE 5: Caricamento ELF ed Esecuzione Guest
             // ==========================================
-            // Pre-caricamento librerie di supporto condivise (STL, libc++, Mono, audio) se presenti nell'APK
-            for (depFile in extractedSos) {
-                if (depFile != mainSo) {
-                    val depName = depFile.name.lowercase()
-                    if (depName.contains("stl") || depName.contains("c++") || depName.contains("shared") ||
-                        depName.contains("fmod") || depName.contains("mono") || depName.contains("gdvoucher")) {
-                        EmuxLogger.i("Emux32", "[FASE 5/5] Pre-caricamento libreria di supporto: ${depFile.name}")
-                        NativeEngine.nativeLoadElfLibrary(depFile.absolutePath)
-                    }
+            // Ordiniamo tutte le librerie native estratte secondo le dipendenze ELF corrette:
+            // 1. Runtime di base C++ (libc++_shared, libgnustl, stlport)
+            // 2. Audio & Middleware (fmod, sound, audio, openal)
+            // 3. Scripting Engine (mono)
+            // 4. Motore primario di gioco (libunity.so, libg.so, libcocos2d.so, libgodot.so)
+            // 5. Entry point JNI Android (libmain.so)
+            // 6. Altre librerie di supporto
+            fun getLibraryPriority(file: File): Int {
+                val name = file.name.lowercase()
+                return when {
+                    name.contains("stl") || name.contains("c++") || name.contains("shared") -> 10
+                    name.contains("fmod") || name.contains("sound") || name.contains("audio") || name.contains("openal") -> 20
+                    name.contains("mono") -> 30
+                    name.contains("gdvoucher") -> 35
+                    name == "libunity.so" || name == "libg.so" || name == "libgame.so" || name.contains("blood") || name.contains("glory") -> 40
+                    name == "libmain.so" -> 50
+                    else -> 60
                 }
             }
 
-            EmuxLogger.i("Emux32", "[FASE 5/5] Caricamento ELF binario guest principale (${mainSo.name})...")
-            val loaded = NativeEngine.nativeLoadElfLibrary(mainSo.absolutePath)
-            if (loaded) {
-                EmuxLogger.i("Emux32", "[FASE 5/5] ELF caricato e rilocato. Avvio uc_emu_start su thread isolato Dispatchers.IO...")
-                val success = NativeEngine.startEmulationNative()
-                if (success) {
-                    EmuxLogger.i("Emux32", "[FASE 5/5] Esecuzione guest completata regolarmente.")
-                } else {
-                    EmuxLogger.w("Emux32", "[FASE 5/5] startEmulationNative ha terminato il ciclo.")
+            val sortedSos = extractedSos.sortedBy { getLibraryPriority(it) }
+
+            // Carica tutte le librerie nell'ordine ottimale di risoluzione dei simboli
+            var allLoaded = true
+            for (soFile in sortedSos) {
+                EmuxLogger.i("Emux32", "[FASE 5/5] Caricamento ELF binario: ${soFile.name} (${soFile.length()} byte)...")
+                val loaded = NativeEngine.nativeLoadElfLibrary(soFile.absolutePath)
+                if (!loaded) {
+                    EmuxLogger.w("Emux32", "[FASE 5/5] Avviso: Caricamento parziale per ${soFile.name}")
+                    allLoaded = false
                 }
+            }
+
+            EmuxLogger.i("Emux32", "[FASE 5/5] Tutte le librerie ELF caricate e rilocate. Avvio uc_emu_start su thread isolato Dispatchers.IO...")
+            val success = NativeEngine.startEmulationNative()
+            if (success) {
+                EmuxLogger.i("Emux32", "[FASE 5/5] Esecuzione guest completata regolarmente.")
             } else {
-                EmuxLogger.e("Emux32", "[FASE 5/5] ERRORE: Caricamento ELF fallito per ${mainSo.name}")
-                withContext(Dispatchers.Main) {
-                    Toast.makeText(this@MainActivity, "Caricamento ELF fallito per ${mainSo.name}", Toast.LENGTH_SHORT).show()
-                }
+                EmuxLogger.w("Emux32", "[FASE 5/5] startEmulationNative ha terminato il ciclo.")
             }
         } catch (e: Throwable) {
             EmuxLogger.e("Emux32", "Eccezione critica durante il lancio del gioco: ${e.message}", e)

@@ -118,6 +118,8 @@ public:
     uint32_t createGuestJString(uc_engine* uc, const std::string& str);
 
     void handleTrampolineCall(uint32_t trampolineId, uc_engine* uc);
+    bool disarmGuestTrapFlag(uc_engine* uc, uint32_t lr);
+    const std::vector<std::shared_ptr<LoadedLibrary>>& getLoadedLibraries() const { return loadedLibraries_; }
 
     const std::vector<RegisteredNativeMethod>& getRegisteredMethods() const { return registeredMethods_; }
     void addRegisteredMethod(const std::string& cls, const std::string& name, const std::string& sig, uint32_t fnPtr) {

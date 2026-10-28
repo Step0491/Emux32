@@ -406,6 +406,7 @@ bool DbtEngine::startEmulation() {
         if (fnAddr == 0) return 0;
         uint32_t sp = guestStackPointer_;
         uint32_t cpsr = (fnAddr & 1U) ? 0x00000030U : 0x00000010U;
+        uint32_t startPc = fnAddr & ~1U;
         uc_reg_write(uc_, UC_ARM_REG_R0, &r0);
         uc_reg_write(uc_, UC_ARM_REG_R1, &r1);
         uc_reg_write(uc_, UC_ARM_REG_R2, &r2);
@@ -413,22 +414,40 @@ bool DbtEngine::startEmulation() {
         uc_reg_write(uc_, UC_ARM_REG_SP, &sp);
         uc_reg_write(uc_, UC_ARM_REG_LR, &lr);
         uc_reg_write(uc_, UC_ARM_REG_CPSR, &cpsr);
-        uc_emu_start(uc_, fnAddr, lr, 0, maxInsns);
+        uc_err startErr = uc_emu_start(uc_, startPc, lr, 0, maxInsns);
+        if (startErr != UC_ERR_OK) {
+            uint32_t curPc = 0;
+            uc_reg_read(uc_, UC_ARM_REG_PC, &curPc);
+            LOGE("invokeGuestFunction(0x%08x): uc_emu_start terminato con errore: %s (PC=0x%08x)",
+                 fnAddr, uc_strerror(startErr), curPc);
+        }
         uint32_t ret = 0;
         uc_reg_read(uc_, UC_ARM_REG_R0, &ret);
         return ret;
     };
 
-    // 4. Invocazione JNI_OnLoad della libreria primaria
-    uint32_t pc = currentLib_->entry_point;
-    LOGI("Avvio JNI_OnLoad / Entry Point guest: PC=0x%08x, SP=0x%08x, JavaVM=0x%08x...",
-         pc, guestStackPointer_, javaVMPtr);
-    invokeGuestFunction(pc, javaVMPtr, 0, 0, 0, 2000000);
+    // 4. Invocazione JNI_OnLoad su tutte le librerie caricate che esportano JNI_OnLoad
+    for (const auto& lib : loadedLibs_) {
+        if (!lib) continue;
+        uint32_t jniOnLoadAddr = 0;
+        for (const auto& sym : lib->symbols) {
+            if (sym.name == "JNI_OnLoad" && sym.vaddr != 0) {
+                jniOnLoadAddr = lib->load_bias + sym.vaddr;
+                break;
+            }
+        }
+        if (jniOnLoadAddr == 0 && lib->entry_point != 0) {
+            jniOnLoadAddr = lib->entry_point;
+        }
 
-    uint32_t retR0 = 0;
-    uc_reg_read(uc_, UC_ARM_REG_R0, &retR0);
-    LOGI("JNI_OnLoad completato (Valore r0: 0x%08x, Metodi registrati: %zu).",
-         retR0, env.getRegisteredMethods().size());
+        if (jniOnLoadAddr != 0) {
+            LOGI("Avvio JNI_OnLoad per '%s': PC=0x%08x, SP=0x%08x, JavaVM=0x%08x...",
+                 lib->path.c_str(), jniOnLoadAddr, guestStackPointer_, javaVMPtr);
+            uint32_t jniVer = invokeGuestFunction(jniOnLoadAddr, javaVMPtr, 0, 0, 0, 3000000);
+            LOGI("JNI_OnLoad '%s' completato (Versione ritornata: 0x%08x, Metodi registrati finora: %zu).",
+                 lib->path.c_str(), jniVer, env.getRegisteredMethods().size());
+        }
+    }
 
     // 5. Sequenza di avvio signature-aware per i metodi JNI registrati (Unity / NDK / libg.so)
     const auto& nativeMethods = env.getRegisteredMethods();
@@ -444,7 +463,7 @@ bool DbtEngine::startEmulation() {
         }
     }
 
-    // 5b. Metodi di init (initJni, init, nativeInit) - Escludiamo tassativamente qualsiasi metodo grafico/surface/recreate
+    // 5b. Metodi di init dedicati (initJni, init, nativeInit, create)
     for (const auto& m : nativeMethods) {
         std::string lower = m.name;
         std::transform(lower.begin(), lower.end(), lower.begin(), ::tolower);
@@ -458,13 +477,15 @@ bool DbtEngine::startEmulation() {
         } else if (lower == "init" && m.signature == "(IZ)V") {
             LOGI("Invocazione metodo guest '%s' (0, false)...", m.name.c_str());
             invokeGuestFunction(m.fnPtr, jniEnvPtr, dummyInstance, 0, 0, 1000000);
-        } else if (lower.find("init") != std::string::npos || lower == "create" || lower == "nativecreate") {
-            LOGI("Invocazione metodo guest di setup '%s' (0x%08x)...", m.name.c_str(), m.fnPtr);
+        } else if (lower == "nativeinit" || lower == "init" || lower == "nativecreate" || lower == "create") {
+            LOGI("Invocazione metodo guest di setup '%s' (0x%08x, sig='%s')...", m.name.c_str(), m.fnPtr, m.signature.c_str());
             if (m.signature.find("(II)") != std::string::npos) {
                 // Metodi tipo Cocos2d-x nativeInit(int w, int h)
                 invokeGuestFunction(m.fnPtr, jniEnvPtr, dummyInstance, 1920, 1080, 2000000);
-            } else {
+            } else if (m.signature.find("(Landroid/content/Context;)") != std::string::npos) {
                 invokeGuestFunction(m.fnPtr, jniEnvPtr, dummyInstance, 0x1001, 0, 1000000);
+            } else if (m.signature.empty() || m.signature == "()V" || m.signature == "()Z") {
+                invokeGuestFunction(m.fnPtr, jniEnvPtr, dummyInstance, 0, 0, 1000000);
             }
         }
     }
@@ -507,17 +528,21 @@ bool DbtEngine::startEmulation() {
     }
 
     if (targetRenderPtr == 0) {
-        for (const auto& sym : currentLib_->symbols) {
-            std::string lower = sym.name;
-            std::transform(lower.begin(), lower.end(), lower.begin(), ::tolower);
-            if ((lower.find("nativerender") != std::string::npos ||
-                 lower.find("ondrawframe") != std::string::npos ||
-                 lower.find("renderframe") != std::string::npos ||
-                 lower.find("nativestep") != std::string::npos) && sym.vaddr != 0) {
-                targetRenderPtr = currentLib_->load_bias + sym.vaddr;
-                targetRenderName = sym.name;
-                break;
+        for (const auto& lib : loadedLibs_) {
+            if (!lib) continue;
+            for (const auto& sym : lib->symbols) {
+                std::string lower = sym.name;
+                std::transform(lower.begin(), lower.end(), lower.begin(), ::tolower);
+                if ((lower.find("nativerender") != std::string::npos ||
+                     lower.find("ondrawframe") != std::string::npos ||
+                     lower.find("renderframe") != std::string::npos ||
+                     lower.find("nativestep") != std::string::npos) && sym.vaddr != 0) {
+                    targetRenderPtr = lib->load_bias + sym.vaddr;
+                    targetRenderName = sym.name;
+                    break;
+                }
             }
+            if (targetRenderPtr != 0) break;
         }
     }
 

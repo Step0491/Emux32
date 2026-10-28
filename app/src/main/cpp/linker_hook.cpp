@@ -682,14 +682,43 @@ uint32_t GuestRuntimeEnvironment::findExportedSymbol(const std::string& symbolNa
     return 0;
 }
 
+static bool isSystemHookSymbol(const std::string& name) {
+    if (name.find("pthread_") == 0 || name.find("__android_log_") == 0 ||
+        name.find("gl") == 0 || name.find("egl") == 0 || name.find("dl") == 0 ||
+        name.find("ANativeWindow_") == 0 || name.find("__aeabi_") == 0 ||
+        name == "malloc" || name == "free" || name == "calloc" || name == "realloc" ||
+        name == "memalign" || name == "posix_memalign" || name == "valloc" ||
+        name == "mmap" || name == "munmap" || name == "mprotect" || name == "sysconf" ||
+        name == "__errno" || name == "abort" || name == "raise" || name == "signal" ||
+        name == "sigaction" || name == "__sigaction" || name == "clock_gettime" ||
+        name == "gettimeofday" || name == "time" || name == "nanosleep" || name == "usleep" ||
+        name == "open" || name == "close" || name == "read" || name == "write" ||
+        name == "ioctl" || name == "lseek" || name == "stat" || name == "fstat" ||
+        name == "access" || name == "opendir" || name == "closedir" || name == "readdir" ||
+        name == "memcpy" || name == "memset" || name == "memmove" || name == "memcmp" ||
+        name == "strlen" || name == "strcpy" || name == "strncpy" || name == "strcmp" ||
+        name == "strncmp" || name == "strcat" || name == "strncat" || name == "strchr" ||
+        name == "strrchr" || name == "strstr" || name == "snprintf" || name == "sprintf" ||
+        name == "printf" || name == "vsnprintf" || name == "vsprintf" || name == "sscanf" ||
+        name == "fopen" || name == "fopen64" || name == "fread" || name == "fwrite" ||
+        name == "fseek" || name == "fseeko" || name == "fseeko64" || name == "ftell" ||
+        name == "ftello" || name == "ftello64" || name == "fclose" || name == "fflush" ||
+        name == "getenv" || name == "setenv" || name == "system" || name == "atexit" ||
+        name == "__cxa_atexit" || name == "__cxa_finalize") {
+        return true;
+    }
+    return false;
+}
+
 uint32_t GuestRuntimeEnvironment::resolveOrRegisterSymbol(const std::string& symbolName, uc_engine* uc) {
     if (symbolName == "_ctype_") return getCtypePointer();
     if (symbolName == "__sF") return getSFilePointer();
     if (symbolName == "__stack_chk_guard") return getStackChkGuardPointer();
 
-    // Se il simbolo appartiene a una libreria guest gia' caricata (es. libc++_shared.so o libmono.so)
-    // ed e' un simbolo C++/Mono non intercettato dagli hook di sistema, usa l'indirizzo reale guest
-    if (symbolName.rfind("_Z", 0) == 0 || symbolName.rfind("mono_", 0) == 0) {
+    // Se non e' un simbolo di sistema gestito dai nostri hook,
+    // verifica se una qualsiasi libreria guest gia' caricata (es. libc++_shared, libmono, libfmod, libunity)
+    // esporta questo simbolo: in tal caso usa direttamente l'indirizzo reale guest!
+    if (!isSystemHookSymbol(symbolName)) {
         uint32_t exported = findExportedSymbol(symbolName);
         if (exported != 0) return exported;
     }
@@ -1324,44 +1353,128 @@ static std::string formatGuestPrintf(uc_engine* uc, const std::string& fmt, uint
     return out;
 }
 
-static bool disarmGuestTrapFlag(uc_engine* uc, uint32_t lr) {
+bool GuestRuntimeEnvironment::disarmGuestTrapFlag(uc_engine* uc, uint32_t lr) {
     if (!uc || lr < 0x1000) return false;
 
+    // 1. Diagnostic Dump: Registri CPU R0-R12, SP, LR, CPSR
+    uint32_t regs[13] = {0};
+    for (int i = 0; i < 13; ++i) {
+        uc_reg_read(uc, UC_ARM_REG_R0 + i, &regs[i]);
+    }
+    uint32_t sp = 0, cpsr = 0;
+    uc_reg_read(uc, UC_ARM_REG_SP, &sp);
+    uc_reg_read(uc, UC_ARM_REG_CPSR, &cpsr);
+    LOGW("[GuestLogCrashDiagnostic] Trap Dump -> R0=0x%08x R1=0x%08x R2=0x%08x R3=0x%08x",
+         regs[0], regs[1], regs[2], regs[3]);
+    LOGW("[GuestLogCrashDiagnostic] Trap Dump -> R4=0x%08x R5=0x%08x R6=0x%08x R7=0x%08x R8=0x%08x R9=0x%08x R10=0x%08x R11=0x%08x R12=0x%08x",
+         regs[4], regs[5], regs[6], regs[7], regs[8], regs[9], regs[10], regs[11], regs[12]);
+    LOGW("[GuestLogCrashDiagnostic] Trap Dump -> SP=0x%08x LR=0x%08x CPSR=0x%08x", sp, lr, cpsr);
+
+    // 2. Diagnostic Dump: 16 parole dallo Stack (SP)
+    if (sp >= 0x70000000U && sp <= 0x7FFFF000U) {
+        uint32_t stackWords[16] = {0};
+        if (uc_mem_read(uc, sp, stackWords, sizeof(stackWords)) == UC_ERR_OK) {
+            LOGW("[GuestLogCrashDiagnostic] Stack Dump [SP..SP+64]: %08x %08x %08x %08x | %08x %08x %08x %08x",
+                 stackWords[0], stackWords[1], stackWords[2], stackWords[3],
+                 stackWords[4], stackWords[5], stackWords[6], stackWords[7]);
+        }
+    }
+
+    // 3. Diagnostic Code Dump: 64 byte prima di LR e 16 byte dopo LR
     uint32_t startAddr = (lr >= 64) ? (lr - 64) : 0;
-    uint32_t countBytes = lr - startAddr;
+    uint32_t countBytes = 80;
     std::vector<uint8_t> codeBuf(countBytes);
-    if (uc_mem_read(uc, startAddr, codeBuf.data(), countBytes) != UC_ERR_OK) {
-        return false;
+    if (uc_mem_read(uc, startAddr, codeBuf.data(), countBytes) == UC_ERR_OK) {
+        for (uint32_t off = 0; off + 4 <= countBytes; off += 16) {
+            uint32_t pc = startAddr + off;
+            uint32_t w0 = 0, w1 = 0, w2 = 0, w3 = 0;
+            std::memcpy(&w0, codeBuf.data() + off, 4);
+            if (off + 8 <= countBytes) std::memcpy(&w1, codeBuf.data() + off + 4, 4);
+            if (off + 12 <= countBytes) std::memcpy(&w2, codeBuf.data() + off + 8, 4);
+            if (off + 16 <= countBytes) std::memcpy(&w3, codeBuf.data() + off + 12, 4);
+            LOGW("[GuestLogCrashDiagnostic] Code [%08x%s]: %08x %08x %08x %08x",
+                 pc, (pc <= lr && lr < pc + 16 ? " <= LR" : "      "), w0, w1, w2, w3);
+        }
     }
 
     bool disarmed = false;
-    // Scan istruzioni ARM (LDR Rd, [PC, #imm])
-    for (uint32_t off = 0; off + 4 <= countBytes; off += 4) {
-        uint32_t pc = startAddr + off;
-        uint32_t insn = 0;
-        std::memcpy(&insn, codeBuf.data() + off, 4);
 
-        if ((insn & 0xFE5F0000U) == 0x051F0000U || (insn & 0xFE5F0000U) == 0x059F0000U) {
-            bool add = (insn & (1U << 23)) != 0;
-            uint32_t imm12 = insn & 0xFFFU;
-            uint32_t poolAddr = add ? (pc + 8 + imm12) : (pc + 8 - imm12);
-            uint32_t targetVarAddr = 0;
-            if (uc_mem_read(uc, poolAddr, &targetVarAddr, 4) == UC_ERR_OK) {
-                if (targetVarAddr >= 0x40000000U && targetVarAddr < 0x55000000U) {
-                    uint32_t currentVal = 0;
-                    if (uc_mem_read(uc, targetVarAddr, &currentVal, 4) == UC_ERR_OK && currentVal != 0) {
-                        uint32_t zero = 0;
-                        uc_mem_write(uc, targetVarAddr, &zero, 4);
-                        LOGI("DisarmTrap [ARM]: Neutralizzato flag trappola guest a 0x%08x (era 0x%08x)",
-                             targetVarAddr, currentVal);
-                        disarmed = true;
+    // 4. Memory Scan: scansione segmenti scrivibili (.data / .bss) di tutte le librerie per signum = 1060439283 (0x3F3504F3)
+    const uint32_t targetSignum = 1060439283U; // 0x3F3504F3
+    for (const auto& lib : loadedLibraries_) {
+        if (!lib) continue;
+        for (const auto& seg : lib->segments) {
+            if ((seg.flags & 2) /* PF_W */ && seg.memsz > 0 && seg.memsz < 0x2000000U) {
+                uint32_t segBase = lib->load_bias + seg.vaddr;
+                size_t scanSize = std::min<size_t>(seg.memsz, 0x400000U); // fino a 4MB
+                std::vector<uint8_t> segData(scanSize);
+                if (uc_mem_read(uc, segBase, segData.data(), scanSize) == UC_ERR_OK) {
+                    for (size_t off = 0; off + 4 <= scanSize; off += 4) {
+                        uint32_t word = 0;
+                        std::memcpy(&word, segData.data() + off, 4);
+                        if (word == targetSignum) {
+                            uint32_t foundAddr = segBase + off;
+                            LOGI("DisarmTrap [MemoryScan]: Trovato signum 0x%08x a 0x%08x in '%s'! Neutralizzazione...",
+                                 targetSignum, foundAddr, lib->path.c_str());
+                            uint32_t zero = 0;
+                            uc_mem_write(uc, foundAddr, &zero, 4);
+                            // Neutralizza anche variabili booleane limitrofe [-32..+32] byte
+                            for (int delta = -32; delta <= 32; delta += 4) {
+                                if (delta == 0) continue;
+                                uint32_t nAddr = foundAddr + delta;
+                                uint32_t nVal = 0;
+                                if (uc_mem_read(uc, nAddr, &nVal, 4) == UC_ERR_OK && nVal != 0 && nVal < 0x1000U) {
+                                    uc_mem_write(uc, nAddr, &zero, 4);
+                                    LOGI("DisarmTrap [MemoryScan]: Neutralizzato flag limitrofo a 0x%08x (era 0x%08x)", nAddr, nVal);
+                                }
+                            }
+                            disarmed = true;
+                        }
                     }
                 }
             }
         }
     }
 
-    // Scan istruzioni Thumb-2 (LDR Rd, [PC, #imm])
+    // 5. Instruction Scan around LR: ARM LDR Rd, [PC, #+/-imm12]
+    // Maschera corretta: (insn & 0x0F3F0000U) == 0x051F0000U
+    for (uint32_t off = 0; off + 4 <= countBytes; off += 4) {
+        uint32_t pc = startAddr + off;
+        uint32_t insn = 0;
+        std::memcpy(&insn, codeBuf.data() + off, 4);
+
+        if ((insn & 0x0F3F0000U) == 0x051F0000U) {
+            bool add = (insn & (1U << 23)) != 0;
+            uint32_t imm12 = insn & 0xFFFU;
+            uint32_t poolAddr = add ? (pc + 8 + imm12) : (pc + 8 - imm12);
+            uint32_t targetVarAddr = 0;
+            if (uc_mem_read(uc, poolAddr, &targetVarAddr, 4) == UC_ERR_OK) {
+                if (targetVarAddr >= 0x40000000U && targetVarAddr < 0x60000000U) {
+                    uint32_t currentVal = 0;
+                    if (uc_mem_read(uc, targetVarAddr, &currentVal, 4) == UC_ERR_OK && currentVal != 0) {
+                        uint32_t zero = 0;
+                        uc_mem_write(uc, targetVarAddr, &zero, 4);
+                        LOGI("DisarmTrap [ARM Direct]: Neutralizzato flag trappola guest a 0x%08x (era 0x%08x)",
+                             targetVarAddr, currentVal);
+                        disarmed = true;
+                    }
+                    // Supporto indirection GOT (puntatore a variabile)
+                    if (currentVal >= 0x40000000U && currentVal < 0x60000000U) {
+                        uint32_t indVal = 0;
+                        if (uc_mem_read(uc, currentVal, &indVal, 4) == UC_ERR_OK && indVal != 0) {
+                            uint32_t zero = 0;
+                            uc_mem_write(uc, currentVal, &zero, 4);
+                            LOGI("DisarmTrap [ARM GOT-Indirect]: Neutralizzato flag a 0x%08x (era 0x%08x)",
+                                 currentVal, indVal);
+                            disarmed = true;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // 6. Thumb LDR Rd, [PC, #imm8*4]
     for (uint32_t off = 0; off + 2 <= countBytes; off += 2) {
         uint32_t pc = startAddr + off;
         uint16_t tInsn = 0;
@@ -1371,7 +1484,7 @@ static bool disarmGuestTrapFlag(uc_engine* uc, uint32_t lr) {
             uint32_t poolAddr = ((pc + 4) & ~3U) + imm;
             uint32_t targetVarAddr = 0;
             if (uc_mem_read(uc, poolAddr, &targetVarAddr, 4) == UC_ERR_OK) {
-                if (targetVarAddr >= 0x40000000U && targetVarAddr < 0x55000000U) {
+                if (targetVarAddr >= 0x40000000U && targetVarAddr < 0x60000000U) {
                     uint32_t currentVal = 0;
                     if (uc_mem_read(uc, targetVarAddr, &currentVal, 4) == UC_ERR_OK && currentVal != 0) {
                         uint32_t zero = 0;
@@ -1380,6 +1493,23 @@ static bool disarmGuestTrapFlag(uc_engine* uc, uint32_t lr) {
                              targetVarAddr, currentVal);
                         disarmed = true;
                     }
+                }
+            }
+        }
+    }
+
+    // 7. Register Pointer Scan: R4..R12
+    for (int i = 4; i <= 12; ++i) {
+        uint32_t regVal = regs[i];
+        if (regVal >= 0x40000000U && regVal < 0x60000000U) {
+            uint32_t valAtReg = 0;
+            if (uc_mem_read(uc, regVal, &valAtReg, 4) == UC_ERR_OK && valAtReg != 0) {
+                if (valAtReg == 1 || valAtReg == targetSignum || valAtReg < 0x1000U) {
+                    uint32_t zero = 0;
+                    uc_mem_write(uc, regVal, &zero, 4);
+                    LOGI("DisarmTrap [Reg R%d]: Neutralizzato flag puntato da registro a 0x%08x (era 0x%08x)",
+                         i, regVal, valAtReg);
+                    disarmed = true;
                 }
             }
         }
