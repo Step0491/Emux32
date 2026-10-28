@@ -1387,7 +1387,6 @@ static bool disarmGuestTrapFlag(uc_engine* uc, uint32_t lr) {
 
     return disarmed;
 }
-}
 
 #pragma pack(push, 4)
 struct z_stream32 {
