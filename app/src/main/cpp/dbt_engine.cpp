@@ -577,13 +577,21 @@ bool DbtEngine::startEmulation() {
         auto elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(now - lastHeartbeat).count();
         if (elapsedMs >= 2000) {
             float fps = (framesSinceHeartbeat * 1000.0f) / static_cast<float>(elapsedMs);
+            size_t pendingCount = 0;
+            {
+                std::lock_guard<std::mutex> lock(touchMutex_);
+                pendingCount = touchQueue_.size();
+            }
             LOGI("DbtEngine Heartbeat: %zu frame renderizzati (velocità media: %.1f FPS, touch in coda: %zu)",
-                 frameCount, fps, pendingTouches_.size());
+                 frameCount, fps, pendingCount);
             lastHeartbeat = now;
             framesSinceHeartbeat = 0;
         }
 
-        governor_.syncFrame(frameStart);
+        // Nei primi 60 frame (warm-up e parsing risorse Unity) lasciamo girare la CPU a piena potenza
+        if (frameCount > 60) {
+            governor_.syncFrame(frameStart);
+        }
     }
 
     LOGI("DbtEngine: Ciclo di gioco terminato (totale frame: %zu). Rilascio EGL sul Worker Thread.", frameCount);

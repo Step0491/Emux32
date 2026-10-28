@@ -1486,16 +1486,6 @@ uc_err uc_emu_start(uc_engine *uc, uint64_t begin, uint64_t until, uint64_t /* t
         lastValidPc = pc;
         bool isThumb = (inst->cpsr & FLAG_T) != 0;
 
-        // Indicizzazione nella TranslationBlockCache (O(1) fast lookup) per i blocchi di ingresso
-        uint32_t taggedPc = pc | (isThumb ? 1U : 0U);
-        emux::BasicBlock* bb = inst->tb_cache.lookupFast(taggedPc);
-        if (!bb) {
-            bb = inst->tb_cache.findOrInsert(taggedPc, isThumb);
-        }
-        if (bb) {
-            bb->insnCount++;
-        }
-
         if (!isThumb) {
             uint32_t insn = 0;
             bool fetchOk = false;
