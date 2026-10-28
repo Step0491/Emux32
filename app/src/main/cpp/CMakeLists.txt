@@ -13,6 +13,7 @@ add_library(
     core/tb_cache.cpp
     core/syscall_thunker.cpp
     core/audio_thunker.cpp
+    core/guest_thread.cpp
     unicorn/unicorn_impl.cpp
     elf_loader.cpp
     linker_hook.cpp

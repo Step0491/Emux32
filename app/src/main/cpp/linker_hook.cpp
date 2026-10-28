@@ -2,6 +2,8 @@
 #include "elf_loader.h"
 #include "core/syscall_thunker.h"
 #include "core/audio_thunker.h"
+#include "core/guest_thread.h"
+#include "core/guest_memory.h"
 #include "unicorn/arm.h"
 
 #include <EGL/egl.h>
@@ -46,11 +48,32 @@ static std::unordered_map<uint32_t, FILE*> sFileTable;
 static uint32_t sNextFileHandle = 0x30000001;
 static std::mutex sFileMutex;
 
-static std::unordered_map<uint32_t, uint32_t> sPthreadTlsMap;
-static uint32_t sNextPthreadKey = 1;
-
 static std::unordered_map<uint32_t, z_stream*> sZlibStreamMap;
 static uint32_t sNextZlibHandle = 0x60000001;
+
+static std::mutex sSyncTableMutex;
+static std::unordered_map<uint32_t, std::shared_ptr<std::recursive_mutex>> sHostPthreadMutexes;
+static std::unordered_map<uint32_t, std::shared_ptr<std::condition_variable_any>> sHostPthreadConds;
+
+static std::shared_ptr<std::recursive_mutex> getOrCreateGuestMutex(uint32_t addr) {
+    if (addr == 0) return nullptr;
+    std::lock_guard<std::mutex> lock(sSyncTableMutex);
+    auto it = sHostPthreadMutexes.find(addr);
+    if (it != sHostPthreadMutexes.end()) return it->second;
+    auto m = std::make_shared<std::recursive_mutex>();
+    sHostPthreadMutexes[addr] = m;
+    return m;
+}
+
+static std::shared_ptr<std::condition_variable_any> getOrCreateGuestCond(uint32_t addr) {
+    if (addr == 0) return nullptr;
+    std::lock_guard<std::mutex> lock(sSyncTableMutex);
+    auto it = sHostPthreadConds.find(addr);
+    if (it != sHostPthreadConds.end()) return it->second;
+    auto c = std::make_shared<std::condition_variable_any>();
+    sHostPthreadConds[addr] = c;
+    return c;
+}
 
 static inline std::string readGuestCString(uc_engine* uc, uint32_t addr, size_t maxLen = 512) {
     if (!uc || addr == 0) return "";
@@ -71,14 +94,20 @@ static inline std::string readGuestCString(uc_engine* uc, uint32_t addr, size_t 
 }
 
 static inline uint32_t allocGuestHeap(uc_engine* uc, uint32_t size, uint32_t align = 16) {
+    static std::mutex sHeapMutex;
+    std::lock_guard<std::mutex> lock(sHeapMutex);
     if (size == 0) size = 16;
     if (align < 8) align = 8;
     uint32_t alignedStart = (sHeapCurrent + (align - 1U)) & ~(align - 1U);
     uint32_t nextEnd = alignedStart + ((size + 15U) & ~15U);
 
-    // Mappa on-demand eventuali blocchi oltre i primi 128 MB
+    // Mappa on-demand nello shared arena se oltre i limiti correnti
+    auto& gm = GuestMemory::getSharedInstance();
     uint32_t pageStart = alignedStart & ~0xFFFU;
     uint32_t pageEnd = (nextEnd + 0xFFFU) & ~0xFFFU;
+    if (pageEnd > pageStart && !gm.isMappedRange(pageStart, pageEnd - pageStart)) {
+        gm.map(pageStart, pageEnd - pageStart, GP_READ | GP_WRITE);
+    }
     if (uc && pageEnd > 0x60000000U) {
         uc_mem_map(uc, pageStart, pageEnd - pageStart, UC_PROT_READ | UC_PROT_WRITE);
     }
@@ -428,8 +457,8 @@ int32_t SyscallDispatcher::handleSyscall(
             }
             return -errno;
         }
-        case ARM_NR_getpid:
-        case ARM_NR_gettid:    return static_cast<int32_t>(getpid());
+        case ARM_NR_getpid:    return static_cast<int32_t>(getpid());
+        case ARM_NR_gettid:    return static_cast<int32_t>(GuestThreadScheduler::getInstance().getCurrentTid());
         case ARM_NR_getuid:
         case ARM_NR_getuid32:  return static_cast<int32_t>(getuid());
         case ARM_NR_getgid:
@@ -2392,13 +2421,13 @@ void GuestRuntimeEnvironment::handleTrampolineCall(uint32_t trampolineId, uc_eng
         return;
     }
 
-    // 7. Pthread & TLS Keys
+    // 7. Sottosistema Multi-Threading Guest: Pthread, TLS & Primitive di Sincronizzazione
     if (name == "pthread_key_create") {
-        uint32_t keyAddr = 0;
+        uint32_t keyAddr = 0, dtor = 0;
         uc_reg_read(uc, UC_ARM_REG_R0, &keyAddr);
+        uc_reg_read(uc, UC_ARM_REG_R1, &dtor);
+        uint32_t newKey = GuestThreadScheduler::getInstance().createTlsKey(dtor);
         if (keyAddr != 0) {
-            uint32_t newKey = sNextPthreadKey++;
-            sPthreadTlsMap[newKey] = 0;
             uc_mem_write(uc, keyAddr, &newKey, 4);
         }
         uint32_t zero = 0;
@@ -2409,28 +2438,29 @@ void GuestRuntimeEnvironment::handleTrampolineCall(uint32_t trampolineId, uc_eng
         uint32_t key = 0, val = 0;
         uc_reg_read(uc, UC_ARM_REG_R0, &key);
         uc_reg_read(uc, UC_ARM_REG_R1, &val);
-        sPthreadTlsMap[key] = val;
-        uint32_t zero = 0;
-        uc_reg_write(uc, UC_ARM_REG_R0, &zero);
+        int32_t res = GuestThreadScheduler::getInstance().setTlsSpecific(key, val);
+        uint32_t ret = (res == 0) ? 0U : static_cast<uint32_t>(-res);
+        uc_reg_write(uc, UC_ARM_REG_R0, &ret);
         return;
     }
     if (name == "pthread_getspecific") {
         uint32_t key = 0;
         uc_reg_read(uc, UC_ARM_REG_R0, &key);
-        uint32_t val = sPthreadTlsMap.count(key) ? sPthreadTlsMap[key] : 0U;
+        uint32_t val = GuestThreadScheduler::getInstance().getTlsSpecific(key);
         uc_reg_write(uc, UC_ARM_REG_R0, &val);
         return;
     }
     if (name == "pthread_key_delete") {
         uint32_t key = 0;
         uc_reg_read(uc, UC_ARM_REG_R0, &key);
-        sPthreadTlsMap.erase(key);
-        uint32_t zero = 0;
-        uc_reg_write(uc, UC_ARM_REG_R0, &zero);
+        int32_t res = GuestThreadScheduler::getInstance().deleteTlsKey(key);
+        uint32_t ret = (res == 0) ? 0U : static_cast<uint32_t>(-res);
+        uc_reg_write(uc, UC_ARM_REG_R0, &ret);
         return;
     }
     if (name == "pthread_self") {
-        uc_reg_write(uc, UC_ARM_REG_R0, &guestTlsBase_);
+        uint32_t tid = GuestThreadScheduler::getInstance().getCurrentTid();
+        uc_reg_write(uc, UC_ARM_REG_R0, &tid);
         return;
     }
     if (name == "pthread_equal") {
@@ -2439,6 +2469,160 @@ void GuestRuntimeEnvironment::handleTrampolineCall(uint32_t trampolineId, uc_eng
         uc_reg_read(uc, UC_ARM_REG_R1, &t2);
         uint32_t eq = (t1 == t2) ? 1U : 0U;
         uc_reg_write(uc, UC_ARM_REG_R0, &eq);
+        return;
+    }
+    if (name == "pthread_join") {
+        uint32_t targetTid = 0, retvalPtr = 0;
+        uc_reg_read(uc, UC_ARM_REG_R0, &targetTid);
+        uc_reg_read(uc, UC_ARM_REG_R1, &retvalPtr);
+        int32_t res = GuestThreadScheduler::getInstance().joinThread(targetTid, retvalPtr, uc);
+        uint32_t ret = (res == 0) ? 0U : static_cast<uint32_t>(-res);
+        uc_reg_write(uc, UC_ARM_REG_R0, &ret);
+        return;
+    }
+    if (name == "pthread_detach") {
+        uint32_t targetTid = 0;
+        uc_reg_read(uc, UC_ARM_REG_R0, &targetTid);
+        int32_t res = GuestThreadScheduler::getInstance().detachThread(targetTid);
+        uint32_t ret = (res == 0) ? 0U : static_cast<uint32_t>(-res);
+        uc_reg_write(uc, UC_ARM_REG_R0, &ret);
+        return;
+    }
+    if (name == "pthread_exit") {
+        uint32_t retval = 0;
+        uc_reg_read(uc, UC_ARM_REG_R0, &retval);
+        GuestThreadScheduler::getInstance().exitThread(retval, uc);
+        return;
+    }
+    if (name == "pthread_mutex_init") {
+        uint32_t mAddr = 0;
+        uc_reg_read(uc, UC_ARM_REG_R0, &mAddr);
+        getOrCreateGuestMutex(mAddr);
+        uint32_t zero = 0;
+        uc_reg_write(uc, UC_ARM_REG_R0, &zero);
+        return;
+    }
+    if (name == "pthread_mutex_destroy") {
+        uint32_t mAddr = 0;
+        uc_reg_read(uc, UC_ARM_REG_R0, &mAddr);
+        if (mAddr != 0) {
+            std::lock_guard<std::mutex> lock(sSyncTableMutex);
+            sHostPthreadMutexes.erase(mAddr);
+        }
+        uint32_t zero = 0;
+        uc_reg_write(uc, UC_ARM_REG_R0, &zero);
+        return;
+    }
+    if (name == "pthread_mutex_lock") {
+        uint32_t mAddr = 0;
+        uc_reg_read(uc, UC_ARM_REG_R0, &mAddr);
+        auto m = getOrCreateGuestMutex(mAddr);
+        if (m) {
+            m->lock();
+        }
+        uint32_t zero = 0;
+        uc_reg_write(uc, UC_ARM_REG_R0, &zero);
+        return;
+    }
+    if (name == "pthread_mutex_unlock") {
+        uint32_t mAddr = 0;
+        uc_reg_read(uc, UC_ARM_REG_R0, &mAddr);
+        auto m = getOrCreateGuestMutex(mAddr);
+        if (m) {
+            m->unlock();
+        }
+        uint32_t zero = 0;
+        uc_reg_write(uc, UC_ARM_REG_R0, &zero);
+        return;
+    }
+    if (name == "pthread_mutex_trylock") {
+        uint32_t mAddr = 0;
+        uc_reg_read(uc, UC_ARM_REG_R0, &mAddr);
+        auto m = getOrCreateGuestMutex(mAddr);
+        uint32_t ret = (m && m->try_lock()) ? 0U : 16U; // 16 = EBUSY
+        uc_reg_write(uc, UC_ARM_REG_R0, &ret);
+        return;
+    }
+    if (name == "pthread_cond_init") {
+        uint32_t cAddr = 0;
+        uc_reg_read(uc, UC_ARM_REG_R0, &cAddr);
+        getOrCreateGuestCond(cAddr);
+        uint32_t zero = 0;
+        uc_reg_write(uc, UC_ARM_REG_R0, &zero);
+        return;
+    }
+    if (name == "pthread_cond_destroy") {
+        uint32_t cAddr = 0;
+        uc_reg_read(uc, UC_ARM_REG_R0, &cAddr);
+        if (cAddr != 0) {
+            std::lock_guard<std::mutex> lock(sSyncTableMutex);
+            sHostPthreadConds.erase(cAddr);
+        }
+        uint32_t zero = 0;
+        uc_reg_write(uc, UC_ARM_REG_R0, &zero);
+        return;
+    }
+    if (name == "pthread_cond_signal") {
+        uint32_t cAddr = 0;
+        uc_reg_read(uc, UC_ARM_REG_R0, &cAddr);
+        auto c = getOrCreateGuestCond(cAddr);
+        if (c) {
+            c->notify_one();
+        }
+        uint32_t zero = 0;
+        uc_reg_write(uc, UC_ARM_REG_R0, &zero);
+        return;
+    }
+    if (name == "pthread_cond_broadcast") {
+        uint32_t cAddr = 0;
+        uc_reg_read(uc, UC_ARM_REG_R0, &cAddr);
+        auto c = getOrCreateGuestCond(cAddr);
+        if (c) {
+            c->notify_all();
+        }
+        uint32_t zero = 0;
+        uc_reg_write(uc, UC_ARM_REG_R0, &zero);
+        return;
+    }
+    if (name == "pthread_cond_wait") {
+        uint32_t cAddr = 0, mAddr = 0;
+        uc_reg_read(uc, UC_ARM_REG_R0, &cAddr);
+        uc_reg_read(uc, UC_ARM_REG_R1, &mAddr);
+        auto c = getOrCreateGuestCond(cAddr);
+        auto m = getOrCreateGuestMutex(mAddr);
+        if (c && m) {
+            c->wait(*m);
+        }
+        uint32_t zero = 0;
+        uc_reg_write(uc, UC_ARM_REG_R0, &zero);
+        return;
+    }
+    if (name == "pthread_cond_timedwait") {
+        uint32_t cAddr = 0, mAddr = 0, tsAddr = 0;
+        uc_reg_read(uc, UC_ARM_REG_R0, &cAddr);
+        uc_reg_read(uc, UC_ARM_REG_R1, &mAddr);
+        uc_reg_read(uc, UC_ARM_REG_R2, &tsAddr);
+        auto c = getOrCreateGuestCond(cAddr);
+        auto m = getOrCreateGuestMutex(mAddr);
+        uint32_t ret = 0;
+        if (c && m && tsAddr != 0) {
+            struct { int32_t tv_sec; int32_t tv_nsec; } ts32{};
+            uc_mem_read(uc, tsAddr, &ts32, sizeof(ts32));
+            struct timespec now{};
+            clock_gettime(CLOCK_REALTIME, &now);
+            int64_t diffNs = (static_cast<int64_t>(ts32.tv_sec) - now.tv_sec) * 1000000000LL + (ts32.tv_nsec - now.tv_nsec);
+            if (diffNs <= 0) {
+                ret = 110U; // ETIMEDOUT
+            } else {
+                auto status = c->wait_for(*m, std::chrono::nanoseconds(diffNs));
+                if (status == std::cv_status::timeout) {
+                    ret = 110U; // ETIMEDOUT
+                }
+            }
+        } else if (c && m) {
+            c->wait(*m);
+        }
+        uc_reg_write(uc, UC_ARM_REG_R0, &ret);
         return;
     }
     if (name == "pthread_once") {
@@ -2534,9 +2718,9 @@ void GuestRuntimeEnvironment::handleTrampolineCall(uint32_t trampolineId, uc_eng
         uc_reg_write(uc, UC_ARM_REG_R0, &zero);
         return;
     }
-    if (name.rfind("pthread_mutex", 0) == 0 || name.rfind("pthread_cond", 0) == 0 ||
+    if (name.rfind("pthread_mutexattr", 0) == 0 || name.rfind("pthread_condattr", 0) == 0 ||
         name.rfind("pthread_attr", 0) == 0 || name.rfind("pthread_rwlock", 0) == 0 ||
-        name == "pthread_setname_np" || name == "pthread_detach" || name == "pthread_join") {
+        name == "pthread_setname_np") {
         uint32_t zero = 0;
         uc_reg_write(uc, UC_ARM_REG_R0, &zero);
         return;
@@ -3494,7 +3678,7 @@ void GuestRuntimeEnvironment::handleTrampolineCall(uint32_t trampolineId, uc_eng
         return;
     }
 
-    // 13. Pthread Create con esecuzione cooperativa della routine di avvio worker
+    // 13. Pthread Create con virtualizzazione nativa del multi-threading guest
     if (name == "pthread_create") {
         uint32_t tidPtr = 0, attrPtr = 0, startRoutine = 0, arg = 0;
         uc_reg_read(uc, UC_ARM_REG_R0, &tidPtr);
@@ -3502,50 +3686,9 @@ void GuestRuntimeEnvironment::handleTrampolineCall(uint32_t trampolineId, uc_eng
         uc_reg_read(uc, UC_ARM_REG_R2, &startRoutine);
         uc_reg_read(uc, UC_ARM_REG_R3, &arg);
 
-        uint32_t workerIndex = nextWorkerThreadId_++;
-        uint32_t tid = 0x60001000U + workerIndex;
-        if (tidPtr != 0) {
-            uc_mem_write(uc, tidPtr, &tid, 4);
-        }
-
-        LOGI("pthread_create: Inizializzazione thread 0x%08x (Routine: 0x%08x, Arg: 0x%08x)...",
-             tid, startRoutine, arg);
-
-        // Se la routine di avvio è valida, esegui il setup cooperativo sul proprio stack
-        if (startRoutine != 0) {
-            uint32_t savedSp = 0, savedLr = 0, savedCpsr = 0;
-            uint32_t savedR0 = 0, savedR1 = 0, savedR2 = 0, savedR3 = 0;
-            uc_reg_read(uc, UC_ARM_REG_SP, &savedSp);
-            uc_reg_read(uc, UC_ARM_REG_LR, &savedLr);
-            uc_reg_read(uc, UC_ARM_REG_CPSR, &savedCpsr);
-            uc_reg_read(uc, UC_ARM_REG_R0, &savedR0);
-            uc_reg_read(uc, UC_ARM_REG_R1, &savedR1);
-            uc_reg_read(uc, UC_ARM_REG_R2, &savedR2);
-            uc_reg_read(uc, UC_ARM_REG_R3, &savedR3);
-
-            // Stack dedicato al worker thread: 256KB per thread all'interno del pool
-            uint32_t workerStackTop = (guestWorkerStackBase_ + ((workerIndex + 1) * 0x40000U) - 0x1000U) & ~7U;
-            uint32_t workerLr = 0xDEADBEEFU;
-            uint32_t workerCpsr = (startRoutine & 1U) ? (savedCpsr | 0x20U) : (savedCpsr & ~0x20U);
-
-            uc_reg_write(uc, UC_ARM_REG_R0, &arg);
-            uc_reg_write(uc, UC_ARM_REG_SP, &workerStackTop);
-            uc_reg_write(uc, UC_ARM_REG_LR, &workerLr);
-            uc_reg_write(uc, UC_ARM_REG_CPSR, &workerCpsr);
-
-            uc_emu_start(uc, startRoutine, workerLr, 0, 100000);
-
-            // Ripristina contesto del thread chiamante
-            uc_reg_write(uc, UC_ARM_REG_SP, &savedSp);
-            uc_reg_write(uc, UC_ARM_REG_LR, &savedLr);
-            uc_reg_write(uc, UC_ARM_REG_CPSR, &savedCpsr);
-            uc_reg_write(uc, UC_ARM_REG_R1, &savedR1);
-            uc_reg_write(uc, UC_ARM_REG_R2, &savedR2);
-            uc_reg_write(uc, UC_ARM_REG_R3, &savedR3);
-        }
-
-        uint32_t zero = 0;
-        uc_reg_write(uc, UC_ARM_REG_R0, &zero);
+        int32_t res = GuestThreadScheduler::getInstance().createThread(tidPtr, attrPtr, startRoutine, arg, uc);
+        uint32_t ret = (res == 0) ? 0U : static_cast<uint32_t>(-res);
+        uc_reg_write(uc, UC_ARM_REG_R0, &ret);
         return;
     }
 

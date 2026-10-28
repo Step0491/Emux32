@@ -280,7 +280,7 @@ struct UnicornInstance {
     }
 
     // Arena flat 4 GB GuestMemory O(1) (g2h = base + addr) + TranslationBlockCache + fallback regioni
-    emux::GuestMemory flat_mem;
+    emux::GuestMemory& flat_mem;
     emux::TranslationBlockCache tb_cache;
     std::vector<MemoryRegion> regions;
     int last_region_idx{-1};
@@ -291,7 +291,7 @@ struct UnicornInstance {
     uc_hook next_hook_id{1};
     std::mutex hook_mutex;
 
-    UnicornInstance(uc_arch a, uc_mode m) : arch(a), mode(m) {
+    UnicornInstance(uc_arch a, uc_mode m) : arch(a), mode(m), flat_mem(emux::GuestMemory::getSharedInstance()) {
         regs[13] = 0x7E1FF000;
         cpsr = 0x00000010;
         flat_mem.initialize();

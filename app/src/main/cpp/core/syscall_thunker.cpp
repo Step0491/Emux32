@@ -1,4 +1,5 @@
 #include "syscall_thunker.h"
+#include "guest_memory.h"
 #include <sys/syscall.h>
 #include <sys/uio.h>
 #include <sys/time.h>
@@ -33,7 +34,21 @@ int32_t SyscallThunker::handleFutex(uc_engine* uc, uint32_t uaddr, int op, uint3
         }
     }
 
-    // Per chiamate FUTEX_WAKE o FUTEX_WAIT usiamo indirizzo sincronizzato
+    auto& gm = GuestMemory::getSharedInstance();
+    if (gm.isReady() && gm.isMapped(uaddr)) {
+        uint32_t* hostPtr = reinterpret_cast<uint32_t*>(gm.g2h(uaddr));
+        uint32_t* hostPtr2 = nullptr;
+        if (uaddr2 != 0 && gm.isMapped(uaddr2)) {
+            hostPtr2 = reinterpret_cast<uint32_t*>(gm.g2h(uaddr2));
+        }
+        long ret = syscall(SYS_futex, hostPtr, op, val, pts, hostPtr2, val3);
+        if (ret < 0) {
+            return -errno;
+        }
+        return static_cast<int32_t>(ret);
+    }
+
+    // Fallback se memoria non ancora mappata in GuestMemory
     uint32_t curVal = 0;
     uc_mem_read(uc, uaddr, &curVal, 4);
 
@@ -41,7 +56,6 @@ int32_t SyscallThunker::handleFutex(uc_engine* uc, uint32_t uaddr, int op, uint3
         if (curVal != val) {
             return -EWOULDBLOCK;
         }
-        // Piccola yielding/sleep per evitare deadlock del guest mono/unity
         if (pts) {
             nanosleep(pts, nullptr);
         } else {
@@ -49,7 +63,7 @@ int32_t SyscallThunker::handleFutex(uc_engine* uc, uint32_t uaddr, int op, uint3
         }
         return 0;
     } else if (cmd == FUTEX_WAKE) {
-        return static_cast<int32_t>(val); // Restituisce numero di processi svegliati
+        return static_cast<int32_t>(val);
     }
 
     return 0;

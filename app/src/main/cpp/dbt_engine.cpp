@@ -1,5 +1,6 @@
 #include "dbt_engine.h"
 #include "linker_hook.h"
+#include "core/guest_thread.h"
 
 #include <android/log.h>
 #include <android/native_window.h>
@@ -40,6 +41,7 @@ void DbtEngine::requestStop() {
     stopRequested_.store(true);
     governor_.isRunning.store(false);
     surfaceCv_.notify_all();
+    GuestThreadScheduler::getInstance().shutdown();
     if (uc_) {
         uc_emu_stop(uc_);
     }
@@ -390,6 +392,9 @@ bool DbtEngine::startEmulation() {
 
     // 1. Setup Stack Guest
     setupGuestStack();
+
+    // Inizializzazione Sottosistema Multi-Threading Guest
+    GuestThreadScheduler::getInstance().initialize(uc_);
 
     // 2. Inizializzazione EGL esclusivamente sul Worker Thread (attende fino a 1.2s se SurfaceView in creazione)
     ensureWorkerEgl(true);

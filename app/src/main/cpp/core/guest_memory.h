@@ -37,6 +37,9 @@ public:
     GuestMemory(const GuestMemory&) = delete;
     GuestMemory& operator=(const GuestMemory&) = delete;
 
+    // Istanza condivisa del modello di memoria flat 4 GB (process-wide address space)
+    static GuestMemory& getSharedInstance();
+
     // Riserva l'intero spazio 32-bit (4 GB) con MAP_NORESERVE e PROT_NONE sull'host
     bool initialize();
 
@@ -94,6 +97,7 @@ private:
     uint8_t* base_{nullptr};
     uint8_t* pageProt_{nullptr}; // Tabella software da 1 MB (1 byte per pagina guest da 4 KB)
     size_t   hostPageSize_{4096};
+    int      refCount_{0};
     mutable std::mutex mutex_;
 };
 

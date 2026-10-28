@@ -22,6 +22,11 @@ inline uintptr_t alignUp(uintptr_t val, size_t align) noexcept {
 }
 } // namespace
 
+GuestMemory& GuestMemory::getSharedInstance() {
+    static GuestMemory sSharedInstance;
+    return sSharedInstance;
+}
+
 GuestMemory::GuestMemory() {
     long ps = sysconf(_SC_PAGESIZE);
     hostPageSize_ = (ps > 0) ? static_cast<size_t>(ps) : 4096U;
@@ -33,6 +38,7 @@ GuestMemory::~GuestMemory() {
 
 bool GuestMemory::initialize() {
     std::lock_guard<std::mutex> lock(mutex_);
+    refCount_++;
     if (base_ != nullptr) {
         return true;
     }
@@ -77,6 +83,9 @@ bool GuestMemory::initialize() {
 
 void GuestMemory::destroy() {
     std::lock_guard<std::mutex> lock(mutex_);
+    if (--refCount_ > 0) {
+        return; // Altre istanze o thread guest sono ancora attivi
+    }
     if (base_ != nullptr) {
         munmap(base_, kAddressSpaceSize);
         base_ = nullptr;
@@ -85,6 +94,7 @@ void GuestMemory::destroy() {
         munmap(pageProt_, kTotalGuestPages);
         pageProt_ = nullptr;
     }
+    refCount_ = 0;
 }
 
 bool GuestMemory::map(guest_addr_t addr, uint32_t size, uint8_t prot) {
