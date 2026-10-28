@@ -724,7 +724,7 @@ bool GuestRuntimeEnvironment::initialize(uc_engine* uc) {
     classHandleMap_[0x1050] = "android/view/MotionEvent";
 
     // Inizializza modulo Audio OpenSL ES simulato per i giochi guest
-    AudioThunker::initialize(uc);
+    AudioThunker::getInstance().initialize(uc);
 
     LOGI("GuestRuntimeEnvironment inizializzato: JavaVM32=0x%08x, JNIEnv32=0x%08x (256 slot ABI), TLS=0x%08x, Heap=0x58000000",
          guestJavaVMAddr_, guestJNIEnvAddr_, guestTlsBase_);
@@ -768,6 +768,7 @@ static bool isSystemHookSymbol(const std::string& name) {
     if (name.find("pthread_") == 0 || name.find("__android_log_") == 0 ||
         name.find("gl") == 0 || name.find("egl") == 0 || name.find("dl") == 0 ||
         name.find("ANativeWindow_") == 0 || name.find("__aeabi_") == 0 ||
+        name.find("sl") == 0 || name.find("SL_IID_") == 0 ||
         name == "malloc" || name == "free" || name == "calloc" || name == "realloc" ||
         name == "memalign" || name == "posix_memalign" || name == "valloc" ||
         name == "mmap" || name == "munmap" || name == "mprotect" || name == "sysconf" ||
@@ -796,6 +797,11 @@ uint32_t GuestRuntimeEnvironment::resolveOrRegisterSymbol(const std::string& sym
     if (symbolName == "_ctype_") return getCtypePointer();
     if (symbolName == "__sF") return getSFilePointer();
     if (symbolName == "__stack_chk_guard") return getStackChkGuardPointer();
+
+    if (symbolName.rfind("SL_IID_", 0) == 0) {
+        uint32_t iidAddr = AudioThunker::getInstance().resolveInterfaceId(symbolName, uc);
+        if (iidAddr != 0) return iidAddr;
+    }
 
     // Se non e' un simbolo di sistema gestito dai nostri hook,
     // verifica se una qualsiasi libreria guest gia' caricata (es. libc++_shared, libmono, libfmod, libunity)
@@ -1841,6 +1847,12 @@ void GuestRuntimeEnvironment::handleTrampolineCall(uint32_t trampolineId, uc_eng
         return;
     }
 
+    // 2b. Intercettazione OpenSL ES Method Calls (0x5000 .. 0x50FF)
+    if (trampolineId >= 0x5000U && trampolineId < 0x5100U) {
+        AudioThunker::getInstance().handleMethodCall(trampolineId - 0x5000U, uc);
+        return;
+    }
+
     auto it = trampolineToSymbolMap_.find(trampolineId - 0x2000U);
     if (it == trampolineToSymbolMap_.end()) {
         uint32_t zero = 0;
@@ -1997,7 +2009,7 @@ void GuestRuntimeEnvironment::handleTrampolineCall(uint32_t trampolineId, uc_eng
     }
 
     // 3b. OpenSL ES Audio Thunking
-    if (AudioThunker::handleAudioCall(name, uc)) {
+    if (AudioThunker::getInstance().handleAudioCall(name, uc)) {
         return;
     }
 
