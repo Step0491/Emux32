@@ -107,6 +107,26 @@ struct GuestUContext {
     uint32_t uc_regspace[128]{0}; // VFP/NEON aux area
 };
 
+// Rimuove eventuali collisioni con macro di sistema (es. asm-generic/siginfo.h)
+#ifdef si_addr
+#undef si_addr
+#endif
+#ifdef si_pid
+#undef si_pid
+#endif
+#ifdef si_uid
+#undef si_uid
+#endif
+#ifdef si_status
+#undef si_status
+#endif
+#ifdef si_value
+#undef si_value
+#endif
+#ifdef si_band
+#undef si_band
+#endif
+
 // Layout completo di siginfo_t per Linux ARM32 (128 byte)
 struct GuestSigInfo {
     int32_t  si_signo{0};

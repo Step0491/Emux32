@@ -3,6 +3,25 @@
 #include <cerrno>
 #include <cstring>
 
+#ifdef si_addr
+#undef si_addr
+#endif
+#ifdef si_pid
+#undef si_pid
+#endif
+#ifdef si_uid
+#undef si_uid
+#endif
+#ifdef si_status
+#undef si_status
+#endif
+#ifdef si_value
+#undef si_value
+#endif
+#ifdef si_band
+#undef si_band
+#endif
+
 #define TAG "GuestSignalManager"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, TAG, __VA_ARGS__)
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN, TAG, __VA_ARGS__)

@@ -66,6 +66,12 @@
 #ifndef GL_POINT_SIZE_ARRAY_OES
 #define GL_POINT_SIZE_ARRAY_OES      0x8B9C
 #endif
+#ifndef GL_FLAT
+#define GL_FLAT                      0x1D00
+#endif
+#ifndef GL_SMOOTH
+#define GL_SMOOTH                    0x1D01
+#endif
 
 namespace emux {
 

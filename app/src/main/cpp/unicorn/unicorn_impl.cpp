@@ -1877,6 +1877,10 @@ uc_err uc_hook_del(uc_engine *uc, uc_hook hh) {
     return UC_ERR_HOOK;
 }
 
+} // extern "C"
+
+namespace {
+
 uc_err runInterpreter(UnicornInstance* inst, uint64_t begin, uint64_t until, size_t count) {
     if (!inst) return UC_ERR_HANDLE;
 
@@ -1910,7 +1914,7 @@ uc_err runInterpreter(UnicornInstance* inst, uint64_t begin, uint64_t until, siz
         uint32_t intnoToSend = (svcComment != 0) ? (0x80000000U | svcComment) : 2U;
         for (size_t i = 0; i < hookCount; ++i) {
             auto cb = reinterpret_cast<uc_cb_hookintr_t>(localHooks[i].callback);
-            cb(uc, intnoToSend, localHooks[i].user_data);
+            cb(reinterpret_cast<uc_engine*>(inst), intnoToSend, localHooks[i].user_data);
         }
     };
 
@@ -3011,6 +3015,10 @@ uc_err runInterpreter(UnicornInstance* inst, uint64_t begin, uint64_t until, siz
     if (prevStop) inst->stop_requested.store(true);
     return UC_ERR_OK;
 }
+
+} // namespace
+
+extern "C" {
 
 uc_err uc_emu_start(uc_engine *uc, uint64_t begin, uint64_t until, uint64_t /* timeout */, size_t count) {
     if (!uc) return UC_ERR_HANDLE;
