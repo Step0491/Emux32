@@ -165,6 +165,8 @@ public:
     EGLContext getEglContext() const { return eglContext_; }
     EGLConfig getEglConfig() const { return eglConfig_; }
 
+    jobject resolveHostObject(uint32_t guestHandle, JNIEnv* hostEnv, uc_engine* uc);
+
 private:
     GuestRuntimeEnvironment();
     void handleJniCall(uint32_t slotIndex, uc_engine* uc);
@@ -254,7 +256,6 @@ private:
     std::unordered_map<uint32_t, jclass> hostClassMap_;
     std::unordered_map<uint32_t, jmethodID> hostMethodMap_;
     std::unordered_map<uint32_t, jobject> hostObjectMap_;
-    jobject resolveHostObject(uint32_t guestHandle, JNIEnv* hostEnv, uc_engine* uc);
 };
 
 } // namespace emux
