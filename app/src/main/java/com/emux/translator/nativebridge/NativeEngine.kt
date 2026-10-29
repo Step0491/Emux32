@@ -24,6 +24,7 @@ object NativeEngine {
         nativeLibDir: String,
         filesDir: String
     )
+    external fun nativeSetGameClassLoader(classLoader: Any?): Boolean
     external fun nativeLoadElfLibrary(libraryPath: String): Boolean
     external fun startEmulationNative(): Boolean
     external fun nativeExecuteEntryPoint(): Boolean

@@ -546,6 +546,23 @@ class MainActivity : ComponentActivity() {
                 cacheDir.absolutePath,
                 filesDir.absolutePath
             )
+
+            // Inizializzazione DexClassLoader per esecuzione reale bytecode Java (.dex)
+            try {
+                val dexOptDir = File(cacheDir, "dex_opt")
+                if (!dexOptDir.exists()) dexOptDir.mkdirs()
+                val gameClassLoader = dalvik.system.DexClassLoader(
+                    apkFile.absolutePath,
+                    dexOptDir.absolutePath,
+                    cacheDir.absolutePath,
+                    classLoader
+                )
+                NativeEngine.nativeSetGameClassLoader(gameClassLoader)
+                EmuxLogger.i("Emux32", "[FASE 4/5] DexClassLoader host inizializzato per ${apkFile.name} (Bridge Java/ART attivo)")
+            } catch (t: Throwable) {
+                EmuxLogger.w("Emux32", "[FASE 4/5] Fallback su ClassLoader di sistema: ${t.message}")
+                NativeEngine.nativeSetGameClassLoader(classLoader)
+            }
             NativeEngine.nativeConfigurePerformance(60, enableFhd = true, throttleGuard = true)
             EmuxLogger.i("Emux32", "[FASE 4/5] Motore DBT configurato: 60 FPS Lock, Buffer FHD 1080p, Throttle Guard attivo.")
 

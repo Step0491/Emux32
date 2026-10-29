@@ -98,6 +98,8 @@ public:
         const std::string& filesDir
     );
 
+    void setGameClassLoader(JNIEnv* env, jobject classLoader);
+
     const std::string& getPackageName() const { return packageName_; }
     const std::string& getApkPath() const { return apkPath_; }
     const std::string& getObbDir() const { return obbDir_; }
@@ -245,6 +247,12 @@ private:
     std::mutex eglMutex_;
     std::unordered_map<uint32_t, EGLContext> guestEglContextMap_;
     std::unordered_map<uint32_t, EGLSurface> guestEglSurfaceMap_;
+
+    JavaVM* hostJavaVm_{nullptr};
+    jobject hostClassLoader_{nullptr};
+    jmethodID loadClassMethod_{nullptr};
+    std::unordered_map<uint32_t, jclass> hostClassMap_;
+    std::unordered_map<uint32_t, jmethodID> hostMethodMap_;
 };
 
 } // namespace emux

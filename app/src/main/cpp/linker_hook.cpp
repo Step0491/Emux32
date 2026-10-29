@@ -723,6 +723,28 @@ void GuestRuntimeEnvironment::setGameContext(
          packageName_.c_str(), apkPath_.c_str(), obbDir_.c_str(), nativeLibDir_.c_str());
 }
 
+void GuestRuntimeEnvironment::setGameClassLoader(JNIEnv* env, jobject classLoader) {
+    if (!env) return;
+    env->GetJavaVM(&hostJavaVm_);
+    if (hostClassLoader_) {
+        env->DeleteGlobalRef(hostClassLoader_);
+        hostClassLoader_ = nullptr;
+    }
+    for (auto& pair : hostClassMap_) {
+        if (pair.second) env->DeleteGlobalRef(pair.second);
+    }
+    hostClassMap_.clear();
+    hostMethodMap_.clear();
+
+    if (classLoader) {
+        hostClassLoader_ = env->NewGlobalRef(classLoader);
+        jclass clClass = env->GetObjectClass(hostClassLoader_);
+        loadClassMethod_ = env->GetMethodID(clClass, "loadClass", "(Ljava/lang/String;)Ljava/lang/Class;");
+        env->DeleteLocalRef(clClass);
+        LOGI("GuestRuntimeEnvironment: DexClassLoader host ART collegato con successo (JavaVM=%p)", hostJavaVm_);
+    }
+}
+
 bool GuestRuntimeEnvironment::initialize(uc_engine* uc) {
     if (!uc) return false;
 
@@ -744,6 +766,8 @@ bool GuestRuntimeEnvironment::initialize(uc_engine* uc) {
     jstringMap_.clear();
     jstringGuestPtrMap_.clear();
     arrayHandleMap_.clear();
+    hostClassMap_.clear();
+    hostMethodMap_.clear();
 
     GuestThreadScheduler::getInstance().shutdown();
 
@@ -1004,6 +1028,28 @@ void GuestRuntimeEnvironment::handleJniCall(uint32_t slotIndex, uc_engine* uc) {
             std::string clsName = readGuestCString(uc, r1);
             uint32_t handle = nextMockHandle_++;
             classHandleMap_[handle] = clsName;
+
+            if (hostJavaVm_ && hostClassLoader_ && loadClassMethod_) {
+                JNIEnv* hostEnv = nullptr;
+                if (hostJavaVm_->GetEnv(reinterpret_cast<void**>(&hostEnv), JNI_VERSION_1_6) == JNI_OK && hostEnv) {
+                    std::string dotted = clsName;
+                    std::replace(dotted.begin(), dotted.end(), '/', '.');
+                    jstring jDotted = hostEnv->NewStringUTF(dotted.c_str());
+                    jclass foundCls = static_cast<jclass>(hostEnv->CallObjectMethod(hostClassLoader_, loadClassMethod_, jDotted));
+                    if (hostEnv->ExceptionCheck()) {
+                        hostEnv->ExceptionClear();
+                        foundCls = hostEnv->FindClass(clsName.c_str());
+                        if (hostEnv->ExceptionCheck()) hostEnv->ExceptionClear();
+                    }
+                    hostEnv->DeleteLocalRef(jDotted);
+                    if (foundCls) {
+                        hostClassMap_[handle] = static_cast<jclass>(hostEnv->NewGlobalRef(foundCls));
+                        hostEnv->DeleteLocalRef(foundCls);
+                        LOGI("JNI FindClass('%s') -> CLASSE REALE HOST ART CARICATA (handle=0x%x)", clsName.c_str(), handle);
+                    }
+                }
+            }
+
             LOGI("JNI FindClass('%s') -> handle=0x%x", clsName.c_str(), handle);
             setReturnU32(handle);
             return;
@@ -1077,6 +1123,24 @@ void GuestRuntimeEnvironment::handleJniCall(uint32_t slotIndex, uc_engine* uc) {
             std::string cName = classHandleMap_.count(r1) ? classHandleMap_[r1] : "";
             uint32_t handle = nextMockHandle_++;
             methodHandleMap_[handle] = {cName, mName, mSig, slotIndex == 113};
+
+            if (hostClassMap_.count(r1) && hostJavaVm_) {
+                JNIEnv* hostEnv = nullptr;
+                if (hostJavaVm_->GetEnv(reinterpret_cast<void**>(&hostEnv), JNI_VERSION_1_6) == JNI_OK && hostEnv) {
+                    jclass realCls = hostClassMap_[r1];
+                    jmethodID mId = (slotIndex == 113)
+                        ? hostEnv->GetStaticMethodID(realCls, mName.c_str(), mSig.c_str())
+                        : hostEnv->GetMethodID(realCls, mName.c_str(), mSig.c_str());
+                    if (hostEnv->ExceptionCheck()) hostEnv->ExceptionClear();
+                    if (mId) {
+                        hostMethodMap_[handle] = mId;
+                        LOGI("JNI %s -> METODO REALE HOST TROVATO: %s::%s%s (handle=0x%x)",
+                             (slotIndex == 113 ? "GetStaticMethodID" : "GetMethodID"),
+                             cName.c_str(), mName.c_str(), mSig.c_str(), handle);
+                    }
+                }
+            }
+
             LOGI("JNI %s('%s', '%s', '%s') -> 0x%x",
                  (slotIndex == 113 ? "GetStaticMethodID" : "GetMethodID"),
                  cName.c_str(), mName.c_str(), mSig.c_str(), handle);
@@ -1099,6 +1163,27 @@ void GuestRuntimeEnvironment::handleJniCall(uint32_t slotIndex, uc_engine* uc) {
         case 34: case 35: case 36:
         case 64: case 65: case 66:
         case 114: case 115: case 116: {
+            auto hit = hostMethodMap_.find(r2);
+            if (hit != hostMethodMap_.end() && hostJavaVm_) {
+                JNIEnv* hostEnv = nullptr;
+                if (hostJavaVm_->GetEnv(reinterpret_cast<void**>(&hostEnv), JNI_VERSION_1_6) == JNI_OK && hostEnv) {
+                    jclass realCls = hostClassMap_.count(r1) ? hostClassMap_[r1] : nullptr;
+                    if (realCls && (slotIndex >= 114)) {
+                        jobject resObj = hostEnv->CallStaticObjectMethod(realCls, hit->second);
+                        if (hostEnv->ExceptionCheck()) hostEnv->ExceptionClear();
+                        if (resObj) {
+                            uint32_t objH = nextMockHandle_++;
+                            jclass objCls = hostEnv->GetObjectClass(resObj);
+                            hostClassMap_[objH] = static_cast<jclass>(hostEnv->NewGlobalRef(objCls));
+                            hostEnv->DeleteLocalRef(objCls);
+                            hostEnv->DeleteLocalRef(resObj);
+                            setReturnU32(objH);
+                            return;
+                        }
+                    }
+                }
+            }
+
             auto mit = methodHandleMap_.find(r2);
             if (mit != methodHandleMap_.end()) {
                 const auto& info = mit->second;
@@ -1262,14 +1347,41 @@ void GuestRuntimeEnvironment::handleJniCall(uint32_t slotIndex, uc_engine* uc) {
         // CallBooleanMethod / CallStaticBooleanMethod
         case 37: case 38: case 39:
         case 67: case 68: case 69:
-        case 117: case 118: case 119:
+        case 117: case 118: case 119: {
+            auto hit = hostMethodMap_.find(r2);
+            if (hit != hostMethodMap_.end() && hostJavaVm_) {
+                JNIEnv* hostEnv = nullptr;
+                if (hostJavaVm_->GetEnv(reinterpret_cast<void**>(&hostEnv), JNI_VERSION_1_6) == JNI_OK && hostEnv) {
+                    jclass realCls = hostClassMap_.count(r1) ? hostClassMap_[r1] : nullptr;
+                    if (realCls && (slotIndex >= 117)) {
+                        jboolean bRes = hostEnv->CallStaticBooleanMethod(realCls, hit->second);
+                        if (hostEnv->ExceptionCheck()) hostEnv->ExceptionClear();
+                        setReturnU32(bRes ? 1U : 0U);
+                        return;
+                    }
+                }
+            }
             setReturnU32(1);
             return;
+        }
 
         // CallIntMethod / CallStaticIntMethod (inclusi metodi MotionEvent e InputStream)
         case 49: case 50: case 51:
         case 79: case 80: case 81:
         case 129: case 130: case 131: {
+            auto hit = hostMethodMap_.find(r2);
+            if (hit != hostMethodMap_.end() && hostJavaVm_) {
+                JNIEnv* hostEnv = nullptr;
+                if (hostJavaVm_->GetEnv(reinterpret_cast<void**>(&hostEnv), JNI_VERSION_1_6) == JNI_OK && hostEnv) {
+                    jclass realCls = hostClassMap_.count(r1) ? hostClassMap_[r1] : nullptr;
+                    if (realCls && (slotIndex >= 129)) {
+                        jint iRes = hostEnv->CallStaticIntMethod(realCls, hit->second);
+                        if (hostEnv->ExceptionCheck()) hostEnv->ExceptionClear();
+                        setReturnU32(static_cast<uint32_t>(iRes));
+                        return;
+                    }
+                }
+            }
             auto mit = methodHandleMap_.find(r2);
             if (mit != methodHandleMap_.end()) {
                 const std::string& mName = mit->second.name;
@@ -1348,6 +1460,19 @@ void GuestRuntimeEnvironment::handleJniCall(uint32_t slotIndex, uc_engine* uc) {
         case 61: case 62: case 63:
         case 91: case 92: case 93:
         case 141: case 142: case 143: {
+            auto hit = hostMethodMap_.find(r2);
+            if (hit != hostMethodMap_.end() && hostJavaVm_) {
+                JNIEnv* hostEnv = nullptr;
+                if (hostJavaVm_->GetEnv(reinterpret_cast<void**>(&hostEnv), JNI_VERSION_1_6) == JNI_OK && hostEnv) {
+                    jclass realCls = hostClassMap_.count(r1) ? hostClassMap_[r1] : nullptr;
+                    if (realCls && (slotIndex >= 141)) {
+                        hostEnv->CallStaticVoidMethod(realCls, hit->second);
+                    }
+                    if (hostEnv->ExceptionCheck()) hostEnv->ExceptionClear();
+                    setReturnU32(0);
+                    return;
+                }
+            }
             auto mit = methodHandleMap_.find(r2);
             if (mit != methodHandleMap_.end()) {
                 const auto& info = mit->second;

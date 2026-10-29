@@ -121,6 +121,16 @@ Java_com_emux_translator_nativebridge_NativeEngine_nativeSetGameContext(
 }
 
 JNIEXPORT jboolean JNICALL
+Java_com_emux_translator_nativebridge_NativeEngine_nativeSetGameClassLoader(
+    JNIEnv* env,
+    jobject /* thiz */,
+    jobject classLoader
+) {
+    emux::GuestRuntimeEnvironment::getInstance().setGameClassLoader(env, classLoader);
+    return JNI_TRUE;
+}
+
+JNIEXPORT jboolean JNICALL
 Java_com_emux_translator_nativebridge_NativeEngine_nativeLoadElfLibrary(
     JNIEnv* env,
     jobject /* thiz */,
