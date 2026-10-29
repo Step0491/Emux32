@@ -670,7 +670,7 @@ bool DbtEngine::startEmulation() {
             LOGI("Invocazione ANativeActivity onStart @ 0x%08x...", onStart);
             invokeGuestFunction(onStart, activityPtr, 0, 0, 0, 1000000);
         }
-        if (onNativeWindowCreated) {
+        if (onWindowCreated) {
             LOGI("Invocazione ANativeActivity onNativeWindowCreated @ 0x%08x...", onWindowCreated);
             invokeGuestFunction(onWindowCreated, activityPtr, winHandle, 0, 0, 2000000);
         }
