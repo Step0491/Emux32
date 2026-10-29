@@ -61,6 +61,7 @@ public:
     uint32_t getTlsSpecific(uint32_t key);
 
     size_t getActiveThreadCount() const;
+    bool isShutdown() const { return isShutdown_.load(std::memory_order_relaxed); }
 
 private:
     GuestThreadScheduler() = default;

@@ -20,6 +20,7 @@
 #include "dynarmic/interface/A32/a32.h"
 #include "dynarmic/interface/A32/config.h"
 #include "dynarmic/interface/A32/coprocessor.h"
+#include "dynarmic/interface/exclusive_monitor.h"
 #endif
 
 #define TAG "UnicornCore"
@@ -229,9 +230,18 @@ class DynarmicUserCallbacks;
 class DynarmicCp15;
 #endif
 
+#if defined(EMUX_ENABLE_DYNARMIC)
+static std::shared_ptr<Dynarmic::ExclusiveMonitor>& getSharedExclusiveMonitor() {
+    static auto sSharedMonitor = std::make_shared<Dynarmic::ExclusiveMonitor>(64);
+    return sSharedMonitor;
+}
+static std::atomic<size_t> sNextProcessorId{0};
+#endif
+
 struct UnicornInstance {
     uc_arch arch{UC_ARCH_ARM};
     uc_mode mode{UC_MODE_ARM};
+    size_t processor_id{0};
     std::atomic<bool> is_running{false};
     std::atomic<bool> stop_requested{false};
 
@@ -318,12 +328,16 @@ struct UnicornInstance {
         cpsr = 0x00000010;
         flat_mem.initialize();
 #if defined(EMUX_ENABLE_DYNARMIC)
+        processor_id = sNextProcessorId.fetch_add(1) % 64;
         initDynarmic();
 #endif
     }
 
     ~UnicornInstance() {
 #if defined(EMUX_ENABLE_DYNARMIC)
+        if (getSharedExclusiveMonitor()) {
+            getSharedExclusiveMonitor()->ClearProcessor(processor_id);
+        }
         dynarmic_jit.reset();
         dynarmic_cp15.reset();
         dynarmic_cb.reset();
@@ -1243,6 +1257,15 @@ public:
     }
 
     void ExceptionRaised(Dynarmic::A32::VAddr pc, Dynarmic::A32::Exception exception) override {
+        if (exception == Dynarmic::A32::Exception::Yield ||
+            exception == Dynarmic::A32::Exception::WaitForEvent ||
+            exception == Dynarmic::A32::Exception::WaitForInterrupt ||
+            exception == Dynarmic::A32::Exception::SendEvent ||
+            exception == Dynarmic::A32::Exception::SendEventLocal) {
+            std::this_thread::yield();
+            return;
+        }
+
         LOGW("Dynarmic: ExceptionRaised a PC=0x%08x (tipo=%d)", pc, static_cast<int>(exception));
         int sig = emux::GUEST_SIGSEGV;
         int code = 1;
@@ -1284,6 +1307,8 @@ void UnicornInstance::initDynarmic() {
         conf.arch_version = Dynarmic::A32::ArchVersion::v7;
         conf.enable_cycle_counting = false;
         conf.unsafe_optimizations = false;
+        conf.global_monitor = getSharedExclusiveMonitor().get();
+        conf.processor_id = processor_id;
 
         if (flat_mem.isReady() && flat_mem.base() != nullptr) {
             conf.fastmem_pointer = reinterpret_cast<uintptr_t>(flat_mem.base());

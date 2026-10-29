@@ -1,5 +1,6 @@
 #include "syscall_thunker.h"
 #include "guest_memory.h"
+#include "guest_thread.h"
 #include <sys/syscall.h>
 #include <sys/uio.h>
 #include <sys/time.h>
@@ -41,7 +42,28 @@ int32_t SyscallThunker::handleFutex(uc_engine* uc, uint32_t uaddr, int op, uint3
         if (uaddr2 != 0 && gm.isMapped(uaddr2)) {
             hostPtr2 = reinterpret_cast<uint32_t*>(gm.g2h(uaddr2));
         }
-        long ret = syscall(SYS_futex, hostPtr, op, val, pts, hostPtr2, val3);
+
+        // Normalizza con FUTEX_PRIVATE_FLAG per garantire che tutti i thread dello stesso processo
+        // usino il medesimo hash bucket nel kernel Linux ed evitino deadlock tra WAIT e WAKE
+        int normOp = cmd | FUTEX_PRIVATE_FLAG;
+
+        if (cmd == FUTEX_WAIT && !pts) {
+            // Schedulazione cooperativa non bloccante: timeout a slice di 250ms per verificare shutdown o cambi di valore
+            struct timespec pollSlice = {0, 250000000}; // 250 ms
+            while (!GuestThreadScheduler::getInstance().isShutdown()) {
+                long ret = syscall(SYS_futex, hostPtr, normOp, val, &pollSlice, hostPtr2, val3);
+                if (ret == 0) return 0;
+                if (errno == EWOULDBLOCK) return -EWOULDBLOCK;
+                if (errno == ETIMEDOUT) {
+                    if (*hostPtr != val) return -EWOULDBLOCK;
+                    continue;
+                }
+                return -errno;
+            }
+            return -EINTR;
+        }
+
+        long ret = syscall(SYS_futex, hostPtr, normOp, val, pts, hostPtr2, val3);
         if (ret < 0) {
             return -errno;
         }

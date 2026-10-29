@@ -129,10 +129,24 @@ int32_t GuestThreadScheduler::createThread(
         gm.map(thread->tlsAddr, 4096, GP_READ | GP_WRITE);
     }
 
-    // Imposta il puntatore self di Bionic a TLS offset 0
+    // Inizializzazione completa del blocco TLS conforme all'ABI Android Bionic ARM32
+    uint32_t tlsBlock[64] = {0};
+    tlsBlock[0] = thread->tlsAddr;         // TLS_SLOT_SELF
+    tlsBlock[1] = thread->tid;             // TLS_SLOT_THREAD_ID (pthread_t)
+    tlsBlock[2] = thread->tlsAddr + 0x100; // TLS_SLOT_ERRNO (allocato a offset +256 nel blocco TLS 4KB)
+    tlsBlock[3] = 0;                       // TLS_SLOT_OPENGL
+    tlsBlock[4] = 0;                       // TLS_SLOT_OPENGL_API
+    tlsBlock[5] = 0xDEADBEE0U;             // TLS_SLOT_STACK_GUARD
+    tlsBlock[6] = 0xDEADBEE0U;             // Stack guard backup
+    tlsBlock[7] = 0;                       // TLS_SLOT_ART_THREAD_SELF
+
+    uint32_t zeroErrno = 0;
+    std::memcpy(gm.g2h(thread->tlsAddr), tlsBlock, sizeof(tlsBlock));
+    std::memcpy(gm.g2h(thread->tlsAddr + 0x100), &zeroErrno, sizeof(zeroErrno));
+
     if (callerUc) {
-        uint32_t selfPtr = thread->tlsAddr;
-        uc_mem_write(callerUc, thread->tlsAddr, &selfPtr, 4);
+        uc_mem_write(callerUc, thread->tlsAddr, tlsBlock, sizeof(tlsBlock));
+        uc_mem_write(callerUc, thread->tlsAddr + 0x100, &zeroErrno, sizeof(zeroErrno));
     }
 
     // Istanzia il motore di emulazione CPU dedicato per questo thread

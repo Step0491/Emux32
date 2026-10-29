@@ -796,11 +796,16 @@ bool GuestRuntimeEnvironment::initialize(uc_engine* uc) {
 
     // 2. Mappa regione TLS Bionic (0x7D020000, 16KB) e imposta registro CP15 TPIDRURO
     uc_mem_map(uc, guestTlsBase_, 0x4000, UC_PROT_READ | UC_PROT_WRITE);
-    uint32_t tlsSlots[16] = {0};
-    tlsSlots[0] = guestTlsBase_; // TLS_SLOT_SELF
-    tlsSlots[1] = guestTlsBase_; // TLS_SLOT_THREAD_ID
-    tlsSlots[6] = 0xDEADBEE0U;   // Stack guard
+    uint32_t tlsSlots[64] = {0};
+    tlsSlots[0] = guestTlsBase_;         // TLS_SLOT_SELF
+    tlsSlots[1] = 1;                     // TLS_SLOT_THREAD_ID (Main Thread TID=1)
+    tlsSlots[2] = guestTlsBase_ + 0x100; // TLS_SLOT_ERRNO (allocato a offset +256)
+    tlsSlots[3] = 0;                     // TLS_SLOT_OPENGL
+    tlsSlots[5] = 0xDEADBEE0U;           // TLS_SLOT_STACK_GUARD (Bionic ARM32)
+    tlsSlots[6] = 0xDEADBEE0U;           // Stack guard backup
     uc_mem_write(uc, guestTlsBase_, tlsSlots, sizeof(tlsSlots));
+    uint32_t zeroErrno = 0;
+    uc_mem_write(uc, guestTlsBase_ + 0x100, &zeroErrno, 4);
     uc_reg_write(uc, UC_ARM_REG_C13_C0_3, &guestTlsBase_);
     uc_reg_write(uc, UC_ARM_REG_C13_C0_2, &guestTlsBase_);
 
@@ -2747,6 +2752,12 @@ void GuestRuntimeEnvironment::handleTrampolineCall(uint32_t trampolineId, uc_eng
         uc_reg_read(uc, UC_ARM_REG_R1, &t2);
         uint32_t eq = (t1 == t2) ? 1U : 0U;
         uc_reg_write(uc, UC_ARM_REG_R0, &eq);
+        return;
+    }
+    if (name == "sched_yield" || name == "pthread_yield") {
+        std::this_thread::yield();
+        uint32_t zero = 0;
+        uc_reg_write(uc, UC_ARM_REG_R0, &zero);
         return;
     }
     if (name == "pthread_join") {
