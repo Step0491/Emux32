@@ -250,6 +250,8 @@ private:
     std::unordered_map<uint32_t, GuestInputStream> guestInputStreamMap_;
     uint32_t nextInputStreamHandle_{0x7D300000U};
 
+    mutable std::recursive_mutex runtimeMutex_;
+
     std::string packageName_{"com.turner.cardwars"};
     std::string apkPath_;
     std::string obbDir_;

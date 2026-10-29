@@ -1089,6 +1089,7 @@ bool GuestRuntimeEnvironment::initialize(uc_engine* uc) {
 }
 
 uint32_t GuestRuntimeEnvironment::createGuestString(uc_engine* uc, const std::string& str) {
+    std::lock_guard<std::recursive_mutex> lock(runtimeMutex_);
     uint32_t addr = allocGuestHeap(uc, static_cast<uint32_t>(str.size() + 1), 8);
     if (uc) {
         uc_mem_write(uc, addr, str.c_str(), str.size() + 1);
@@ -1097,6 +1098,7 @@ uint32_t GuestRuntimeEnvironment::createGuestString(uc_engine* uc, const std::st
 }
 
 uint32_t GuestRuntimeEnvironment::createGuestJString(uc_engine* uc, const std::string& str) {
+    std::lock_guard<std::recursive_mutex> lock(runtimeMutex_);
     uint32_t handle = nextMockHandle_++;
     jstringMap_[handle] = str;
     jstringGuestPtrMap_[handle] = createGuestString(uc, str);
@@ -1416,6 +1418,7 @@ static JniArgUnpackResult unpackJniArguments(
 }
 
 void GuestRuntimeEnvironment::handleJniCall(uint32_t slotIndex, uc_engine* uc) {
+    std::lock_guard<std::recursive_mutex> lock(runtimeMutex_);
     uint32_t r1 = 0, r2 = 0, r3 = 0;
     uc_reg_read(uc, UC_ARM_REG_R1, &r1);
     uc_reg_read(uc, UC_ARM_REG_R2, &r2);

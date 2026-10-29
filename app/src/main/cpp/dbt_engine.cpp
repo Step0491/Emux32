@@ -2,6 +2,7 @@
 #include "linker_hook.h"
 #include "core/guest_thread.h"
 #include "core/gles_virtualizer.h"
+#include "core/guest_memory.h"
 
 #include <android/log.h>
 #include <android/native_window.h>
@@ -36,6 +37,7 @@ DbtEngine::~DbtEngine() {
         ANativeWindow_release(nativeWindow_);
         nativeWindow_ = nullptr;
     }
+    GuestMemory::getSharedInstance().destroy();
 }
 
 void DbtEngine::requestStop() {
@@ -350,9 +352,16 @@ void DbtEngine::processPendingTouchEvents() {
 bool DbtEngine::initialize(size_t /* guestRamSize */) {
     LOGI("Inizializzazione Unicorn Engine per architettura ARMv7-A...");
 
+    // Inizializza l'arena virtuale contigua da 4 GB per lo spazio indirizzi guest a 32 bit
+    if (!GuestMemory::getSharedInstance().initialize()) {
+        LOGE("GuestMemory::initialize() fallito: impossibile riservare l'arena virtuale da 4 GB");
+        return false;
+    }
+
     uc_err err = uc_open(UC_ARCH_ARM, UC_MODE_ARM, &uc_);
     if (err != UC_ERR_OK) {
         LOGE("uc_open fallito: %s (codice: %d)", uc_strerror(err), err);
+        GuestMemory::getSharedInstance().destroy();
         return false;
     }
 
