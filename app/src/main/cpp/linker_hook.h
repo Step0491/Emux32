@@ -116,6 +116,7 @@ public:
     uint32_t findExportedSymbol(const std::string& symbolName) const;
 
     uint32_t createGuestString(uc_engine* uc, const std::string& str);
+    uint32_t createGuestCString(uc_engine* uc, const std::string& str) { return createGuestString(uc, str); }
     uint32_t createGuestJString(uc_engine* uc, const std::string& str);
 
     std::string resolveAssetPath(const std::string& relativePath);

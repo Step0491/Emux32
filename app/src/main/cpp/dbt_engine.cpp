@@ -255,6 +255,7 @@ void DbtEngine::processPendingTouchEvents() {
 
     for (const auto& ev : events) {
         env.setLastTouchState(ev.action, ev.x, ev.y, ev.pointerId);
+        bool handled = false;
         for (const auto& m : nativeMethods) {
             std::string lower = m.name;
             std::transform(lower.begin(), lower.end(), lower.begin(), ::tolower);
@@ -286,7 +287,51 @@ void DbtEngine::processPendingTouchEvents() {
                 uc_reg_write(uc_, UC_ARM_REG_LR, &lr);
                 uc_reg_write(uc_, UC_ARM_REG_CPSR, &cpsr);
                 uc_emu_start(uc_, m.fnPtr, lr, 0, 200000);
+                handled = true;
                 break;
+            }
+        }
+
+        // Fallback Cocos2d-x nativeTouchesBegin / nativeTouchesMove / nativeTouchesEnd
+        if (!handled) {
+            for (const auto& lib : loadedLibs_) {
+                if (!lib) continue;
+                for (const auto& sym : lib->symbols) {
+                    if (sym.vaddr == 0) continue;
+                    std::string lower = sym.name;
+                    std::transform(lower.begin(), lower.end(), lower.begin(), ::tolower);
+                    bool match = false;
+                    if (ev.action == 0 && (lower.find("touchesbegin") != std::string::npos || lower.find("touchdown") != std::string::npos)) match = true;
+                    else if (ev.action == 2 && (lower.find("touchesmove") != std::string::npos || lower.find("touchmove") != std::string::npos)) match = true;
+                    else if (ev.action == 1 && (lower.find("touchesend") != std::string::npos || lower.find("touchup") != std::string::npos)) match = true;
+                    else if (ev.action == 3 && (lower.find("touchcancel") != std::string::npos)) match = true;
+
+                    if (match) {
+                        uint32_t fnPtr = lib->load_bias + sym.vaddr;
+                        uint32_t jniEnvPtr = env.getJNIEnvPointer();
+                        uint32_t dummyObj = 0x1002;
+                        uint32_t pId = static_cast<uint32_t>(ev.pointerId);
+                        uint32_t rawX = 0, rawY = 0;
+                        std::memcpy(&rawX, &ev.x, 4);
+                        std::memcpy(&rawY, &ev.y, 4);
+                        uint32_t lr = 0xDEADBEEF;
+                        uint32_t sp = guestStackPointer_;
+                        uint32_t cpsr = (fnPtr & 1U) ? 0x00000030U : 0x00000010U;
+
+                        uc_reg_write(uc_, UC_ARM_REG_R0, &jniEnvPtr);
+                        uc_reg_write(uc_, UC_ARM_REG_R1, &dummyObj);
+                        uc_reg_write(uc_, UC_ARM_REG_R2, &pId);
+                        uc_reg_write(uc_, UC_ARM_REG_R3, &rawX);
+                        uc_mem_write(uc_, sp, &rawY, 4);
+                        uc_reg_write(uc_, UC_ARM_REG_SP, &sp);
+                        uc_reg_write(uc_, UC_ARM_REG_LR, &lr);
+                        uc_reg_write(uc_, UC_ARM_REG_CPSR, &cpsr);
+                        uc_emu_start(uc_, fnPtr, lr, 0, 200000);
+                        handled = true;
+                        break;
+                    }
+                }
+                if (handled) break;
             }
         }
     }
@@ -450,6 +495,18 @@ bool DbtEngine::startEmulation() {
                 break;
             }
         }
+        if (jniOnLoadAddr == 0 && lib->entry_point != 0 && lib->path.find("libmono") == std::string::npos) {
+            bool isNativeActivity = false;
+            for (const auto& sym : lib->symbols) {
+                if (sym.name == "ANativeActivity_onCreate") {
+                    isNativeActivity = true;
+                    break;
+                }
+            }
+            if (!isNativeActivity) {
+                jniOnLoadAddr = lib->entry_point;
+            }
+        }
 
         if (jniOnLoadAddr != 0) {
             LOGI("Avvio JNI_OnLoad per '%s': PC=0x%08x, SP=0x%08x, JavaVM=0x%08x...",
@@ -465,7 +522,17 @@ bool DbtEngine::startEmulation() {
     uint32_t dummyInstance = 0x1001;
     uint32_t dummySurface = 0x1003;
 
-    // 5a. Unity nativeFile(String apkPath)
+    // 5a. Unity/Bionic init del contesto (initJni) - DEVE ESSERE PRIMA DI nativeFile!
+    for (const auto& m : nativeMethods) {
+        std::string lower = m.name;
+        std::transform(lower.begin(), lower.end(), lower.begin(), ::tolower);
+        if (lower == "initjni" || lower == "nativeinitjni") {
+            LOGI("Invocazione metodo guest '%s' (Context=0x1001)...", m.name.c_str());
+            invokeGuestFunction(m.fnPtr, jniEnvPtr, dummyInstance, 0x1001, 0, 2000000);
+        }
+    }
+
+    // 5b. Unity nativeFile(String apkPath) - eseguito dopo initJni
     for (const auto& m : nativeMethods) {
         if (m.name == "nativeFile" && !env.getApkPath().empty()) {
             uint32_t jstrApk = env.createGuestJString(uc_, env.getApkPath());
@@ -474,24 +541,21 @@ bool DbtEngine::startEmulation() {
         }
     }
 
-    // 5b. Metodi di init dedicati (initJni, init, nativeInit, create)
+    // 5c. Altri metodi di init dedicati (init, nativeInit, create)
     for (const auto& m : nativeMethods) {
         std::string lower = m.name;
         std::transform(lower.begin(), lower.end(), lower.begin(), ::tolower);
+        if (lower == "initjni" || lower == "nativeinitjni" || lower == "nativefile") continue;
         if (lower.find("recreate") != std::string::npos || lower.find("surface") != std::string::npos || lower.find("gfx") != std::string::npos) {
-            continue; // Riservato alla fase 5c con la Surface valida
+            continue; // Riservato alla fase 5d con la Surface valida
         }
 
-        if (lower == "initjni" || lower == "nativeinitjni") {
-            LOGI("Invocazione metodo guest '%s' (Context=0x1001)...", m.name.c_str());
-            invokeGuestFunction(m.fnPtr, jniEnvPtr, dummyInstance, 0x1001, 0, 20000000);
-        } else if (lower == "init" && m.signature == "(IZ)V") {
+        if (lower == "init" && m.signature == "(IZ)V") {
             LOGI("Invocazione metodo guest '%s' (0, false)...", m.name.c_str());
             invokeGuestFunction(m.fnPtr, jniEnvPtr, dummyInstance, 0, 0, 20000000);
         } else if (lower == "nativeinit" || lower == "init" || lower == "nativecreate" || lower == "create" || lower.find("init") != std::string::npos) {
             LOGI("Invocazione metodo guest di setup '%s' (0x%08x, sig='%s')...", m.name.c_str(), m.fnPtr, m.signature.c_str());
             if (m.signature.find("(II)") != std::string::npos) {
-                // Metodi tipo Cocos2d-x nativeInit(int w, int h)
                 invokeGuestFunction(m.fnPtr, jniEnvPtr, dummyInstance, 1920, 1080, 50000000);
             } else if (m.signature.find("(Landroid/content/Context;)") != std::string::npos) {
                 invokeGuestFunction(m.fnPtr, jniEnvPtr, dummyInstance, 0x1001, 0, 20000000);
@@ -503,7 +567,7 @@ bool DbtEngine::startEmulation() {
         }
     }
 
-    // 5c. Collegamento Surface e Focus/Resume (nativeRecreateGfxState, onSurfaceChanged, nativeFocusChanged, nativeResume)
+    // 5d. Collegamento Surface e Focus/Resume (nativeRecreateGfxState, onSurfaceChanged, nativeFocusChanged, nativeResume)
     for (const auto& m : nativeMethods) {
         std::string lower = m.name;
         std::transform(lower.begin(), lower.end(), lower.begin(), ::tolower);
@@ -523,6 +587,103 @@ bool DbtEngine::startEmulation() {
         } else if (lower.find("focuschanged") != std::string::npos) {
             LOGI("Invocazione metodo di window focus '%s' (focus=true)...", m.name.c_str());
             invokeGuestFunction(m.fnPtr, jniEnvPtr, dummyInstance, 1, 0, 10000000);
+        }
+    }
+
+    // 5e. Fallback dinamico su simboli esportati .dynsym (Cocos2d-x / Flappy Bird / NDK)
+    for (const auto& lib : loadedLibs_) {
+        if (!lib) continue;
+        for (const auto& sym : lib->symbols) {
+            if (sym.vaddr == 0) continue;
+            std::string sName = sym.name;
+            std::string lower = sName;
+            std::transform(lower.begin(), lower.end(), lower.begin(), ::tolower);
+
+            uint32_t symAddr = lib->load_bias + sym.vaddr;
+
+            if (lower.find("setapkpath") != std::string::npos || lower.find("nativesetapkpath") != std::string::npos) {
+                if (!env.getApkPath().empty()) {
+                    uint32_t jstrApk = env.createGuestJString(uc_, env.getApkPath());
+                    LOGI("Invocazione dinamica '%s' @ 0x%08x (apk='%s')...", sName.c_str(), symAddr, env.getApkPath().c_str());
+                    invokeGuestFunction(symAddr, jniEnvPtr, dummyInstance, jstrApk, 0, 1000000);
+                }
+            } else if (lower.find("nativeinit") != std::string::npos || (lower.find("renderer") != std::string::npos && lower.find("init") != std::string::npos)) {
+                LOGI("Invocazione dinamica Cocos2d-x '%s' @ 0x%08x (1920x1080)...", sName.c_str(), symAddr);
+                invokeGuestFunction(symAddr, jniEnvPtr, dummyInstance, 1920, 1080, 3000000);
+            } else if (lower.find("onsurfacechanged") != std::string::npos || lower.find("nativeonsurfacechanged") != std::string::npos) {
+                LOGI("Invocazione dinamica SurfaceChanged '%s' @ 0x%08x (1920x1080)...", sName.c_str(), symAddr);
+                invokeGuestFunction(symAddr, jniEnvPtr, dummyInstance, 1920, 1080, 2000000);
+            } else if (lower.find("nativeonresume") != std::string::npos || lower.find("onresume") != std::string::npos) {
+                LOGI("Invocazione dinamica Resume '%s' @ 0x%08x...", sName.c_str(), symAddr);
+                invokeGuestFunction(symAddr, jniEnvPtr, dummyInstance, 0, 0, 1000000);
+            }
+        }
+    }
+
+    // 5f. Supporto Android NativeActivity (Blood & Glory / Glu Mobile / libmain.so)
+    uint32_t nativeActivityOnCreateAddr = 0;
+    for (const auto& lib : loadedLibs_) {
+        if (!lib) continue;
+        for (const auto& sym : lib->symbols) {
+            if (sym.name == "ANativeActivity_onCreate" && sym.vaddr != 0) {
+                nativeActivityOnCreateAddr = lib->load_bias + sym.vaddr;
+                break;
+            }
+        }
+        if (nativeActivityOnCreateAddr != 0) break;
+    }
+
+    uint32_t nativeActivityRedrawAddr = 0;
+    uint32_t activityPtr = 0x7d002900U;
+    uint32_t winHandle = env.getJNIEnvPointer() + 0x2800U;
+
+    if (nativeActivityOnCreateAddr != 0 && env.getRegisteredMethods().empty()) {
+        LOGI("ANativeActivity rilevata: avvio ANativeActivity_onCreate @ 0x%08x...", nativeActivityOnCreateAddr);
+        uint32_t callbacksPtr = 0x7d002880U;
+        uint32_t internalPathStr = env.createGuestCString(uc_, env.getFilesDir());
+        uint32_t externalPathStr = env.createGuestCString(uc_, env.getObbDir().empty() ? env.getFilesDir() : env.getObbDir());
+        uint32_t obbPathStr = env.createGuestCString(uc_, env.getObbDir());
+
+        uint32_t sdkVer = 27;
+        uint32_t mockAssetMgr = env.getJNIEnvPointer() + 0x2800U;
+        uc_mem_write(uc_, activityPtr + 0, &callbacksPtr, 4);
+        uc_mem_write(uc_, activityPtr + 4, &javaVMPtr, 4);
+        uc_mem_write(uc_, activityPtr + 8, &jniEnvPtr, 4);
+        uc_mem_write(uc_, activityPtr + 12, &dummyInstance, 4);
+        uc_mem_write(uc_, activityPtr + 16, &internalPathStr, 4);
+        uc_mem_write(uc_, activityPtr + 20, &externalPathStr, 4);
+        uc_mem_write(uc_, activityPtr + 24, &sdkVer, 4);
+        uc_mem_write(uc_, activityPtr + 32, &mockAssetMgr, 4);
+        uc_mem_write(uc_, activityPtr + 36, &obbPathStr, 4);
+
+        invokeGuestFunction(nativeActivityOnCreateAddr, activityPtr, 0, 0, 0, 3000000);
+        LOGI("ANativeActivity_onCreate completata.");
+
+        uint32_t onStart = 0, onResume = 0, onWindowFocus = 0, onWindowCreated = 0, onRedraw = 0;
+        uc_mem_read(uc_, callbacksPtr + 0, &onStart, 4);
+        uc_mem_read(uc_, callbacksPtr + 4, &onResume, 4);
+        uc_mem_read(uc_, callbacksPtr + 24, &onWindowFocus, 4);
+        uc_mem_read(uc_, callbacksPtr + 28, &onWindowCreated, 4);
+        uc_mem_read(uc_, callbacksPtr + 36, &onRedraw, 4);
+
+        if (onStart) {
+            LOGI("Invocazione ANativeActivity onStart @ 0x%08x...", onStart);
+            invokeGuestFunction(onStart, activityPtr, 0, 0, 0, 1000000);
+        }
+        if (onNativeWindowCreated) {
+            LOGI("Invocazione ANativeActivity onNativeWindowCreated @ 0x%08x...", onWindowCreated);
+            invokeGuestFunction(onWindowCreated, activityPtr, winHandle, 0, 0, 2000000);
+        }
+        if (onResume) {
+            LOGI("Invocazione ANativeActivity onResume @ 0x%08x...", onResume);
+            invokeGuestFunction(onResume, activityPtr, 0, 0, 0, 1000000);
+        }
+        if (onWindowFocus) {
+            LOGI("Invocazione ANativeActivity onWindowFocusChanged @ 0x%08x...", onWindowFocus);
+            invokeGuestFunction(onWindowFocus, activityPtr, 1, 0, 0, 1000000);
+        }
+        if (onRedraw) {
+            nativeActivityRedrawAddr = onRedraw;
         }
     }
 
@@ -561,6 +722,11 @@ bool DbtEngine::startEmulation() {
         }
     }
 
+    if (targetRenderPtr == 0 && nativeActivityRedrawAddr != 0) {
+        targetRenderPtr = nativeActivityRedrawAddr;
+        targetRenderName = "ANativeActivity_onNativeWindowRedrawNeeded";
+    }
+
     LOGI("DbtEngine: Avvio LOOP DI GIOCO ATTIVO A 60 FPS (RenderMethod='%s' @ 0x%08x)...",
          targetRenderName.empty() ? "EGL-PresentLoop" : targetRenderName.c_str(), targetRenderPtr);
 
@@ -576,7 +742,9 @@ bool DbtEngine::startEmulation() {
         env.consumeFrameSwapFlag();
 
         if (targetRenderPtr != 0) {
-            uint32_t renderRet = invokeGuestFunction(targetRenderPtr, jniEnvPtr, dummyInstance, 0, 0, 25000000);
+            uint32_t arg0 = (targetRenderPtr == nativeActivityRedrawAddr) ? activityPtr : jniEnvPtr;
+            uint32_t arg1 = (targetRenderPtr == nativeActivityRedrawAddr) ? winHandle : dummyInstance;
+            uint32_t renderRet = invokeGuestFunction(targetRenderPtr, arg0, arg1, 0, 0, 25000000);
             if (frameCount < 10 || frameCount % 30 == 0) {
                 LOGI("DbtEngine: Frame %zu eseguito su %s (status=0x%x)", frameCount + 1, targetRenderName.c_str(), renderRet);
             }

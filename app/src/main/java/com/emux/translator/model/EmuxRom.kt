@@ -4,6 +4,7 @@ import android.content.Context
 import android.content.pm.ActivityInfo
 import android.content.pm.PackageManager
 import android.graphics.Bitmap
+import android.graphics.BitmapFactory
 import android.graphics.Canvas
 import android.graphics.drawable.BitmapDrawable
 import android.graphics.drawable.Drawable
@@ -11,82 +12,128 @@ import android.net.Uri
 import com.emux.translator.util.ImageUpscaler
 import java.io.File
 import java.io.FileOutputStream
+import java.nio.ByteBuffer
+import java.nio.ByteOrder
+import java.util.zip.ZipFile
 
 data class EmuxRom(
     val title: String,
     val coverUri: Uri?,
     val apkFile: File,
-    val obbFiles: List<File> = emptyList(), // Supporta sia singolo file che più OBB (main + patch) o cartella
+    val obbFiles: List<File> = emptyList(),
     val packageName: String? = null,
     val hasObb: Boolean = false,
     val preferredOrientation: Int = ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
 )
 
 /**
- * Scansiona la cartella Emux32/apk ed Emux32/obb.
- * Riconosce automaticamente sia file .obb sciolti che cartelle package estratte (es. com.turner.cardwars).
+ * Scansiona la cartella Emux32/apk ed Emux32/obb (oltre a /storage/emulated/0/Android/obb).
+ * Riconosce automaticamente:
+ * - Package Name nativo via pure-Kotlin AXML parser da AndroidManifest.xml (senza blocchi Android 14/15/16 SDK 36)
+ * - File OBB con regex standard (main.<version>.<package>.obb / patch.<version>.<package>.obb)
+ * - Cartelle estratte (es. com.turner.cardwars, com.glu.gladiator)
+ * - Scansione ricorsiva completa in qualsiasi sotto-cartella OBB
  */
 fun scanEmuxStorage(context: Context, apkDir: File, obbDir: File): List<EmuxRom> {
     val gamesList = mutableListOf<EmuxRom>()
 
-    if (!apkDir.exists()) {
-        apkDir.mkdirs()
-    }
-    if (!obbDir.exists()) {
-        obbDir.mkdirs()
-    }
+    if (!apkDir.exists()) apkDir.mkdirs()
+    if (!obbDir.exists()) obbDir.mkdirs()
 
     val apkFiles = apkDir.listFiles { file ->
         file.isFile && file.name.lowercase().endsWith(".apk")
     } ?: emptyArray()
 
     val upscaledCoversDir = File(apkDir, ".upscaled_covers")
-    if (!upscaledCoversDir.exists()) {
-        upscaledCoversDir.mkdirs()
+    if (!upscaledCoversDir.exists()) upscaledCoversDir.mkdirs()
+
+    // Raccoglie tutti i file .obb disponibili cercando ricorsivamente in:
+    // 1. obbDir configurata dall'emulatore (es. /storage/emulated/0/Emulators/Emux32/obb)
+    // 2. /storage/emulated/0/Android/obb (directory standard Android)
+    val allDiscoveredObbs = mutableListOf<File>()
+    try {
+        if (obbDir.exists()) {
+            obbDir.walkTopDown().filter { it.isFile && it.name.lowercase().endsWith(".obb") }.forEach {
+                allDiscoveredObbs.add(it)
+            }
+        }
+        val systemObbDir = File("/storage/emulated/0/Android/obb")
+        if (systemObbDir.exists() && systemObbDir.canRead()) {
+            systemObbDir.walkTopDown().maxDepth(3).filter { it.isFile && it.name.lowercase().endsWith(".obb") }.forEach {
+                allDiscoveredObbs.add(it)
+            }
+        }
+    } catch (e: Throwable) {
+        e.printStackTrace()
     }
+
+    val obbPattern = Regex("""^(?:main|patch)\.\d+\.([a-zA-Z0-9_.]+)\.obb$""", RegexOption.IGNORE_CASE)
 
     for (apkFile in apkFiles) {
         val baseName = apkFile.nameWithoutExtension
         val title = baseName.replace("_", " ")
 
         val (pkgName, rawIconFile, orientation) = extractApkMetadata(context, apkFile)
+        val cleanPkg = pkgName?.lowercase()?.trim()
+        val cleanBase = baseName.lowercase().replace("[^a-z0-9]".toRegex(), "")
 
-        // Cerca i file OBB associati:
-        // Caso A: Cartella estratta con il package name (es. Emux32/obb/com.turner.cardwars/main.xxx.obb)
-        // Caso B: Cartella estratta con nome simile (es. Emux32/obb/BloodAndGlory/)
-        // Caso C: File .obb diretto (es. Emux32/obb/main.xxx.com.turner.cardwars.obb)
+        // Ricerca file OBB corrispondenti
         val matchedObbList = mutableListOf<File>()
 
-        if (obbDir.exists()) {
-            val allEntries = obbDir.listFiles() ?: emptyArray()
+        for (candidate in allDiscoveredObbs) {
+            val fileName = candidate.name.lowercase()
+            val parentName = candidate.parentFile?.name?.lowercase() ?: ""
 
-            // 1. Cerca dentro cartelle
-            for (entry in allEntries) {
-                if (entry.isDirectory) {
-                    val folderName = entry.name.lowercase()
-                    val matchPackage = (pkgName != null && folderName.contains(pkgName.lowercase()))
-                    val matchBase = folderName.contains(baseName.lowercase()) || baseName.lowercase().contains(folderName)
+            var matched = false
 
-                    if (matchPackage || matchBase) {
-                        val obbs = entry.listFiles { f -> f.isFile && f.name.endsWith(".obb") }
-                        if (!obbs.isNullOrEmpty()) {
-                            matchedObbList.addAll(obbs)
-                        }
+            // 1. Corrispondenza esatta tramite nome standard OBB (main.<version>.<package>.obb)
+            val matchRes = obbPattern.matchEntire(candidate.name)
+            if (matchRes != null && cleanPkg != null) {
+                val obbPkg = matchRes.groupValues[1].lowercase()
+                if (obbPkg == cleanPkg) {
+                    matched = true
+                }
+            }
+
+            // 2. Corrispondenza per cartella genitore (es. obb/com.glu.gladiator/...)
+            if (!matched && cleanPkg != null) {
+                if (parentName == cleanPkg || parentName.contains(cleanPkg) || cleanPkg.contains(parentName)) {
+                    matched = true
+                }
+            }
+
+            // 3. Corrispondenza per nome file contenente il package
+            if (!matched && cleanPkg != null && fileName.contains(cleanPkg)) {
+                matched = true
+            }
+
+            // 4. Corrispondenza per nome gioco / baseName
+            if (!matched) {
+                val cleanParent = parentName.replace("[^a-z0-9]".toRegex(), "")
+                val cleanFile = fileName.replace("[^a-z0-9]".toRegex(), "")
+                if (cleanParent.isNotEmpty() && (cleanParent.contains(cleanBase) || cleanBase.contains(cleanParent))) {
+                    matched = true
+                } else if (cleanFile.contains(cleanBase) || cleanBase.contains(cleanFile)) {
+                    matched = true
+                }
+            }
+
+            // 5. Corrispondenza specifica per titoli noti (es: Blood & Glory -> gladiator)
+            if (!matched) {
+                if (cleanBase.contains("blood") || cleanBase.contains("glory")) {
+                    if (parentName.contains("gladiator") || fileName.contains("gladiator")) {
+                        matched = true
+                    }
+                }
+                if (cleanBase.contains("cardwars") || cleanBase.contains("card_wars")) {
+                    if (parentName.contains("cardwars") || fileName.contains("cardwars")) {
+                        matched = true
                     }
                 }
             }
 
-            // 2. Se non ancora trovato, cerca file .obb sciolti direttamente nella root di obb/
-            if (matchedObbList.isEmpty()) {
-                val directObbs = obbDir.listFiles { f ->
-                    f.isFile && f.name.endsWith(".obb") && (
-                        (pkgName != null && f.name.lowercase().contains(pkgName.lowercase())) ||
-                        f.name.lowercase().contains(baseName.lowercase())
-                    )
-                }
-                if (!directObbs.isNullOrEmpty()) {
-                    matchedObbList.addAll(directObbs)
-                }
+            if (matched && !matchedObbList.contains(candidate)) {
+                matchedObbList.add(candidate)
             }
         }
 
@@ -139,18 +186,28 @@ fun scanEmuxStorage(context: Context, apkDir: File, obbDir: File): List<EmuxRom>
  * Estrae l'icona, il package name e l'orientamento nativo del gioco dall'APK
  */
 private fun extractApkMetadata(context: Context, apkFile: File): Triple<String?, File?, Int> {
+    var detectedPackageName: String? = ApkManifestParser.extractPackageName(apkFile)
+    var gameOrientation = ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
+    var iconFile: File? = null
+
     try {
         val iconsDir = File(context.cacheDir, "extracted_icons")
         if (!iconsDir.exists()) iconsDir.mkdirs()
 
         val safeName = apkFile.name.replace("[^a-zA-Z0-9]".toRegex(), "_")
-        val iconFile = File(iconsDir, "$safeName.png")
+        iconFile = File(iconsDir, "$safeName.png")
 
         val pm = context.packageManager
-        val pkgInfo = pm.getPackageArchiveInfo(apkFile.absolutePath, PackageManager.GET_ACTIVITIES)
-        val packageName = pkgInfo?.packageName
+        val pkgInfo = try {
+            pm.getPackageArchiveInfo(apkFile.absolutePath, PackageManager.GET_ACTIVITIES)
+        } catch (e: Throwable) {
+            null
+        }
 
-        var gameOrientation = ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
+        if (detectedPackageName == null && pkgInfo?.packageName != null) {
+            detectedPackageName = pkgInfo.packageName
+        }
+
         if (pkgInfo?.activities != null && pkgInfo.activities.isNotEmpty()) {
             val mainAct = pkgInfo.activities.firstOrNull { it.screenOrientation != ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED }
                 ?: pkgInfo.activities.first()
@@ -166,24 +223,66 @@ private fun extractApkMetadata(context: Context, apkFile: File): Triple<String?,
         }
 
         if (iconFile.exists() && iconFile.length() > 0) {
-            return Triple(packageName, iconFile, gameOrientation)
+            return Triple(detectedPackageName, iconFile, gameOrientation)
         }
 
+        // Tentativo di estrazione icona tramite PackageManager
         if (pkgInfo != null) {
-            pkgInfo.applicationInfo.sourceDir = apkFile.absolutePath
-            pkgInfo.applicationInfo.publicSourceDir = apkFile.absolutePath
-            val drawable = pkgInfo.applicationInfo.loadIcon(pm)
-
-            val bitmap = drawableToBitmap(drawable)
-            FileOutputStream(iconFile).use { out ->
-                bitmap.compress(Bitmap.CompressFormat.PNG, 95, out)
+            try {
+                pkgInfo.applicationInfo.sourceDir = apkFile.absolutePath
+                pkgInfo.applicationInfo.publicSourceDir = apkFile.absolutePath
+                val drawable = pkgInfo.applicationInfo.loadIcon(pm)
+                val bitmap = drawableToBitmap(drawable)
+                FileOutputStream(iconFile).use { out ->
+                    bitmap.compress(Bitmap.CompressFormat.PNG, 95, out)
+                }
+                return Triple(detectedPackageName, iconFile, gameOrientation)
+            } catch (e: Throwable) {
+                // Fallback a lettura diretta dal file ZIP
             }
-            return Triple(packageName, iconFile, gameOrientation)
         }
-    } catch (e: Exception) {
+
+        // Fallback: estrazione diretta dell'icona dal file ZIP dell'APK
+        if (extractIconFromZip(apkFile, iconFile)) {
+            return Triple(detectedPackageName, iconFile, gameOrientation)
+        }
+    } catch (e: Throwable) {
         e.printStackTrace()
     }
-    return Triple(null, null, ActivityInfo.SCREEN_ORIENTATION_SENSOR)
+
+    return Triple(detectedPackageName, if (iconFile?.exists() == true) iconFile else null, gameOrientation)
+}
+
+/**
+ * Estrae un'icona valida cercando nei percorsi standard di risorse dell'APK zip
+ */
+private fun extractIconFromZip(apkFile: File, outputFile: File): Boolean {
+    return try {
+        ZipFile(apkFile).use { zip ->
+            val entries = zip.entries().toList()
+            val iconEntry = entries.firstOrNull {
+                val name = it.name.lowercase()
+                (name.startsWith("res/mipmap") || name.startsWith("res/drawable")) &&
+                (name.endsWith("ic_launcher.png") || name.endsWith("icon.png") || name.endsWith("app_icon.png"))
+            } ?: entries.firstOrNull {
+                val name = it.name.lowercase()
+                name.endsWith(".png") && (name.contains("icon") || name.contains("launcher"))
+            }
+
+            if (iconEntry != null) {
+                zip.getInputStream(iconEntry).use { input ->
+                    FileOutputStream(outputFile).use { output ->
+                        input.copyTo(output)
+                    }
+                }
+                outputFile.exists() && outputFile.length() > 0
+            } else {
+                false
+            }
+        }
+    } catch (e: Throwable) {
+        false
+    }
 }
 
 private fun drawableToBitmap(drawable: Drawable): Bitmap {
@@ -197,4 +296,132 @@ private fun drawableToBitmap(drawable: Drawable): Bitmap {
     drawable.setBounds(0, 0, canvas.width, canvas.height)
     drawable.draw(canvas)
     return bitmap
+}
+
+/**
+ * Parser binario AXML ad alte prestazioni per AndroidManifest.xml.
+ * Funziona su tutte le versioni di Android senza restrizioni di permessi o targetSdkVersion.
+ */
+object ApkManifestParser {
+    fun extractPackageName(apkFile: File): String? {
+        return try {
+            ZipFile(apkFile).use { zip ->
+                val entry = zip.getEntry("AndroidManifest.xml") ?: return null
+                val bytes = zip.getInputStream(entry).use { it.readBytes() }
+                parseAxmlPackage(bytes)
+            }
+        } catch (e: Throwable) {
+            null
+        }
+    }
+
+    private fun parseAxmlPackage(data: ByteArray): String? {
+        if (data.size < 8) return null
+        val buf = ByteBuffer.wrap(data).order(ByteOrder.LITTLE_ENDIAN)
+        val magic = buf.int
+        if (magic != 0x00080003) return null
+        val fileSize = buf.int
+
+        var pos = 8
+        val stringTable = mutableListOf<String>()
+
+        while (pos + 8 <= data.size) {
+            val chunkType = buf.getInt(pos)
+            val chunkSize = buf.getInt(pos + 4)
+            if (chunkSize <= 0 || pos + chunkSize > data.size) break
+
+            when (chunkType) {
+                0x001C0001 -> { // RES_STRING_POOL_TYPE
+                    val stringCount = buf.getInt(pos + 8)
+                    val flags = buf.getInt(pos + 16)
+                    val stringsStart = pos + buf.getInt(pos + 20)
+                    val isUtf8 = (flags and (1 shl 8)) != 0
+
+                    val offsets = IntArray(stringCount)
+                    for (i in 0 until stringCount) {
+                        offsets[i] = buf.getInt(pos + 28 + (i * 4))
+                    }
+
+                    for (off in offsets) {
+                        val strPos = stringsStart + off
+                        if (strPos >= data.size) {
+                            stringTable.add("")
+                            continue
+                        }
+                        if (isUtf8) {
+                            var p = strPos
+                            var u8Len = data[p].toInt() and 0xFF
+                            p++
+                            if ((u8Len and 0x80) != 0) {
+                                u8Len = ((u8Len and 0x7F) shl 8) or (data[p].toInt() and 0xFF)
+                                p++
+                            }
+                            var bLen = data[p].toInt() and 0xFF
+                            p++
+                            if ((bLen and 0x80) != 0) {
+                                bLen = ((bLen and 0x7F) shl 8) or (data[p].toInt() and 0xFF)
+                                p++
+                            }
+                            if (p + bLen <= data.size) {
+                                stringTable.add(String(data, p, bLen, Charsets.UTF_8))
+                            } else {
+                                stringTable.add("")
+                            }
+                        } else {
+                            var p = strPos
+                            var u16Len = buf.getShort(p).toInt() and 0xFFFF
+                            p += 2
+                            if ((u16Len and 0x8000) != 0) {
+                                u16Len = ((u16Len and 0x7FFF) shl 16) or (buf.getShort(p).toInt() and 0xFFFF)
+                                p += 2
+                            }
+                            val bLen = u16Len * 2
+                            if (p + bLen <= data.size) {
+                                stringTable.add(String(data, p, bLen, Charsets.UTF_16LE))
+                            } else {
+                                stringTable.add("")
+                            }
+                        }
+                    }
+                }
+
+                0x00100102 -> { // RES_XML_START_ELEMENT_TYPE
+                    val nameIdx = buf.getInt(pos + 20)
+                    val tagName = stringTable.getOrNull(nameIdx) ?: ""
+                    if (tagName == "manifest") {
+                        val attrCount = buf.getShort(pos + 28).toInt() and 0xFFFF
+                        var attrPos = pos + 36
+                        for (a in 0 until attrCount) {
+                            if (attrPos + 20 > data.size) break
+                            val attrNameIdx = buf.getInt(attrPos + 4)
+                            val attrValIdx = buf.getInt(attrPos + 8)
+                            val attrName = stringTable.getOrNull(attrNameIdx) ?: ""
+                            if (attrName == "package") {
+                                val pkgVal = stringTable.getOrNull(attrValIdx)
+                                if (!pkgVal.isNullOrEmpty()) return pkgVal
+                            }
+                            attrPos += 20
+                        }
+                    }
+                }
+            }
+            pos += chunkSize
+        }
+
+        // Fallback Euristico: cerca pattern di package valido nel pool delle stringhe
+        val pkgRegex = Regex("""^[a-zA-Z][a-zA-Z0-9_]*(\.[a-zA-Z0-9_]+)+$""")
+        for (str in stringTable) {
+            if (pkgRegex.matches(str) &&
+                !str.startsWith("android.") &&
+                !str.startsWith("java.") &&
+                !str.startsWith("schemas.") &&
+                !str.contains("http") &&
+                str.contains(".")
+            ) {
+                return str
+            }
+        }
+
+        return null
+    }
 }

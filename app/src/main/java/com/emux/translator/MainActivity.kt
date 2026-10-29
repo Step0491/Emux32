@@ -397,6 +397,13 @@ class MainActivity : ComponentActivity() {
             val targetAbiPrefix = if (hasArmV7a) "lib/armeabi-v7a/" else "lib/armeabi/"
             val extractedSos = mutableListOf<File>()
 
+            val assetsTargetDir = File(cacheDir, "assets")
+            if (!assetsTargetDir.exists()) assetsTargetDir.mkdirs()
+            val filesAssetsDir = File(filesDir, "assets")
+            if (!filesAssetsDir.exists()) filesAssetsDir.mkdirs()
+
+            var extractedAssetsCount = 0
+
             for (entry in allEntries) {
                 if (entry.name.startsWith(targetAbiPrefix) && entry.name.endsWith(".so")) {
                     val outFile = File(cacheDir, File(entry.name).name)
@@ -410,34 +417,35 @@ class MainActivity : ComponentActivity() {
                         extractedSos.add(outFile)
                         EmuxLogger.i("Emux32", "   -> Estratta libreria ARM32 ($targetAbiPrefix): ${outFile.name} (${outFile.length()} byte)")
                     }
-                }
-            }
-
-            // Estrazione completa cartella assets/ dell'APK in filesDir/assets/$pkg
-            val assetsTargetDir = File(filesDir, "assets/$pkg")
-            if (!assetsTargetDir.exists()) {
-                assetsTargetDir.mkdirs()
-            }
-            var extractedAssetCount = 0
-            var extractedAssetBytes = 0L
-
-            for (entry in allEntries) {
-                if (entry.name.startsWith("assets/") && !entry.isDirectory) {
-                    val relPath = entry.name.removePrefix("assets/")
-                    val targetAssetFile = File(assetsTargetDir, relPath)
-                    if (!targetAssetFile.exists() || targetAssetFile.length() != entry.size) {
-                        targetAssetFile.parentFile?.mkdirs()
+                } else if (entry.name.startsWith("assets/") && !entry.isDirectory) {
+                    val relPath = entry.name.substring("assets/".length)
+                    val targetInCache = File(assetsTargetDir, relPath)
+                    targetInCache.parentFile?.mkdirs()
+                    if (!targetInCache.exists() || targetInCache.length() != entry.size) {
                         zip.getInputStream(entry).use { inStream ->
-                            targetAssetFile.outputStream().use { outStream ->
-                                inStream.copyTo(outStream)
-                            }
+                            targetInCache.outputStream().use { outStream -> inStream.copyTo(outStream) }
                         }
                     }
-                    extractedAssetCount++
-                    extractedAssetBytes += targetAssetFile.length()
+                    val targetInFiles = File(filesAssetsDir, relPath)
+                    targetInFiles.parentFile?.mkdirs()
+                    if (!targetInFiles.exists() || targetInFiles.length() != entry.size) {
+                        try {
+                            targetInCache.copyTo(targetInFiles, overwrite = true)
+                        } catch (_: Exception) {}
+                    }
+                    val targetInPkg = File(File(filesDir, "assets/$pkg"), relPath)
+                    targetInPkg.parentFile?.mkdirs()
+                    if (!targetInPkg.exists() || targetInPkg.length() != entry.size) {
+                        try {
+                            targetInCache.copyTo(targetInPkg, overwrite = true)
+                        } catch (_: Exception) {}
+                    }
+                    extractedAssetsCount++
                 }
             }
-            EmuxLogger.i("Emux32", "[FASE 3/5] Estratti $extractedAssetCount asset di gioco in ${assetsTargetDir.absolutePath} ($extractedAssetBytes byte totali).")
+            if (extractedAssetsCount > 0) {
+                EmuxLogger.i("Emux32", "   -> Estratti $extractedAssetsCount asset di gioco in cache/assets e files/assets/$pkg")
+            }
             zip.close()
 
             if (extractedSos.isEmpty()) {

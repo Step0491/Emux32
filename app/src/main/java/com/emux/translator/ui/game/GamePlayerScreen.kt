@@ -104,8 +104,9 @@ fun GamePlayerScreen(
         AndroidView(
             factory = { ctx ->
                 SurfaceView(ctx).apply {
-                    setZOrderMediaOverlay(true)
-                    holder.setFormat(android.graphics.PixelFormat.RGBA_8888)
+                    try {
+                        setZOrderMediaOverlay(true)
+                    } catch (_: Throwable) {}
                     holder.setFixedSize(1920, 1080)
                     holder.addCallback(object : SurfaceHolder.Callback {
                         override fun surfaceCreated(holder: SurfaceHolder) {

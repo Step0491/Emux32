@@ -77,6 +77,14 @@ static std::shared_ptr<std::condition_variable_any> getOrCreateGuestCond(uint32_
     return c;
 }
 
+struct GuestAssetFile {
+    FILE* fp;
+    size_t length;
+    uint32_t guestBufferAddr;
+};
+static std::unordered_map<uint32_t, GuestAssetFile> sGuestAssetMap;
+static uint32_t sNextAssetHandle = 0x70000001;
+
 static inline std::string readGuestCString(uc_engine* uc, uint32_t addr, size_t maxLen = 512) {
     if (!uc || addr == 0) return "";
     std::string out;
@@ -633,6 +641,10 @@ bool GuestRuntimeEnvironment::initialize(uc_engine* uc) {
         }
     }
     sZlibStreamMap.clear();
+    for (auto& ap : sGuestAssetMap) {
+        if (ap.second.fp) fclose(ap.second.fp);
+    }
+    sGuestAssetMap.clear();
 
     // 1. Mappa regione JNI + Bionic Globals (0x7D000000, 64KB, UC_PROT_ALL per stub eseguibili)
     uc_mem_map(uc, guestJniBase_, 0x10000, UC_PROT_ALL);
@@ -2765,6 +2777,160 @@ void GuestRuntimeEnvironment::handleTrampolineCall(uint32_t trampolineId, uc_eng
     }
     if (name == "ANativeWindow_setBuffersGeometry" || name == "ANativeWindow_acquire" ||
         name == "ANativeWindow_release" || name == "ANativeWindow_lock" || name == "ANativeWindow_unlockAndPost") {
+        uint32_t zero = 0;
+        uc_reg_write(uc, UC_ARM_REG_R0, &zero);
+        return;
+    }
+
+    // 8a. Android NDK AAssetManager & AAsset Passthrough
+    if (name == "AAssetManager_fromJava") {
+        uint32_t mgr = guestJniBase_ + 0x2800U;
+        uc_reg_write(uc, UC_ARM_REG_R0, &mgr);
+        return;
+    }
+    if (name == "AAssetManager_open") {
+        uint32_t filenamePtr = 0, mode = 0;
+        uc_reg_read(uc, UC_ARM_REG_R1, &filenamePtr);
+        uc_reg_read(uc, UC_ARM_REG_R2, &mode);
+        std::string fname = readGuestCString(uc, filenamePtr, 256);
+
+        FILE* fp = nullptr;
+        std::string p1 = nativeLibDir_ + "/assets/" + fname;
+        fp = fopen(p1.c_str(), "rb");
+        if (!fp) {
+            std::string p2 = filesDir_ + "/assets/" + fname;
+            fp = fopen(p2.c_str(), "rb");
+        }
+        if (!fp) {
+            std::string p3 = sCustomStoragePath + "/assets/" + fname;
+            fp = fopen(p3.c_str(), "rb");
+        }
+        if (!fp) {
+            fp = fopen(fname.c_str(), "rb");
+        }
+
+        if (fp) {
+            fseek(fp, 0, SEEK_END);
+            size_t sz = ftell(fp);
+            fseek(fp, 0, SEEK_SET);
+
+            uint32_t handle = sNextAssetHandle++;
+            sGuestAssetMap[handle] = {fp, sz, 0};
+            LOGI("AAssetManager_open('%s'): Trovato e aperto (handle=0x%08x, dimensione=%zu byte)", fname.c_str(), handle, sz);
+            uc_reg_write(uc, UC_ARM_REG_R0, &handle);
+        } else {
+            LOGW("AAssetManager_open('%s'): File non trovato nei percorsi asset.", fname.c_str());
+            uint32_t zero = 0;
+            uc_reg_write(uc, UC_ARM_REG_R0, &zero);
+        }
+        return;
+    }
+    if (name == "AAsset_read") {
+        uint32_t handle = 0, bufPtr = 0, count = 0;
+        uc_reg_read(uc, UC_ARM_REG_R0, &handle);
+        uc_reg_read(uc, UC_ARM_REG_R1, &bufPtr);
+        uc_reg_read(uc, UC_ARM_REG_R2, &count);
+        auto it = sGuestAssetMap.find(handle);
+        if (it != sGuestAssetMap.end() && it->second.fp && bufPtr != 0 && count > 0) {
+            std::vector<uint8_t> tmp(std::min<size_t>(count, 0x1000000U));
+            size_t bytesRead = fread(tmp.data(), 1, tmp.size(), it->second.fp);
+            if (bytesRead > 0) {
+                uc_mem_write(uc, bufPtr, tmp.data(), bytesRead);
+            }
+            uint32_t ret = static_cast<uint32_t>(bytesRead);
+            uc_reg_write(uc, UC_ARM_REG_R0, &ret);
+        } else {
+            uint32_t zero = 0;
+            uc_reg_write(uc, UC_ARM_REG_R0, &zero);
+        }
+        return;
+    }
+    if (name == "AAsset_seek" || name == "AAsset_seek64") {
+        uint32_t handle = 0, offset = 0, whence = 0;
+        uc_reg_read(uc, UC_ARM_REG_R0, &handle);
+        uc_reg_read(uc, UC_ARM_REG_R1, &offset);
+        uc_reg_read(uc, UC_ARM_REG_R2, &whence);
+        auto it = sGuestAssetMap.find(handle);
+        if (it != sGuestAssetMap.end() && it->second.fp) {
+            int w = (whence == 1) ? SEEK_CUR : ((whence == 2) ? SEEK_END : SEEK_SET);
+            fseek(it->second.fp, static_cast<long>(offset), w);
+            uint32_t curPos = static_cast<uint32_t>(ftell(it->second.fp));
+            uc_reg_write(uc, UC_ARM_REG_R0, &curPos);
+        } else {
+            uint32_t negOne = 0xFFFFFFFFU;
+            uc_reg_write(uc, UC_ARM_REG_R0, &negOne);
+        }
+        return;
+    }
+    if (name == "AAsset_getLength" || name == "AAsset_getLength64") {
+        uint32_t handle = 0;
+        uc_reg_read(uc, UC_ARM_REG_R0, &handle);
+        auto it = sGuestAssetMap.find(handle);
+        uint32_t len = (it != sGuestAssetMap.end()) ? static_cast<uint32_t>(it->second.length) : 0U;
+        uc_reg_write(uc, UC_ARM_REG_R0, &len);
+        return;
+    }
+    if (name == "AAsset_getRemainingLength" || name == "AAsset_getRemainingLength64") {
+        uint32_t handle = 0;
+        uc_reg_read(uc, UC_ARM_REG_R0, &handle);
+        auto it = sGuestAssetMap.find(handle);
+        uint32_t rem = 0;
+        if (it != sGuestAssetMap.end() && it->second.fp) {
+            long cur = ftell(it->second.fp);
+            if (cur >= 0 && static_cast<size_t>(cur) < it->second.length) {
+                rem = static_cast<uint32_t>(it->second.length - cur);
+            }
+        }
+        uc_reg_write(uc, UC_ARM_REG_R0, &rem);
+        return;
+    }
+    if (name == "AAsset_getBuffer") {
+        uint32_t handle = 0;
+        uc_reg_read(uc, UC_ARM_REG_R0, &handle);
+        auto it = sGuestAssetMap.find(handle);
+        if (it != sGuestAssetMap.end() && it->second.fp) {
+            if (it->second.guestBufferAddr == 0 && it->second.length > 0) {
+                uint32_t guestBuf = allocGuestHeap(uc, it->second.length, 16);
+                if (guestBuf != 0) {
+                    long cur = ftell(it->second.fp);
+                    fseek(it->second.fp, 0, SEEK_SET);
+                    std::vector<uint8_t> tmp(it->second.length);
+                    fread(tmp.data(), 1, it->second.length, it->second.fp);
+                    fseek(it->second.fp, cur, SEEK_SET);
+                    uc_mem_write(uc, guestBuf, tmp.data(), it->second.length);
+                    it->second.guestBufferAddr = guestBuf;
+                }
+            }
+            uc_reg_write(uc, UC_ARM_REG_R0, &it->second.guestBufferAddr);
+        } else {
+            uint32_t zero = 0;
+            uc_reg_write(uc, UC_ARM_REG_R0, &zero);
+        }
+        return;
+    }
+    if (name == "AAsset_close") {
+        uint32_t handle = 0;
+        uc_reg_read(uc, UC_ARM_REG_R0, &handle);
+        auto it = sGuestAssetMap.find(handle);
+        if (it != sGuestAssetMap.end()) {
+            if (it->second.fp) fclose(it->second.fp);
+            sGuestAssetMap.erase(it);
+        }
+        uint32_t zero = 0;
+        uc_reg_write(uc, UC_ARM_REG_R0, &zero);
+        return;
+    }
+    if (name == "AAssetManager_openDir") {
+        uint32_t dirHandle = nextMockHandle_++;
+        uc_reg_write(uc, UC_ARM_REG_R0, &dirHandle);
+        return;
+    }
+    if (name == "AAssetDir_getNextFileName") {
+        uint32_t zero = 0;
+        uc_reg_write(uc, UC_ARM_REG_R0, &zero);
+        return;
+    }
+    if (name == "AAssetDir_close") {
         uint32_t zero = 0;
         uc_reg_write(uc, UC_ARM_REG_R0, &zero);
         return;
