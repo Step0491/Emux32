@@ -78,6 +78,10 @@ bool DbtEngine::ensureWorkerEgl(bool waitIfNull) {
 
     if (eglDisplay_ != EGL_NO_DISPLAY && eglContext_ != EGL_NO_CONTEXT &&
         eglSurface_ != EGL_NO_SURFACE && boundEglWindow_ == targetWindow && !surfaceDirty_.load()) {
+        auto& env = GuestRuntimeEnvironment::getInstance();
+        if (env.hasGuestWindowOwner() && env.getGuestWindowOwner() != pthread_self()) {
+            return true;
+        }
         return true;
     }
 
@@ -164,8 +168,14 @@ bool DbtEngine::ensureWorkerEgl(bool waitIfNull) {
     glViewport(0, 0, width, height);
     glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
     glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+    eglSwapBuffers(eglDisplay_, eglSurface_);
 
-    LOGI("initEgl [WorkerThread]: Contesto EGL attivo e collegato a ANativeWindow (%dx%d).", width, height);
+    // Handover Cooperativo: rilasciamo il legame sul thread di setup/inizializzazione
+    // così che il thread di rendering guest (Unity / main guest loop) possa acquisire
+    // la Window Surface senza generare conflitti EGL_BAD_ACCESS (0x300B).
+    eglMakeCurrent(eglDisplay_, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
+
+    LOGI("initEgl [WorkerThread]: Contesto EGL inizializzato su ANativeWindow (%dx%d) e rilasciato per cooperative handover.", width, height);
     GuestRuntimeEnvironment::getInstance().setEglState(eglDisplay_, eglSurface_, eglContext_, eglConfig_, &governor_);
     return true;
 }
@@ -737,7 +747,9 @@ bool DbtEngine::startEmulation() {
     while (governor_.isRunning.load(std::memory_order_relaxed) && !stopRequested_.load(std::memory_order_relaxed)) {
         auto frameStart = std::chrono::steady_clock::now();
 
-        ensureWorkerEgl(false);
+        if (!env.hasGuestWindowOwner() || env.getGuestWindowOwner() == pthread_self()) {
+            ensureWorkerEgl(false);
+        }
         processPendingTouchEvents();
         env.consumeFrameSwapFlag();
 
@@ -751,7 +763,9 @@ bool DbtEngine::startEmulation() {
         }
 
         if (!env.consumeFrameSwapFlag()) {
-            swapBuffers();
+            if (!env.hasGuestWindowOwner() || env.getGuestWindowOwner() == pthread_self()) {
+                swapBuffers();
+            }
         }
 
         frameCount++;

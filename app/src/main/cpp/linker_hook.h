@@ -8,6 +8,8 @@
 #include <memory>
 #include <atomic>
 #include <mutex>
+#include <condition_variable>
+#include <pthread.h>
 #include <jni.h>
 #include <EGL/egl.h>
 #include <GLES2/gl2.h>
@@ -140,6 +142,28 @@ public:
     }
 
     void setEglState(EGLDisplay dpy, EGLSurface surf, EGLContext ctx, EGLConfig cfg, PerformanceGovernor* gov) {
+        std::lock_guard<std::mutex> lock(eglMutex_);
+        if (dpy == EGL_NO_DISPLAY && eglDisplay_ != EGL_NO_DISPLAY) {
+            for (auto& pair : threadSharedContextMap_) {
+                if (pair.second != EGL_NO_CONTEXT) {
+                    ::eglDestroyContext(eglDisplay_, pair.second);
+                }
+            }
+            threadSharedContextMap_.clear();
+            for (auto& pair : threadPbufferSurfaceMap_) {
+                if (pair.second != EGL_NO_SURFACE) {
+                    ::eglDestroySurface(eglDisplay_, pair.second);
+                }
+            }
+            threadPbufferSurfaceMap_.clear();
+            guestEglContextMap_.clear();
+            guestEglSurfaceMap_.clear();
+            threadCurrentContextHandleMap_.clear();
+            threadCurrentSurfaceHandleMap_.clear();
+            windowSurfaceOwnerThread_.store(0);
+            windowSurfaceOwnerTid_.store(0);
+            handoverRequested_.store(false);
+        }
         eglDisplay_ = dpy;
         eglSurface_ = surf;
         eglContext_ = ctx;
@@ -148,13 +172,12 @@ public:
     }
 
     bool ensureThreadEglContext();
-
-    void swapBuffers() {
-        if (eglDisplay_ != EGL_NO_DISPLAY && eglSurface_ != EGL_NO_SURFACE) {
-            ::eglSwapBuffers(eglDisplay_, eglSurface_);
-            swappedThisFrame_.store(true, std::memory_order_relaxed);
-        }
-    }
+    void swapBuffers();
+    bool handleEglMakeCurrent(uint32_t drawHandle, uint32_t readHandle, uint32_t ctxHandle, uc_engine* uc);
+    uint32_t getCurrentThreadEglContextHandle() const;
+    uint32_t getCurrentThreadEglSurfaceHandle() const;
+    bool hasGuestWindowOwner() const { return windowSurfaceOwnerThread_.load() != 0; }
+    pthread_t getGuestWindowOwner() const { return windowSurfaceOwnerThread_.load(); }
 
     bool consumeFrameSwapFlag() {
         return swappedThisFrame_.exchange(false, std::memory_order_relaxed);
@@ -247,8 +270,17 @@ private:
     PerformanceGovernor* governor_{nullptr};
 
     std::mutex eglMutex_;
+    std::condition_variable eglHandoverCv_;
+    std::atomic<pthread_t> windowSurfaceOwnerThread_{0};
+    std::atomic<uint32_t> windowSurfaceOwnerTid_{0};
+    std::atomic<bool> handoverRequested_{false};
+
     std::unordered_map<uint32_t, EGLContext> guestEglContextMap_;
     std::unordered_map<uint32_t, EGLSurface> guestEglSurfaceMap_;
+    std::unordered_map<pthread_t, uint32_t> threadCurrentContextHandleMap_;
+    std::unordered_map<pthread_t, uint32_t> threadCurrentSurfaceHandleMap_;
+    std::unordered_map<pthread_t, EGLContext> threadSharedContextMap_;
+    std::unordered_map<pthread_t, EGLSurface> threadPbufferSurfaceMap_;
 
     JavaVM* hostJavaVm_{nullptr};
     jobject hostClassLoader_{nullptr};
