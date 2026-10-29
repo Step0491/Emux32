@@ -4836,13 +4836,13 @@ void GuestRuntimeEnvironment::handleTrampolineCall(uint32_t trampolineId, uc_eng
         uc_reg_read(uc, UC_ARM_REG_R1, &type);
         uc_reg_read(uc, UC_ARM_REG_R2, &attribsPtr);
 
-        typedef void* (*PFN_eglCreateSyncKHR)(EGLDisplay, EGLenum, const EGLint*);
+        typedef void* (*PFN_eglCreateSyncKHR)(EGLDisplay, unsigned int, const EGLint*);
         static auto pfn = reinterpret_cast<PFN_eglCreateSyncKHR>(::eglGetProcAddress("eglCreateSyncKHR"));
 
         EGLDisplay hostDpy = (eglDisplay_ != EGL_NO_DISPLAY) ? eglDisplay_ : GuestRuntimeEnvironment::getInstance().getEglDisplay();
         void* hostSync = nullptr;
         if (pfn && hostDpy != EGL_NO_DISPLAY) {
-            hostSync = pfn(hostDpy, static_cast<EGLenum>(type), nullptr);
+            hostSync = pfn(hostDpy, static_cast<unsigned int>(type), nullptr);
         }
         uint32_t syncHandle = nextMockHandle_++;
         guestEglSyncMap_[syncHandle] = hostSync;
@@ -4936,7 +4936,7 @@ void GuestRuntimeEnvironment::handleTrampolineCall(uint32_t trampolineId, uc_eng
         uint32_t res = 0x911CU; // GL_ALREADY_SIGNALED (or GL_CONDITION_SATISFIED 0x911C)
         auto it = guestGlSyncMap_.find(syncH);
         if (it != guestGlSyncMap_.end() && it->second != nullptr) {
-            typedef GLenum (*PFN_glClientWaitSync)(void*, GLbitfield, GLuint64);
+            typedef GLenum (*PFN_glClientWaitSync)(void*, GLbitfield, uint64_t);
             static auto pfn = reinterpret_cast<PFN_glClientWaitSync>(::eglGetProcAddress("glClientWaitSync"));
             if (pfn) {
                 res = static_cast<uint32_t>(pfn(it->second, flags, timeout));
@@ -4958,7 +4958,7 @@ void GuestRuntimeEnvironment::handleTrampolineCall(uint32_t trampolineId, uc_eng
 
         auto it = guestGlSyncMap_.find(syncH);
         if (it != guestGlSyncMap_.end() && it->second != nullptr) {
-            typedef void (*PFN_glWaitSync)(void*, GLbitfield, GLuint64);
+            typedef void (*PFN_glWaitSync)(void*, GLbitfield, uint64_t);
             static auto pfn = reinterpret_cast<PFN_glWaitSync>(::eglGetProcAddress("glWaitSync"));
             if (pfn) {
                 pfn(it->second, flags, timeout);
