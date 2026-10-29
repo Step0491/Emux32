@@ -139,6 +139,36 @@ static void ensureParentDirs(const std::string& filePath) {
     }
 }
 
+bool GuestRuntimeEnvironment::ensureThreadEglContext() {
+    if (eglDisplay_ == EGL_NO_DISPLAY || eglContext_ == EGL_NO_CONTEXT) {
+        return false;
+    }
+    EGLContext current = eglGetCurrentContext();
+    if (current != EGL_NO_CONTEXT) {
+        return true;
+    }
+
+    static thread_local EGLContext tl_context = EGL_NO_CONTEXT;
+    static thread_local EGLSurface tl_surface = EGL_NO_SURFACE;
+
+    if (tl_context == EGL_NO_CONTEXT) {
+        std::lock_guard<std::mutex> lock(eglMutex_);
+        if (eglConfig_ != nullptr) {
+            const EGLint ctxAttribs[] = { EGL_CONTEXT_CLIENT_VERSION, 2, EGL_NONE };
+            tl_context = eglCreateContext(eglDisplay_, eglConfig_, eglContext_, ctxAttribs);
+            if (tl_context != EGL_NO_CONTEXT) {
+                const EGLint pbufAttribs[] = { EGL_WIDTH, 1, EGL_HEIGHT, 1, EGL_NONE };
+                tl_surface = eglCreatePbufferSurface(eglDisplay_, eglConfig_, pbufAttribs);
+            }
+        }
+    }
+
+    if (tl_context != EGL_NO_CONTEXT && tl_surface != EGL_NO_SURFACE) {
+        return eglMakeCurrent(eglDisplay_, tl_surface, tl_surface, tl_context);
+    }
+    return false;
+}
+
 std::string GuestRuntimeEnvironment::resolveAssetPath(const std::string& relativePath) {
     if (relativePath.empty()) return "";
     std::string clean = relativePath;
@@ -186,6 +216,33 @@ std::string SyscallDispatcher::resolveFilePath(const char* guestPath) {
             std::string redirected = env.getFilesDir() + "/guest_data/" + pkg + pathStr.substr(p2.size());
             ensureParentDirs(redirected);
             return redirected;
+        }
+    }
+
+    // Redirezione salvataggi e percorsi dati legacy arbitrari (/sdcard/, /mnt/sdcard/, /storage/emulated/0/)
+    // Risolve i blocchi Scoped Storage su Android 14/15/16 (SDK 34-36) per cartelle tipo /sdcard/glu/, /sdcard/titolo/
+    if (!pkg.empty()) {
+        std::string prefix;
+        if (pathStr.rfind("/sdcard/", 0) == 0) prefix = "/sdcard/";
+        else if (pathStr.rfind("/mnt/sdcard/", 0) == 0) prefix = "/mnt/sdcard/";
+        else if (pathStr.rfind("/storage/emulated/0/", 0) == 0) prefix = "/storage/emulated/0/";
+
+        if (!prefix.empty()) {
+            std::string sub = pathStr.substr(prefix.size());
+            if (sub.rfind("Android/obb", 0) != 0 && sub.rfind("Android/data", 0) != 0 &&
+                sub.rfind("Emux32", 0) != 0 && sub.rfind("Emulators/Emux32", 0) != 0) {
+                std::string redirected = env.getFilesDir() + "/guest_data/" + pkg + "/sdcard/" + sub;
+                std::string customCand = sCustomStoragePath + "/" + sub;
+                if (access(customCand.c_str(), F_OK) == 0) {
+                    return customCand;
+                }
+                if (access(redirected.c_str(), F_OK) == 0) {
+                    return redirected;
+                }
+                ensureParentDirs(redirected);
+                LOGI("Redirezione storage/save legacy: '%s' -> '%s'", guestPath, redirected.c_str());
+                return redirected;
+            }
         }
     }
 
@@ -3748,6 +3805,7 @@ void GuestRuntimeEnvironment::handleTrampolineCall(uint32_t trampolineId, uc_eng
         return;
     }
     if (name == "glDrawArrays") {
+        GuestRuntimeEnvironment::getInstance().ensureThreadEglContext();
         static size_t sDrawArraysCount = 0;
         if (sDrawArraysCount++ < 5) {
             LOGI("GLES Passthrough: glDrawArrays #%zu eseguito su GPU host", sDrawArraysCount);
@@ -3760,6 +3818,7 @@ void GuestRuntimeEnvironment::handleTrampolineCall(uint32_t trampolineId, uc_eng
         return;
     }
     if (name == "glDrawElements") {
+        GuestRuntimeEnvironment::getInstance().ensureThreadEglContext();
         static size_t sDrawElementsCount = 0;
         if (sDrawElementsCount++ < 5) {
             LOGI("GLES Passthrough: glDrawElements #%zu eseguito su GPU host", sDrawElementsCount);
@@ -3882,9 +3941,124 @@ void GuestRuntimeEnvironment::handleTrampolineCall(uint32_t trampolineId, uc_eng
         uc_reg_write(uc, UC_ARM_REG_R0, &one);
         return;
     }
+    if (name == "eglCreateContext") {
+        uint32_t dpy = 0, cfg = 0, shareCtx = 0, attribsPtr = 0;
+        uc_reg_read(uc, UC_ARM_REG_R0, &dpy);
+        uc_reg_read(uc, UC_ARM_REG_R1, &cfg);
+        uc_reg_read(uc, UC_ARM_REG_R2, &shareCtx);
+        uc_reg_read(uc, UC_ARM_REG_R3, &attribsPtr);
+
+        EGLDisplay hostDpy = GuestRuntimeEnvironment::getInstance().getEglDisplay();
+        EGLContext hostMainCtx = GuestRuntimeEnvironment::getInstance().getEglContext();
+        EGLConfig hostCfg = GuestRuntimeEnvironment::getInstance().getEglConfig();
+
+        uint32_t ctxHandle = nextMockHandle_++;
+        if (hostDpy != EGL_NO_DISPLAY && hostCfg != nullptr) {
+            const EGLint ctxAttribs[] = { EGL_CONTEXT_CLIENT_VERSION, 2, EGL_NONE };
+            EGLContext hostCtx = eglCreateContext(hostDpy, hostCfg, hostMainCtx, ctxAttribs);
+            if (hostCtx != EGL_NO_CONTEXT) {
+                guestEglContextMap_[ctxHandle] = hostCtx;
+                LOGI("EGL: eglCreateContext() creato contesto condiviso %p (GuestHandle: 0x%x)", hostCtx, ctxHandle);
+            }
+        }
+        uc_reg_write(uc, UC_ARM_REG_R0, &ctxHandle);
+        return;
+    }
+
+    if (name == "eglCreateWindowSurface" || name == "eglCreatePbufferSurface") {
+        uint32_t dpy = 0, cfg = 0, win = 0, attribsPtr = 0;
+        uc_reg_read(uc, UC_ARM_REG_R0, &dpy);
+        uc_reg_read(uc, UC_ARM_REG_R1, &cfg);
+        uc_reg_read(uc, UC_ARM_REG_R2, &win);
+        uc_reg_read(uc, UC_ARM_REG_R3, &attribsPtr);
+
+        EGLDisplay hostDpy = GuestRuntimeEnvironment::getInstance().getEglDisplay();
+        EGLConfig hostCfg = GuestRuntimeEnvironment::getInstance().getEglConfig();
+        uint32_t surfHandle = nextMockHandle_++;
+
+        if (name == "eglCreatePbufferSurface" && hostDpy != EGL_NO_DISPLAY && hostCfg != nullptr) {
+            const EGLint pbufAttribs[] = { EGL_WIDTH, 1, EGL_HEIGHT, 1, EGL_NONE };
+            EGLSurface pbuf = eglCreatePbufferSurface(hostDpy, hostCfg, pbufAttribs);
+            guestEglSurfaceMap_[surfHandle] = pbuf;
+            LOGI("EGL: eglCreatePbufferSurface() creato pbuffer %p (GuestHandle: 0x%x)", pbuf, surfHandle);
+        } else {
+            guestEglSurfaceMap_[surfHandle] = GuestRuntimeEnvironment::getInstance().getEglSurface();
+        }
+        uc_reg_write(uc, UC_ARM_REG_R0, &surfHandle);
+        return;
+    }
+
+    if (name == "eglMakeCurrent") {
+        uint32_t dpy = 0, draw = 0, read = 0, ctx = 0;
+        uc_reg_read(uc, UC_ARM_REG_R0, &dpy);
+        uc_reg_read(uc, UC_ARM_REG_R1, &draw);
+        uc_reg_read(uc, UC_ARM_REG_R2, &read);
+        uc_reg_read(uc, UC_ARM_REG_R3, &ctx);
+
+        EGLDisplay hostDpy = GuestRuntimeEnvironment::getInstance().getEglDisplay();
+        if (hostDpy != EGL_NO_DISPLAY) {
+            if (ctx == 0) {
+                eglMakeCurrent(hostDpy, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
+            } else {
+                EGLContext targetCtx = GuestRuntimeEnvironment::getInstance().getEglContext();
+                EGLSurface targetSurf = GuestRuntimeEnvironment::getInstance().getEglSurface();
+
+                auto it = guestEglContextMap_.find(ctx);
+                if (it != guestEglContextMap_.end() && it->second != EGL_NO_CONTEXT) {
+                    targetCtx = it->second;
+                }
+                auto sit = guestEglSurfaceMap_.find(draw);
+                if (sit != guestEglSurfaceMap_.end() && sit->second != EGL_NO_SURFACE) {
+                    targetSurf = sit->second;
+                }
+
+                if (targetSurf == EGL_NO_SURFACE && GuestRuntimeEnvironment::getInstance().getEglConfig() != nullptr) {
+                    const EGLint pbufAttribs[] = { EGL_WIDTH, 1, EGL_HEIGHT, 1, EGL_NONE };
+                    targetSurf = eglCreatePbufferSurface(hostDpy, GuestRuntimeEnvironment::getInstance().getEglConfig(), pbufAttribs);
+                }
+
+                if (targetCtx != EGL_NO_CONTEXT && targetSurf != EGL_NO_SURFACE) {
+                    eglMakeCurrent(hostDpy, targetSurf, targetSurf, targetCtx);
+                    LOGI("EGL: eglMakeCurrent applicato su thread host (Ctx=%p, Surf=%p)", targetCtx, targetSurf);
+                }
+            }
+        }
+        uint32_t one = 1;
+        uc_reg_write(uc, UC_ARM_REG_R0, &one);
+        return;
+    }
+
+    if (name == "eglDestroyContext") {
+        uint32_t dpy = 0, ctx = 0;
+        uc_reg_read(uc, UC_ARM_REG_R0, &dpy);
+        uc_reg_read(uc, UC_ARM_REG_R1, &ctx);
+        auto it = guestEglContextMap_.find(ctx);
+        if (it != guestEglContextMap_.end() && it->second != EGL_NO_CONTEXT) {
+            eglDestroyContext(GuestRuntimeEnvironment::getInstance().getEglDisplay(), it->second);
+            guestEglContextMap_.erase(it);
+        }
+        uint32_t one = 1;
+        uc_reg_write(uc, UC_ARM_REG_R0, &one);
+        return;
+    }
+
+    if (name == "eglDestroySurface") {
+        uint32_t dpy = 0, surf = 0;
+        uc_reg_read(uc, UC_ARM_REG_R0, &dpy);
+        uc_reg_read(uc, UC_ARM_REG_R1, &surf);
+        auto it = guestEglSurfaceMap_.find(surf);
+        if (it != guestEglSurfaceMap_.end() && it->second != EGL_NO_SURFACE &&
+            it->second != GuestRuntimeEnvironment::getInstance().getEglSurface()) {
+            eglDestroySurface(GuestRuntimeEnvironment::getInstance().getEglDisplay(), it->second);
+            guestEglSurfaceMap_.erase(it);
+        }
+        uint32_t one = 1;
+        uc_reg_write(uc, UC_ARM_REG_R0, &one);
+        return;
+    }
+
     if (name == "eglGetDisplay" || name == "eglGetCurrentDisplay" || name == "eglGetCurrentSurface" ||
-        name == "eglGetCurrentContext" || name == "eglCreateWindowSurface" || name == "eglCreateContext" ||
-        name == "eglInitialize" || name == "eglMakeCurrent" || name == "eglChooseConfig") {
+        name == "eglGetCurrentContext" || name == "eglInitialize" || name == "eglChooseConfig") {
         if (name == "eglInitialize") {
             uint32_t majPtr = 0, minPtr = 0;
             uc_reg_read(uc, UC_ARM_REG_R1, &majPtr);
@@ -3944,6 +4118,135 @@ void GuestRuntimeEnvironment::handleTrampolineCall(uint32_t trampolineId, uc_eng
         std::string procName = readGuestCString(uc, procNamePtr, 128);
         uint32_t tramp = registerSymbolTrampoline(procName, uc);
         uc_reg_write(uc, UC_ARM_REG_R0, &tramp);
+        return;
+    }
+
+    // 12b. GLES 3.1 Compute Shaders & Extended Rendering
+    if (name == "glDispatchCompute") {
+        GuestRuntimeEnvironment::getInstance().ensureThreadEglContext();
+        uint32_t gx = 0, gy = 0, gz = 0;
+        uc_reg_read(uc, UC_ARM_REG_R0, &gx);
+        uc_reg_read(uc, UC_ARM_REG_R1, &gy);
+        uc_reg_read(uc, UC_ARM_REG_R2, &gz);
+        typedef void (*PFN_glDispatchCompute)(GLuint, GLuint, GLuint);
+        static auto pfn = reinterpret_cast<PFN_glDispatchCompute>(eglGetProcAddress("glDispatchCompute"));
+        if (pfn) pfn(gx, gy, gz);
+        return;
+    }
+    if (name == "glDispatchComputeIndirect") {
+        GuestRuntimeEnvironment::getInstance().ensureThreadEglContext();
+        uint32_t indirect = 0;
+        uc_reg_read(uc, UC_ARM_REG_R0, &indirect);
+        typedef void (*PFN_glDispatchComputeIndirect)(GLintptr);
+        static auto pfn = reinterpret_cast<PFN_glDispatchComputeIndirect>(eglGetProcAddress("glDispatchComputeIndirect"));
+        if (pfn) pfn(static_cast<GLintptr>(indirect));
+        return;
+    }
+    if (name == "glMemoryBarrier" || name == "glMemoryBarrierByRegion") {
+        GuestRuntimeEnvironment::getInstance().ensureThreadEglContext();
+        uint32_t barriers = 0;
+        uc_reg_read(uc, UC_ARM_REG_R0, &barriers);
+        typedef void (*PFN_glMemoryBarrier)(GLbitfield);
+        static auto pfn = reinterpret_cast<PFN_glMemoryBarrier>(eglGetProcAddress("glMemoryBarrier"));
+        if (pfn) pfn(barriers);
+        return;
+    }
+    if (name == "glBindImageTexture") {
+        GuestRuntimeEnvironment::getInstance().ensureThreadEglContext();
+        uint32_t unit = 0, tex = 0, level = 0, layered = 0, layer = 0, access = 0, format = 0;
+        uc_reg_read(uc, UC_ARM_REG_R0, &unit);
+        uc_reg_read(uc, UC_ARM_REG_R1, &tex);
+        uc_reg_read(uc, UC_ARM_REG_R2, &level);
+        uc_reg_read(uc, UC_ARM_REG_R3, &layered);
+        uint32_t sp = 0;
+        uc_reg_read(uc, UC_ARM_REG_SP, &sp);
+        uc_mem_read(uc, sp, &layer, 4);
+        uc_mem_read(uc, sp + 4, &access, 4);
+        uc_mem_read(uc, sp + 8, &format, 4);
+        typedef void (*PFN_glBindImageTexture)(GLuint, GLuint, GLint, GLboolean, GLint, GLenum, GLenum);
+        static auto pfn = reinterpret_cast<PFN_glBindImageTexture>(eglGetProcAddress("glBindImageTexture"));
+        if (pfn) pfn(unit, tex, static_cast<GLint>(level), static_cast<GLboolean>(layered), static_cast<GLint>(layer), access, format);
+        return;
+    }
+    if (name == "glTexStorage2DMultisample") {
+        GuestRuntimeEnvironment::getInstance().ensureThreadEglContext();
+        uint32_t target = 0, samples = 0, internalformat = 0, w = 0, h = 0, fixedsamples = 0;
+        uc_reg_read(uc, UC_ARM_REG_R0, &target);
+        uc_reg_read(uc, UC_ARM_REG_R1, &samples);
+        uc_reg_read(uc, UC_ARM_REG_R2, &internalformat);
+        uc_reg_read(uc, UC_ARM_REG_R3, &w);
+        uint32_t sp = 0;
+        uc_reg_read(uc, UC_ARM_REG_SP, &sp);
+        uc_mem_read(uc, sp, &h, 4);
+        uc_mem_read(uc, sp + 4, &fixedsamples, 4);
+        typedef void (*PFN_glTexStorage2DMultisample)(GLenum, GLsizei, GLenum, GLsizei, GLsizei, GLboolean);
+        static auto pfn = reinterpret_cast<PFN_glTexStorage2DMultisample>(eglGetProcAddress("glTexStorage2DMultisample"));
+        if (pfn) pfn(target, samples, internalformat, w, h, fixedsamples != 0);
+        return;
+    }
+    if (name == "glFramebufferParameteri") {
+        GuestRuntimeEnvironment::getInstance().ensureThreadEglContext();
+        uint32_t target = 0, pname = 0, param = 0;
+        uc_reg_read(uc, UC_ARM_REG_R0, &target);
+        uc_reg_read(uc, UC_ARM_REG_R1, &pname);
+        uc_reg_read(uc, UC_ARM_REG_R2, &param);
+        typedef void (*PFN_glFramebufferParameteri)(GLenum, GLenum, GLint);
+        static auto pfn = reinterpret_cast<PFN_glFramebufferParameteri>(eglGetProcAddress("glFramebufferParameteri"));
+        if (pfn) pfn(target, pname, param);
+        return;
+    }
+
+    // 12c. Vulkan Loader & Hardware Fallback Safe Trapping
+    if (name == "vkGetInstanceProcAddr") {
+        uint32_t inst = 0, namePtr = 0;
+        uc_reg_read(uc, UC_ARM_REG_R0, &inst);
+        uc_reg_read(uc, UC_ARM_REG_R1, &namePtr);
+        uint32_t retAddr = 0;
+        if (namePtr != 0) {
+            std::string vkFn = readGuestCString(uc, namePtr, 128);
+            if (vkFn == "vkCreateInstance" || vkFn == "vkEnumerateInstanceExtensionProperties" ||
+                vkFn == "vkEnumerateInstanceLayerProperties") {
+                retAddr = registerSymbolTrampoline(vkFn, uc);
+            }
+            LOGI("Vulkan: vkGetInstanceProcAddr('%s') -> 0x%08x", vkFn.c_str(), retAddr);
+        }
+        uc_reg_write(uc, UC_ARM_REG_R0, &retAddr);
+        return;
+    }
+    if (name == "vkGetDeviceProcAddr") {
+        uint32_t zero = 0;
+        uc_reg_write(uc, UC_ARM_REG_R0, &zero);
+        return;
+    }
+    if (name == "vkCreateInstance") {
+        LOGI("Vulkan: vkCreateInstance segnala VK_ERROR_INCOMPATIBLE_DRIVER (-9) per fallback automatico su GLES");
+        uint32_t errCode = 0xFFFFFFF7U; // VK_ERROR_INCOMPATIBLE_DRIVER (-9)
+        uc_reg_write(uc, UC_ARM_REG_R0, &errCode);
+        return;
+    }
+    if (name == "vkEnumerateInstanceExtensionProperties") {
+        uint32_t layerPtr = 0, countPtr = 0, propsPtr = 0;
+        uc_reg_read(uc, UC_ARM_REG_R0, &layerPtr);
+        uc_reg_read(uc, UC_ARM_REG_R1, &countPtr);
+        uc_reg_read(uc, UC_ARM_REG_R2, &propsPtr);
+        if (countPtr != 0) {
+            uint32_t zero = 0;
+            uc_mem_write(uc, countPtr, &zero, 4);
+        }
+        uint32_t ok = 0; // VK_SUCCESS
+        uc_reg_write(uc, UC_ARM_REG_R0, &ok);
+        return;
+    }
+    if (name == "vkEnumerateInstanceLayerProperties") {
+        uint32_t countPtr = 0, propsPtr = 0;
+        uc_reg_read(uc, UC_ARM_REG_R0, &countPtr);
+        uc_reg_read(uc, UC_ARM_REG_R1, &propsPtr);
+        if (countPtr != 0) {
+            uint32_t zero = 0;
+            uc_mem_write(uc, countPtr, &zero, 4);
+        }
+        uint32_t ok = 0; // VK_SUCCESS
+        uc_reg_write(uc, UC_ARM_REG_R0, &ok);
         return;
     }
 

@@ -137,12 +137,15 @@ public:
         lastTouchPointerId_.store(pointerId, std::memory_order_relaxed);
     }
 
-    void setEglState(EGLDisplay dpy, EGLSurface surf, EGLContext ctx, PerformanceGovernor* gov) {
+    void setEglState(EGLDisplay dpy, EGLSurface surf, EGLContext ctx, EGLConfig cfg, PerformanceGovernor* gov) {
         eglDisplay_ = dpy;
         eglSurface_ = surf;
         eglContext_ = ctx;
+        eglConfig_ = cfg;
         governor_ = gov;
     }
+
+    bool ensureThreadEglContext();
 
     void swapBuffers() {
         if (eglDisplay_ != EGL_NO_DISPLAY && eglSurface_ != EGL_NO_SURFACE) {
@@ -235,7 +238,12 @@ private:
     EGLDisplay eglDisplay_{EGL_NO_DISPLAY};
     EGLSurface eglSurface_{EGL_NO_SURFACE};
     EGLContext eglContext_{EGL_NO_CONTEXT};
+    EGLConfig eglConfig_{nullptr};
     PerformanceGovernor* governor_{nullptr};
+
+    std::mutex eglMutex_;
+    std::unordered_map<uint32_t, EGLContext> guestEglContextMap_;
+    std::unordered_map<uint32_t, EGLSurface> guestEglSurfaceMap_;
 };
 
 } // namespace emux

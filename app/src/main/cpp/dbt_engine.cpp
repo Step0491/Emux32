@@ -99,7 +99,7 @@ bool DbtEngine::ensureWorkerEgl(bool waitIfNull) {
 
         const EGLint attribs[] = {
             EGL_RENDERABLE_TYPE, EGL_OPENGL_ES2_BIT,
-            EGL_SURFACE_TYPE, EGL_WINDOW_BIT,
+            EGL_SURFACE_TYPE, EGL_WINDOW_BIT | EGL_PBUFFER_BIT,
             EGL_BLUE_SIZE, 8,
             EGL_GREEN_SIZE, 8,
             EGL_RED_SIZE, 8,
@@ -113,7 +113,7 @@ bool DbtEngine::ensureWorkerEgl(bool waitIfNull) {
         if (!eglChooseConfig(eglDisplay_, attribs, &eglConfig_, 1, &numConfigs) || numConfigs <= 0) {
             const EGLint fallbackAttribs[] = {
                 EGL_RENDERABLE_TYPE, EGL_OPENGL_ES2_BIT,
-                EGL_SURFACE_TYPE, EGL_WINDOW_BIT,
+                EGL_SURFACE_TYPE, EGL_WINDOW_BIT | EGL_PBUFFER_BIT,
                 EGL_BLUE_SIZE, 8,
                 EGL_GREEN_SIZE, 8,
                 EGL_RED_SIZE, 8,
@@ -166,7 +166,7 @@ bool DbtEngine::ensureWorkerEgl(bool waitIfNull) {
     glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
 
     LOGI("initEgl [WorkerThread]: Contesto EGL attivo e collegato a ANativeWindow (%dx%d).", width, height);
-    GuestRuntimeEnvironment::getInstance().setEglState(eglDisplay_, eglSurface_, eglContext_, &governor_);
+    GuestRuntimeEnvironment::getInstance().setEglState(eglDisplay_, eglSurface_, eglContext_, eglConfig_, &governor_);
     return true;
 }
 
@@ -191,7 +191,7 @@ void DbtEngine::destroyEgl() {
         boundEglWindow_ = nullptr;
         LOGI("destroyEgl: Risorse grafiche EGL rilasciate.");
     }
-    GuestRuntimeEnvironment::getInstance().setEglState(EGL_NO_DISPLAY, EGL_NO_SURFACE, EGL_NO_CONTEXT, nullptr);
+    GuestRuntimeEnvironment::getInstance().setEglState(EGL_NO_DISPLAY, EGL_NO_SURFACE, EGL_NO_CONTEXT, nullptr, nullptr);
 }
 
 void DbtEngine::swapBuffers() {
