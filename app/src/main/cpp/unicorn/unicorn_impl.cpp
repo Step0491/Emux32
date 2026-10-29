@@ -15,6 +15,8 @@
 #include <mutex>
 #include <algorithm>
 #include <new>
+#include <thread>
+#include <sched.h>
 
 #if defined(EMUX_ENABLE_DYNARMIC)
 #include "dynarmic/interface/A32/a32.h"
@@ -1262,7 +1264,7 @@ public:
             exception == Dynarmic::A32::Exception::WaitForInterrupt ||
             exception == Dynarmic::A32::Exception::SendEvent ||
             exception == Dynarmic::A32::Exception::SendEventLocal) {
-            std::this_thread::yield();
+            sched_yield();
             return;
         }
 

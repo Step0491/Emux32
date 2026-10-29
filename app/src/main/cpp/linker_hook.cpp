@@ -35,6 +35,8 @@
 #include <string>
 #include <unordered_map>
 #include <algorithm>
+#include <thread>
+#include <sched.h>
 
 #define TAG "EmuxLinkerHook"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, TAG, __VA_ARGS__)
@@ -2755,7 +2757,7 @@ void GuestRuntimeEnvironment::handleTrampolineCall(uint32_t trampolineId, uc_eng
         return;
     }
     if (name == "sched_yield" || name == "pthread_yield") {
-        std::this_thread::yield();
+        sched_yield();
         uint32_t zero = 0;
         uc_reg_write(uc, UC_ARM_REG_R0, &zero);
         return;
