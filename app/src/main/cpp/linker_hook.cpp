@@ -4825,7 +4825,7 @@ void GuestRuntimeEnvironment::handleTrampolineCall(uint32_t trampolineId, uc_eng
                 default: str = ""; break;
             }
         }
-        uint32_t gStr = allocateGuestString(uc, str);
+        uint32_t gStr = createGuestString(uc, str ? str : "");
         uc_reg_write(uc, UC_ARM_REG_R0, &gStr);
         return;
     }
