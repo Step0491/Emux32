@@ -1218,10 +1218,15 @@ public:
 
     std::optional<std::uint32_t> MemoryReadCode(Dynarmic::A32::VAddr vaddr) override {
         if ((vaddr & 0xFFFFF000U) == 0xFFFF0000U) {
+            // [0xFFFF0FE0] __kuser_get_tls
             if (vaddr == 0xFFFF0FE0U) return 0xee1d0f70U; // mrc p15, 0, r0, c13, c0, 3
             if (vaddr == 0xFFFF0FE4U) return 0xe12fff1eU; // bx lr
+
+            // [0xFFFF0FA0] __kuser_dmb
             if (vaddr == 0xFFFF0FA0U) return 0xf57ff05eU; // dmb sy
             if (vaddr == 0xFFFF0FA4U) return 0xe12fff1eU; // bx lr
+
+            // [0xFFFF0FC0] __kuser_cmpxchg (r0=oldval, r1=newval, r2=ptr -> r0=0 on success)
             if (vaddr == 0xFFFF0FC0U) return 0xe1923f9fU; // ldrex r3, [r2]
             if (vaddr == 0xFFFF0FC4U) return 0xe1530000U; // cmp r3, r0
             if (vaddr == 0xFFFF0FC8U) return 0x13a00001U; // movne r0, #1
@@ -1230,7 +1235,7 @@ public:
             if (vaddr == 0xFFFF0FD4U) return 0xe3530000U; // cmp r3, #0
             if (vaddr == 0xFFFF0FD8U) return 0x1a00fff8U; // bne 0xffff0fc0
             if (vaddr == 0xFFFF0FDCU) return 0xe3a00000U; // mov r0, #0
-            if (vaddr == 0xFFFF0FE0U) return 0xe12fff1eU; // bx lr
+            if (vaddr == 0xFFFF0FFCU) return 0x00000003U; // __kuser_helper_version = 3
         }
 
         if (inst_->flat_mem.isReady() && inst_->flat_mem.isMapped(vaddr)) {
@@ -1312,6 +1317,15 @@ void UnicornInstance::initDynarmic() {
         conf.global_monitor = getSharedExclusiveMonitor().get();
         conf.processor_id = processor_id;
 
+        // Ottimizzazioni JIT ad alte prestazioni per ARM32 -> AArch64 Gaming
+        conf.optimizations = Dynarmic::all_safe_optimizations;
+        conf.fastmem_exclusive_access = true;
+        conf.code_cache_size = 128 * 1024 * 1024; // 128 MB code cache per thread
+        conf.always_little_endian = true;         // Android ARM32 è strettamente little-endian
+        conf.wall_clock_cntpct = true;            // Usa clock reale per evitare overhead timer emulati
+        conf.hook_hint_instructions = true;       // Intercetta yield/wfe per rilasciare la CPU in spinlock
+        conf.define_unpredictable_behaviour = true;
+
         if (flat_mem.isReady() && flat_mem.base() != nullptr) {
             conf.fastmem_pointer = reinterpret_cast<uintptr_t>(flat_mem.base());
             conf.recompile_on_fastmem_failure = true;
@@ -1319,7 +1333,7 @@ void UnicornInstance::initDynarmic() {
         }
 
         dynarmic_jit = std::make_unique<Dynarmic::A32::Jit>(conf);
-        LOGI("UnicornCore: Dynarmic ARM32 JIT compiler istanziato con successo!");
+        LOGI("UnicornCore: Dynarmic ARM32 JIT compiler istanziato con successo (BlockLinking, Fastmem, RSB: ON)!");
     } catch (const std::exception& e) {
         LOGE("UnicornCore: Eccezione durante initDynarmic: %s (fallback su interprete)", e.what());
         dynarmic_jit.reset();
