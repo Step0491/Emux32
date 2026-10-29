@@ -6,8 +6,7 @@
 #include <map>
 #include <string>
 
-struct uc_struct;
-typedef struct uc_struct uc_engine;
+#include "unicorn/unicorn.h"
 
 namespace emux {
 
