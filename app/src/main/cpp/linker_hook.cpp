@@ -244,8 +244,8 @@ bool GuestRuntimeEnvironment::handleEglMakeCurrent(uint32_t drawHandle, uint32_t
     pthread_t self = pthread_self();
     uint32_t currentTid = GuestThreadScheduler::getInstance().getCurrentTid();
 
-    // 1. Unbinding esplicito del thread corrente (ctx == 0 oppure draw == 0)
-    if (ctxHandle == 0 || drawHandle == 0) {
+    // 1. Unbinding esplicito del thread corrente: SOLO SE ctxHandle == 0
+    if (ctxHandle == 0) {
         EGLBoolean ok = ::eglMakeCurrent(eglDisplay_, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
         if (windowSurfaceOwnerThread_.load() == self) {
             windowSurfaceOwnerThread_.store(0);
@@ -268,13 +268,41 @@ bool GuestRuntimeEnvironment::handleEglMakeCurrent(uint32_t drawHandle, uint32_t
     }
 
     // 3. Risoluzione superficie EGL target
-    EGLSurface targetSurf = eglSurface_;
-    auto sit = guestEglSurfaceMap_.find(drawHandle);
-    if (sit != guestEglSurfaceMap_.end() && sit->second != EGL_NO_SURFACE) {
-        targetSurf = sit->second;
+    EGLSurface targetSurf = EGL_NO_SURFACE;
+    if (drawHandle != 0) {
+        auto sit = guestEglSurfaceMap_.find(drawHandle);
+        if (sit != guestEglSurfaceMap_.end() && sit->second != EGL_NO_SURFACE) {
+            targetSurf = sit->second;
+        } else if (drawHandle == 1 && eglSurface_ != EGL_NO_SURFACE) {
+            targetSurf = eglSurface_;
+        }
     }
 
-    // Se la superficie non esiste ed è richiesto un pbuffer, creiamola sul display host
+    // 4. Gestione Surfaceless Context per Worker Threads (drawHandle == 0)
+    if (drawHandle == 0) {
+        // Tentativo 1: Surfaceless nativo (EGL_KHR_surfaceless_context)
+        if (::eglMakeCurrent(eglDisplay_, EGL_NO_SURFACE, EGL_NO_SURFACE, targetCtx) == EGL_TRUE) {
+            threadCurrentContextHandleMap_[self] = ctxHandle;
+            threadCurrentSurfaceHandleMap_[self] = 0;
+            LOGI("EGL: Surfaceless eglMakeCurrent SUCCESSO su worker thread %p (TID=%u, Ctx=0x%x [%p])",
+                 (void*)self, currentTid, ctxHandle, targetCtx);
+            return true;
+        }
+
+        // Tentativo 2: Fallback Pbuffer dedicato per driver che esigono superficie valida
+        auto spit = threadPbufferSurfaceMap_.find(self);
+        if (spit != threadPbufferSurfaceMap_.end() && spit->second != EGL_NO_SURFACE) {
+            targetSurf = spit->second;
+        } else if (eglConfig_ != nullptr) {
+            const EGLint pbufAttribs[] = { EGL_WIDTH, 1, EGL_HEIGHT, 1, EGL_NONE };
+            targetSurf = ::eglCreatePbufferSurface(eglDisplay_, eglConfig_, pbufAttribs);
+            if (targetSurf != EGL_NO_SURFACE) {
+                threadPbufferSurfaceMap_[self] = targetSurf;
+            }
+        }
+    }
+
+    // Se la superficie target (drawHandle != 0) non esiste, creiamola come pbuffer
     if (targetSurf == EGL_NO_SURFACE && eglConfig_ != nullptr) {
         const EGLint pbufAttribs[] = { EGL_WIDTH, 1, EGL_HEIGHT, 1, EGL_NONE };
         targetSurf = ::eglCreatePbufferSurface(eglDisplay_, eglConfig_, pbufAttribs);
@@ -285,7 +313,7 @@ bool GuestRuntimeEnvironment::handleEglMakeCurrent(uint32_t drawHandle, uint32_t
 
     bool isWindowSurface = (targetSurf == eglSurface_ && eglSurface_ != EGL_NO_SURFACE);
 
-    // 4. Protocollo di Handover Cooperativo per Window Surface (ANativeWindow)
+    // 5. Protocollo di Handover Cooperativo per Window Surface (ANativeWindow)
     if (isWindowSurface) {
         pthread_t owner = windowSurfaceOwnerThread_.load();
         if (owner != 0 && owner != self) {
@@ -298,7 +326,7 @@ bool GuestRuntimeEnvironment::handleEglMakeCurrent(uint32_t drawHandle, uint32_t
         }
     }
 
-    // 5. Tentativo di binding primario
+    // 6. Tentativo di binding primario
     EGLBoolean ok = ::eglMakeCurrent(eglDisplay_, targetSurf, targetSurf, targetCtx);
     if (ok == EGL_TRUE) {
         if (isWindowSurface) {
@@ -316,43 +344,39 @@ bool GuestRuntimeEnvironment::handleEglMakeCurrent(uint32_t drawHandle, uint32_t
     EGLint err = ::eglGetError();
     LOGW("EGL Handover: eglMakeCurrent primario fallito (err=0x%x) su thread %p (TID=%u)", err, (void*)self, currentTid);
 
-    // 6. Strategia di Resilienza per EGL_BAD_ACCESS su Worker Threads
-    if (err == EGL_BAD_ACCESS) {
-        if (!isWindowSurface) {
-            // Per thread secondari (texture upload, shader compilation) che non renderizzano a video:
-            // Creiamo un contesto condiviso dedicato con superficie Pbuffer
-            EGLContext sharedCtx = EGL_NO_CONTEXT;
-            auto scit = threadSharedContextMap_.find(self);
-            if (scit != threadSharedContextMap_.end() && scit->second != EGL_NO_CONTEXT) {
-                sharedCtx = scit->second;
-            } else if (eglConfig_ != nullptr) {
-                const EGLint ctxAttribs[] = { EGL_CONTEXT_CLIENT_VERSION, 2, EGL_NONE };
-                sharedCtx = ::eglCreateContext(eglDisplay_, eglConfig_, targetCtx, ctxAttribs);
-                if (sharedCtx != EGL_NO_CONTEXT) {
-                    threadSharedContextMap_[self] = sharedCtx;
-                }
+    // 7. Strategia di Resilienza per EGL_BAD_ACCESS su Worker Threads
+    if (err == EGL_BAD_ACCESS && !isWindowSurface) {
+        EGLContext sharedCtx = EGL_NO_CONTEXT;
+        auto scit = threadSharedContextMap_.find(self);
+        if (scit != threadSharedContextMap_.end() && scit->second != EGL_NO_CONTEXT) {
+            sharedCtx = scit->second;
+        } else if (eglConfig_ != nullptr) {
+            const EGLint ctxAttribs[] = { EGL_CONTEXT_CLIENT_VERSION, 2, EGL_NONE };
+            sharedCtx = ::eglCreateContext(eglDisplay_, eglConfig_, targetCtx, ctxAttribs);
+            if (sharedCtx != EGL_NO_CONTEXT) {
+                threadSharedContextMap_[self] = sharedCtx;
             }
+        }
 
-            EGLSurface pbufSurf = EGL_NO_SURFACE;
-            auto spit = threadPbufferSurfaceMap_.find(self);
-            if (spit != threadPbufferSurfaceMap_.end() && spit->second != EGL_NO_SURFACE) {
-                pbufSurf = spit->second;
-            } else if (eglConfig_ != nullptr) {
-                const EGLint pbufAttribs[] = { EGL_WIDTH, 1, EGL_HEIGHT, 1, EGL_NONE };
-                pbufSurf = ::eglCreatePbufferSurface(eglDisplay_, eglConfig_, pbufAttribs);
-                if (pbufSurf != EGL_NO_SURFACE) {
-                    threadPbufferSurfaceMap_[self] = pbufSurf;
-                }
+        EGLSurface pbufSurf = EGL_NO_SURFACE;
+        auto spit = threadPbufferSurfaceMap_.find(self);
+        if (spit != threadPbufferSurfaceMap_.end() && spit->second != EGL_NO_SURFACE) {
+            pbufSurf = spit->second;
+        } else if (eglConfig_ != nullptr) {
+            const EGLint pbufAttribs[] = { EGL_WIDTH, 1, EGL_HEIGHT, 1, EGL_NONE };
+            pbufSurf = ::eglCreatePbufferSurface(eglDisplay_, eglConfig_, pbufAttribs);
+            if (pbufSurf != EGL_NO_SURFACE) {
+                threadPbufferSurfaceMap_[self] = pbufSurf;
             }
+        }
 
-            if (sharedCtx != EGL_NO_CONTEXT && pbufSurf != EGL_NO_SURFACE) {
-                if (::eglMakeCurrent(eglDisplay_, pbufSurf, pbufSurf, sharedCtx) == EGL_TRUE) {
-                    threadCurrentContextHandleMap_[self] = ctxHandle;
-                    threadCurrentSurfaceHandleMap_[self] = drawHandle;
-                    LOGI("EGL Handover: Worker Thread %p associato a Contesto Condiviso dedicato %p con Pbuffer %p",
-                         (void*)self, sharedCtx, pbufSurf);
-                    return true;
-                }
+        if (sharedCtx != EGL_NO_CONTEXT && pbufSurf != EGL_NO_SURFACE) {
+            if (::eglMakeCurrent(eglDisplay_, pbufSurf, pbufSurf, sharedCtx) == EGL_TRUE) {
+                threadCurrentContextHandleMap_[self] = ctxHandle;
+                threadCurrentSurfaceHandleMap_[self] = drawHandle;
+                LOGI("EGL Handover: Worker Thread %p associato a Contesto Condiviso dedicato %p con Pbuffer %p",
+                     (void*)self, sharedCtx, pbufSurf);
+                return true;
             }
         }
     }
@@ -4591,7 +4615,12 @@ void GuestRuntimeEnvironment::handleTrampolineCall(uint32_t trampolineId, uc_eng
         uint32_t ctxHandle = nextMockHandle_++;
         if (hostDpy != EGL_NO_DISPLAY && hostCfg != nullptr) {
             const EGLint ctxAttribs[] = { EGL_CONTEXT_CLIENT_VERSION, clientVersion, EGL_NONE };
+            // Condivisione contesti con fallback resiliente senza sharing se rifiutato dal driver host
             EGLContext hostCtx = ::eglCreateContext(hostDpy, hostCfg, hostMainCtx, ctxAttribs);
+            if (hostCtx == EGL_NO_CONTEXT && hostMainCtx != EGL_NO_CONTEXT) {
+                hostCtx = ::eglCreateContext(hostDpy, hostCfg, EGL_NO_CONTEXT, ctxAttribs);
+            }
+
             if (hostCtx != EGL_NO_CONTEXT) {
                 guestEglContextMap_[ctxHandle] = hostCtx;
                 LOGI("EGL: eglCreateContext() creato contesto (GuestHandle: 0x%x, HostCtx: %p, Shared: %p, GLES ver=%d)",
@@ -4695,12 +4724,24 @@ void GuestRuntimeEnvironment::handleTrampolineCall(uint32_t trampolineId, uc_eng
 
     if (name == "eglGetCurrentContext") {
         uint32_t curCtxHandle = getCurrentThreadEglContextHandle();
+        if (curCtxHandle == 0 && eglContext_ != EGL_NO_CONTEXT) {
+            if (windowSurfaceOwnerThread_.load() == pthread_self() || ::eglGetCurrentContext() != EGL_NO_CONTEXT) {
+                curCtxHandle = 1;
+            }
+        }
         uc_reg_write(uc, UC_ARM_REG_R0, &curCtxHandle);
         return;
     }
 
     if (name == "eglGetCurrentSurface") {
+        uint32_t reType = 0;
+        uc_reg_read(uc, UC_ARM_REG_R0, &reType);
         uint32_t curSurfHandle = getCurrentThreadEglSurfaceHandle();
+        if (curSurfHandle == 0 && eglSurface_ != EGL_NO_SURFACE) {
+            if (windowSurfaceOwnerThread_.load() == pthread_self() || ::eglGetCurrentSurface(EGL_DRAW) != EGL_NO_SURFACE) {
+                curSurfHandle = 1;
+            }
+        }
         uc_reg_write(uc, UC_ARM_REG_R0, &curSurfHandle);
         return;
     }
@@ -4766,6 +4807,190 @@ void GuestRuntimeEnvironment::handleTrampolineCall(uint32_t trampolineId, uc_eng
         uc_reg_write(uc, UC_ARM_REG_R0, &ok);
         return;
     }
+    if (name == "eglQueryString") {
+        uint32_t dpy = 0, queryName = 0;
+        uc_reg_read(uc, UC_ARM_REG_R0, &dpy);
+        uc_reg_read(uc, UC_ARM_REG_R1, &queryName);
+        EGLDisplay hostDpy = (eglDisplay_ != EGL_NO_DISPLAY) ? eglDisplay_ : GuestRuntimeEnvironment::getInstance().getEglDisplay();
+        const char* str = nullptr;
+        if (hostDpy != EGL_NO_DISPLAY) {
+            str = ::eglQueryString(hostDpy, static_cast<EGLint>(queryName));
+        }
+        if (!str) {
+            switch (queryName) {
+                case 0x3053: str = "Android"; break; // EGL_VENDOR
+                case 0x3054: str = "1.4 Android META-EGL"; break; // EGL_VERSION
+                case 0x3055: str = "EGL_KHR_image EGL_KHR_image_base EGL_KHR_gl_texture_2D_image EGL_KHR_fence_sync EGL_ANDROID_image_native_buffer EGL_KHR_surfaceless_context"; break; // EGL_EXTENSIONS
+                case 0x308D: str = "OpenGL_ES"; break; // EGL_CLIENT_APIS
+                default: str = ""; break;
+            }
+        }
+        uint32_t gStr = allocateGuestString(uc, str);
+        uc_reg_write(uc, UC_ARM_REG_R0, &gStr);
+        return;
+    }
+
+    if (name == "eglCreateSyncKHR") {
+        uint32_t dpy = 0, type = 0, attribsPtr = 0;
+        uc_reg_read(uc, UC_ARM_REG_R0, &dpy);
+        uc_reg_read(uc, UC_ARM_REG_R1, &type);
+        uc_reg_read(uc, UC_ARM_REG_R2, &attribsPtr);
+
+        typedef void* (*PFN_eglCreateSyncKHR)(EGLDisplay, EGLenum, const EGLint*);
+        static auto pfn = reinterpret_cast<PFN_eglCreateSyncKHR>(::eglGetProcAddress("eglCreateSyncKHR"));
+
+        EGLDisplay hostDpy = (eglDisplay_ != EGL_NO_DISPLAY) ? eglDisplay_ : GuestRuntimeEnvironment::getInstance().getEglDisplay();
+        void* hostSync = nullptr;
+        if (pfn && hostDpy != EGL_NO_DISPLAY) {
+            hostSync = pfn(hostDpy, static_cast<EGLenum>(type), nullptr);
+        }
+        uint32_t syncHandle = nextMockHandle_++;
+        guestEglSyncMap_[syncHandle] = hostSync;
+        LOGI("EGL: eglCreateSyncKHR() creato sync handle 0x%x (hostSync=%p, type=0x%x)", syncHandle, hostSync, type);
+        uc_reg_write(uc, UC_ARM_REG_R0, &syncHandle);
+        return;
+    }
+
+    if (name == "eglDestroySyncKHR") {
+        uint32_t dpy = 0, syncHandle = 0;
+        uc_reg_read(uc, UC_ARM_REG_R0, &dpy);
+        uc_reg_read(uc, UC_ARM_REG_R1, &syncHandle);
+
+        auto it = guestEglSyncMap_.find(syncHandle);
+        if (it != guestEglSyncMap_.end()) {
+            if (it->second != nullptr) {
+                typedef EGLBoolean (*PFN_eglDestroySyncKHR)(EGLDisplay, void*);
+                static auto pfn = reinterpret_cast<PFN_eglDestroySyncKHR>(::eglGetProcAddress("eglDestroySyncKHR"));
+                EGLDisplay hostDpy = (eglDisplay_ != EGL_NO_DISPLAY) ? eglDisplay_ : GuestRuntimeEnvironment::getInstance().getEglDisplay();
+                if (pfn && hostDpy != EGL_NO_DISPLAY) {
+                    pfn(hostDpy, it->second);
+                }
+            }
+            guestEglSyncMap_.erase(it);
+        }
+        uint32_t one = 1;
+        uc_reg_write(uc, UC_ARM_REG_R0, &one);
+        return;
+    }
+
+    if (name == "eglClientWaitSyncKHR") {
+        uint32_t dpy = 0, syncHandle = 0, flags = 0;
+        uint32_t timeoutLow = 0, timeoutHigh = 0;
+        uc_reg_read(uc, UC_ARM_REG_R0, &dpy);
+        uc_reg_read(uc, UC_ARM_REG_R1, &syncHandle);
+        uc_reg_read(uc, UC_ARM_REG_R2, &flags);
+        uc_reg_read(uc, UC_ARM_REG_R3, &timeoutLow);
+        uint32_t sp = 0;
+        uc_reg_read(uc, UC_ARM_REG_SP, &sp);
+        uc_mem_read(uc, sp, &timeoutHigh, 4);
+        uint64_t timeout = (static_cast<uint64_t>(timeoutHigh) << 32) | timeoutLow;
+
+        auto it = guestEglSyncMap_.find(syncHandle);
+        uint32_t res = 0x30BCU; // EGL_CONDITION_SATISFIED_KHR
+        if (it != guestEglSyncMap_.end() && it->second != nullptr) {
+            typedef EGLint (*PFN_eglClientWaitSyncKHR)(EGLDisplay, void*, EGLint, uint64_t);
+            static auto pfn = reinterpret_cast<PFN_eglClientWaitSyncKHR>(::eglGetProcAddress("eglClientWaitSyncKHR"));
+            EGLDisplay hostDpy = (eglDisplay_ != EGL_NO_DISPLAY) ? eglDisplay_ : GuestRuntimeEnvironment::getInstance().getEglDisplay();
+            if (pfn && hostDpy != EGL_NO_DISPLAY) {
+                res = static_cast<uint32_t>(pfn(hostDpy, it->second, static_cast<EGLint>(flags), timeout));
+            }
+        }
+        uc_reg_write(uc, UC_ARM_REG_R0, &res);
+        return;
+    }
+
+    if (name == "eglWaitSyncKHR") {
+        uint32_t one = 1;
+        uc_reg_write(uc, UC_ARM_REG_R0, &one);
+        return;
+    }
+
+    if (name == "glFenceSync") {
+        GuestRuntimeEnvironment::getInstance().ensureThreadEglContext();
+        uint32_t condition = 0, flags = 0;
+        uc_reg_read(uc, UC_ARM_REG_R0, &condition);
+        uc_reg_read(uc, UC_ARM_REG_R1, &flags);
+
+        typedef void* (*PFN_glFenceSync)(GLenum, GLbitfield);
+        static auto pfn = reinterpret_cast<PFN_glFenceSync>(::eglGetProcAddress("glFenceSync"));
+        void* syncObj = nullptr;
+        if (pfn) {
+            syncObj = pfn(condition, flags);
+        }
+        uint32_t syncH = nextMockHandle_++;
+        guestGlSyncMap_[syncH] = syncObj;
+        uc_reg_write(uc, UC_ARM_REG_R0, &syncH);
+        return;
+    }
+
+    if (name == "glClientWaitSync") {
+        GuestRuntimeEnvironment::getInstance().ensureThreadEglContext();
+        uint32_t syncH = 0, flags = 0;
+        uint32_t timeoutLow = 0, timeoutHigh = 0;
+        uc_reg_read(uc, UC_ARM_REG_R0, &syncH);
+        uc_reg_read(uc, UC_ARM_REG_R1, &flags);
+        uc_reg_read(uc, UC_ARM_REG_R2, &timeoutLow);
+        uc_reg_read(uc, UC_ARM_REG_R3, &timeoutHigh);
+        uint64_t timeout = (static_cast<uint64_t>(timeoutHigh) << 32) | timeoutLow;
+
+        uint32_t res = 0x911CU; // GL_ALREADY_SIGNALED (or GL_CONDITION_SATISFIED 0x911C)
+        auto it = guestGlSyncMap_.find(syncH);
+        if (it != guestGlSyncMap_.end() && it->second != nullptr) {
+            typedef GLenum (*PFN_glClientWaitSync)(void*, GLbitfield, GLuint64);
+            static auto pfn = reinterpret_cast<PFN_glClientWaitSync>(::eglGetProcAddress("glClientWaitSync"));
+            if (pfn) {
+                res = static_cast<uint32_t>(pfn(it->second, flags, timeout));
+            }
+        }
+        uc_reg_write(uc, UC_ARM_REG_R0, &res);
+        return;
+    }
+
+    if (name == "glWaitSync") {
+        GuestRuntimeEnvironment::getInstance().ensureThreadEglContext();
+        uint32_t syncH = 0, flags = 0;
+        uint32_t timeoutLow = 0, timeoutHigh = 0;
+        uc_reg_read(uc, UC_ARM_REG_R0, &syncH);
+        uc_reg_read(uc, UC_ARM_REG_R1, &flags);
+        uc_reg_read(uc, UC_ARM_REG_R2, &timeoutLow);
+        uc_reg_read(uc, UC_ARM_REG_R3, &timeoutHigh);
+        uint64_t timeout = (static_cast<uint64_t>(timeoutHigh) << 32) | timeoutLow;
+
+        auto it = guestGlSyncMap_.find(syncH);
+        if (it != guestGlSyncMap_.end() && it->second != nullptr) {
+            typedef void (*PFN_glWaitSync)(void*, GLbitfield, GLuint64);
+            static auto pfn = reinterpret_cast<PFN_glWaitSync>(::eglGetProcAddress("glWaitSync"));
+            if (pfn) {
+                pfn(it->second, flags, timeout);
+            }
+        }
+        return;
+    }
+
+    if (name == "glDeleteSync") {
+        GuestRuntimeEnvironment::getInstance().ensureThreadEglContext();
+        uint32_t syncH = 0;
+        uc_reg_read(uc, UC_ARM_REG_R0, &syncH);
+        auto it = guestGlSyncMap_.find(syncH);
+        if (it != guestGlSyncMap_.end()) {
+            if (it->second != nullptr) {
+                typedef void (*PFN_glDeleteSync)(void*);
+                static auto pfn = reinterpret_cast<PFN_glDeleteSync>(::eglGetProcAddress("glDeleteSync"));
+                if (pfn) pfn(it->second);
+            }
+            guestGlSyncMap_.erase(it);
+        }
+        return;
+    }
+
+    if (name == "glIsSync") {
+        uint32_t syncH = 0;
+        uc_reg_read(uc, UC_ARM_REG_R0, &syncH);
+        uint32_t res = (guestGlSyncMap_.find(syncH) != guestGlSyncMap_.end()) ? 1U : 0U;
+        uc_reg_write(uc, UC_ARM_REG_R0, &res);
+        return;
+    }
+
     if (name == "eglGetProcAddress") {
         uint32_t procNamePtr = 0;
         uc_reg_read(uc, UC_ARM_REG_R0, &procNamePtr);

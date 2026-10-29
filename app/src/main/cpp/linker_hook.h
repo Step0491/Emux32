@@ -159,6 +159,8 @@ public:
             threadPbufferSurfaceMap_.clear();
             guestEglContextMap_.clear();
             guestEglSurfaceMap_.clear();
+            guestEglSyncMap_.clear();
+            guestGlSyncMap_.clear();
             threadCurrentContextHandleMap_.clear();
             threadCurrentSurfaceHandleMap_.clear();
             windowSurfaceOwnerThread_.store(0);
@@ -286,6 +288,8 @@ private:
     std::unordered_map<pthread_t, uint32_t> threadCurrentSurfaceHandleMap_;
     std::unordered_map<pthread_t, EGLContext> threadSharedContextMap_;
     std::unordered_map<pthread_t, EGLSurface> threadPbufferSurfaceMap_;
+    std::unordered_map<uint32_t, void*> guestEglSyncMap_;
+    std::unordered_map<uint32_t, void*> guestGlSyncMap_;
 
     JavaVM* hostJavaVm_{nullptr};
     jobject hostClassLoader_{nullptr};
