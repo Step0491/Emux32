@@ -23,6 +23,7 @@ data class EmuxRom(
     val obbFiles: List<File> = emptyList(),
     val packageName: String? = null,
     val hasObb: Boolean = false,
+    val hasData: Boolean = false,
     val preferredOrientation: Int = ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
 )
 
@@ -137,6 +138,31 @@ fun scanEmuxStorage(context: Context, apkDir: File, obbDir: File): List<EmuxRom>
             }
         }
 
+        // 6. Rilevamento cartelle Dati / Cache di gioco (es. unitycache per Blood & Glory)
+        var hasGameData = false
+        val baseDataDir = File(obbDir.parentFile, "data")
+        val candidateDataDirs = listOfNotNull(
+            cleanPkg?.let { File(obbDir, it) },
+            cleanPkg?.let { File(baseDataDir, it) },
+            cleanPkg?.let { File(File("/storage/emulated/0/Android/data"), it) },
+            File(obbDir, "com.glu.gladiator"),
+            File(baseDataDir, "com.glu.gladiator"),
+            File(File("/storage/emulated/0/Android/data"), "com.glu.gladiator")
+        )
+        for (candDir in candidateDataDirs) {
+            if (candDir.exists() && candDir.isDirectory) {
+                val subFiles = try {
+                    candDir.walkTopDown().maxDepth(3).filter { it.isFile }.take(5).toList()
+                } catch (_: Throwable) {
+                    emptyList()
+                }
+                if (subFiles.isNotEmpty()) {
+                    hasGameData = true
+                    break
+                }
+            }
+        }
+
         // Cerca copertina custom omonima (es: nome.jpg, nome.png, cover.jpg)
         var sourceCoverFile: File? = null
         val possibleCovers = listOf(
@@ -174,6 +200,7 @@ fun scanEmuxStorage(context: Context, apkDir: File, obbDir: File): List<EmuxRom>
                 obbFiles = matchedObbList,
                 packageName = pkgName,
                 hasObb = matchedObbList.isNotEmpty(),
+                hasData = hasGameData,
                 preferredOrientation = orientation
             )
         )

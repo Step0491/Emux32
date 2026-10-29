@@ -267,6 +267,10 @@ class MainActivity : ComponentActivity() {
             if (!obbDir.exists()) {
                 obbDir.mkdirs()
             }
+            val dataDir = File(emuxDir, "data")
+            if (!dataDir.exists()) {
+                dataDir.mkdirs()
+            }
             val logDir = File(emuxDir, "log")
             if (!logDir.exists()) {
                 logDir.mkdirs()
@@ -382,6 +386,41 @@ class MainActivity : ComponentActivity() {
                             } else {
                                 EmuxLogger.i("Emux32", "[FASE 2/5] OBB già presente e verificato in: ${targetObb.absolutePath}")
                             }
+                        }
+                    }
+                }
+            }
+
+            // Linking cartelle Dati / Cache di gioco (es. unitycache per Blood & Glory)
+            val baseStorage = resolveEmuxDirectory()
+            val candidateSourceDataDirs = listOfNotNull(
+                File(baseStorage, "obb/$pkg"),
+                File(baseStorage, "data/$pkg"),
+                File(baseStorage, "obb/com.glu.gladiator"),
+                File(baseStorage, "data/com.glu.gladiator"),
+                File(Environment.getExternalStorageDirectory(), "Android/data/$pkg")
+            )
+            val guestDataDir = File(filesDir, "guest_data/$pkg")
+            val guestCacheDir = File(guestDataDir, "cache")
+            if (!guestDataDir.exists()) guestDataDir.mkdirs()
+            if (!guestCacheDir.exists()) guestCacheDir.mkdirs()
+
+            for (srcDir in candidateSourceDataDirs) {
+                if (srcDir.exists() && srcDir.isDirectory) {
+                    val subItems = srcDir.listFiles()
+                    if (subItems != null && subItems.any { it.isDirectory || !it.name.endsWith(".obb", ignoreCase = true) }) {
+                        EmuxLogger.i("Emux32", "[FASE 2/5] Cartella dati/cache rilevata in: ${srcDir.absolutePath} (${subItems.size} elementi)")
+                        for (item in subItems) {
+                            try {
+                                val t1 = File(guestDataDir, item.name)
+                                val t2 = File(guestCacheDir, item.name)
+                                if (!t1.exists()) {
+                                    try { android.system.Os.symlink(item.absolutePath, t1.absolutePath) } catch (_: Exception) {}
+                                }
+                                if (!t2.exists()) {
+                                    try { android.system.Os.symlink(item.absolutePath, t2.absolutePath) } catch (_: Exception) {}
+                                }
+                            } catch (_: Exception) {}
                         }
                     }
                 }

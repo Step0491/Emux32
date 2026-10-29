@@ -167,14 +167,20 @@ fun GameCoverSquareCard(game: EmuxRom, onClick: () -> Unit) {
                     }
                 }
 
-                // Badge indicatore stato OBB
+                // Badge indicatore stato OBB / DATA
+                val hasAssets = game.hasObb || game.hasData
                 Surface(
-                    color = if (game.hasObb) Color(0xFF15803D).copy(alpha = 0.9f) else Color(0xFF475569).copy(alpha = 0.85f),
+                    color = if (hasAssets) Color(0xFF15803D).copy(alpha = 0.9f) else Color(0xFF475569).copy(alpha = 0.85f),
                     shape = RoundedCornerShape(topStart = 8.dp, bottomEnd = 8.dp),
                     modifier = Modifier.align(Alignment.TopStart)
                 ) {
                     Text(
-                        text = if (game.hasObb) "OBB ✓" else "NO OBB",
+                        text = when {
+                            game.hasObb && game.hasData -> "OBB+DATA ✓"
+                            game.hasObb -> "OBB ✓"
+                            game.hasData -> "DATA ✓"
+                            else -> "NO OBB"
+                        },
                         color = Color.White,
                         fontSize = 10.sp,
                         fontWeight = FontWeight.Bold,

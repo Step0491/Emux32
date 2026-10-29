@@ -200,6 +200,64 @@ std::string SyscallDispatcher::resolveFilePath(const char* guestPath) {
         return assetCand;
     }
 
+    // Risoluzione specifica per percorsi di Cache / Dati esterni (es. unitycache o Android/data)
+    size_t ucPos = pathStr.find("/unitycache/");
+    if (ucPos != std::string::npos) {
+        std::string subUc = pathStr.substr(ucPos);
+        std::vector<std::string> ucCandidates = {
+            sCustomStoragePath + "/obb/" + pkg + subUc,
+            sCustomStoragePath + "/data/" + pkg + subUc,
+            sCustomStoragePath + "/obb/" + pkg + "/cache" + subUc,
+            sCustomStoragePath + "/data/" + pkg + "/cache" + subUc,
+            sCustomStoragePath + "/obb/com.glu.gladiator" + subUc,
+            sCustomStoragePath + "/data/com.glu.gladiator" + subUc,
+            env.getFilesDir() + "/guest_data/" + pkg + subUc,
+            env.getFilesDir() + "/guest_data/" + pkg + "/cache" + subUc,
+            "/storage/emulated/0/Android/data/" + pkg + subUc,
+            "/storage/emulated/0/Android/data/" + pkg + "/cache" + subUc,
+            "/storage/emulated/0/Android/data/com.glu.gladiator" + subUc,
+            "/storage/emulated/0/Emux32/obb/" + pkg + subUc,
+            "/storage/emulated/0/Emux32/data/" + pkg + subUc
+        };
+        for (const auto& cand : ucCandidates) {
+            if (access(cand.c_str(), F_OK) == 0) {
+                LOGI("Risoluzione unitycache: '%s' -> '%s'", guestPath, cand.c_str());
+                return cand;
+            }
+        }
+    }
+
+    size_t dataPos = pathStr.find("/Android/data/");
+    if (dataPos != std::string::npos && !pkg.empty()) {
+        std::string afterData = pathStr.substr(dataPos + 14);
+        size_t nextSlash = afterData.find('/');
+        std::string relPath = (nextSlash != std::string::npos) ? afterData.substr(nextSlash) : "";
+        if (!relPath.empty()) {
+            std::vector<std::string> dataCandidates = {
+                sCustomStoragePath + "/obb/" + pkg + relPath,
+                sCustomStoragePath + "/data/" + pkg + relPath,
+                sCustomStoragePath + "/obb/com.glu.gladiator" + relPath,
+                sCustomStoragePath + "/data/com.glu.gladiator" + relPath,
+                env.getFilesDir() + "/guest_data/" + pkg + relPath,
+                env.getFilesDir() + "/guest_data/" + pkg + "/cache" + relPath,
+                "/storage/emulated/0/Emux32/obb/" + pkg + relPath,
+                "/storage/emulated/0/Emux32/data/" + pkg + relPath
+            };
+            if (relPath.rfind("/cache/", 0) == 0) {
+                std::string noCache = relPath.substr(6);
+                dataCandidates.push_back(sCustomStoragePath + "/obb/" + pkg + noCache);
+                dataCandidates.push_back(sCustomStoragePath + "/data/" + pkg + noCache);
+                dataCandidates.push_back(env.getFilesDir() + "/guest_data/" + pkg + noCache);
+            }
+            for (const auto& cand : dataCandidates) {
+                if (access(cand.c_str(), F_OK) == 0) {
+                    LOGI("Risoluzione Android/data: '%s' -> '%s'", guestPath, cand.c_str());
+                    return cand;
+                }
+            }
+        }
+    }
+
     size_t lastSlash = pathStr.find_last_of('/');
     std::string filename = (lastSlash != std::string::npos) ? pathStr.substr(lastSlash + 1) : pathStr;
 
@@ -209,6 +267,7 @@ std::string SyscallDispatcher::resolveFilePath(const char* guestPath) {
     }
     if (!env.getFilesDir().empty() && !pkg.empty()) {
         candidates.push_back(env.getFilesDir() + "/obb/" + pkg + "/" + filename);
+        candidates.push_back(env.getFilesDir() + "/data/" + pkg + "/" + filename);
         candidates.push_back(env.getFilesDir() + "/assets/" + pkg + "/" + filename);
         candidates.push_back(env.getFilesDir() + "/assets/" + filename);
     }
@@ -216,14 +275,19 @@ std::string SyscallDispatcher::resolveFilePath(const char* guestPath) {
         candidates.push_back(env.getNativeLibDir() + "/" + filename);
     }
     candidates.push_back(sCustomStoragePath + "/obb/" + pkg + "/" + filename);
+    candidates.push_back(sCustomStoragePath + "/data/" + pkg + "/" + filename);
     candidates.push_back(sCustomStoragePath + "/obb/" + filename);
+    candidates.push_back(sCustomStoragePath + "/data/" + filename);
     candidates.push_back(sCustomStoragePath + "/apk/" + filename);
     candidates.push_back(sCustomStoragePath + "/" + filename);
     candidates.push_back("/storage/emulated/0/Emux32/obb/" + pkg + "/" + filename);
+    candidates.push_back("/storage/emulated/0/Emux32/data/" + pkg + "/" + filename);
     candidates.push_back("/storage/emulated/0/Emux32/obb/" + filename);
     candidates.push_back("/storage/emulated/0/Emux32/apk/" + filename);
     candidates.push_back("/storage/emulated/0/Android/obb/" + pkg + "/" + filename);
+    candidates.push_back("/storage/emulated/0/Android/data/" + pkg + "/" + filename);
     candidates.push_back("/sdcard/Android/obb/" + pkg + "/" + filename);
+    candidates.push_back("/sdcard/Android/data/" + pkg + "/" + filename);
 
     for (const auto& cand : candidates) {
         if (access(cand.c_str(), F_OK) == 0) {
@@ -989,9 +1053,15 @@ void GuestRuntimeEnvironment::handleJniCall(uint32_t slotIndex, uc_engine* uc) {
                     setReturnU32(createGuestJString(uc, apkPath_));
                     return;
                 }
-                if (info.name == "getObbDir" || info.name == "getExternalStorageDirectory") {
+                if (info.name == "getObbDir") {
                     uint32_t dirObj = nextMockHandle_++;
-                    jstringMap_[dirObj] = obbDir_.empty() ? sCustomStoragePath : obbDir_;
+                    jstringMap_[dirObj] = obbDir_.empty() ? (sCustomStoragePath + "/obb") : obbDir_;
+                    setReturnU32(dirObj);
+                    return;
+                }
+                if (info.name == "getExternalStorageDirectory") {
+                    uint32_t dirObj = nextMockHandle_++;
+                    jstringMap_[dirObj] = sCustomStoragePath.empty() ? "/storage/emulated/0" : sCustomStoragePath;
                     setReturnU32(dirObj);
                     return;
                 }
