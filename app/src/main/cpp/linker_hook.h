@@ -13,6 +13,7 @@
 #include <jni.h>
 #include <EGL/egl.h>
 #include <GLES2/gl2.h>
+#include "core/vfs_zip.h"
 #include "unicorn/unicorn.h"
 
 namespace emux {
@@ -227,6 +228,8 @@ private:
         std::string path;
         size_t length{0};
         uint32_t bufferGuestAddr{0};
+        std::shared_ptr<VfsFileStream> vfsStream{nullptr};
+        off_t dataOffset{0};
     };
 
     struct GuestAssetDir {

@@ -29,6 +29,7 @@ add_library(
     core/guest_thread.cpp
     core/gles_virtualizer.cpp
     core/guest_signal.cpp
+    core/vfs_zip.cpp
     unicorn/unicorn_impl.cpp
     elf_loader.cpp
     linker_hook.cpp

@@ -25,6 +25,7 @@
 #include <dirent.h>
 #include <sys/mman.h>
 #include <zlib.h>
+#include "core/vfs_zip.h"
 #include <cstring>
 #include <cerrno>
 #include <cmath>
@@ -911,6 +912,27 @@ void GuestRuntimeEnvironment::setGameContext(
     if (!filesDir.empty()) filesDir_ = filesDir;
     LOGI("GameContext configurato: pkg='%s', apk='%s', obbDir='%s', libDir='%s'",
          packageName_.c_str(), apkPath_.c_str(), obbDir_.c_str(), nativeLibDir_.c_str());
+
+    // Inizializzazione e montaggio automatico dei container VFS (APK e archivi OBB)
+    auto& vfs = ZipArchiveVfs::getInstance();
+    vfs.reset();
+    if (!apkPath_.empty()) {
+        vfs.mountArchive(apkPath_);
+    }
+    if (!obbDir_.empty()) {
+        vfs.mountObbDirectory(obbDir_);
+    }
+    if (!packageName_.empty()) {
+        vfs.mountObbDirectory("/storage/emulated/0/Android/obb/" + packageName_);
+        vfs.mountObbDirectory("/sdcard/Android/obb/" + packageName_);
+        if (!filesDir_.empty()) {
+            vfs.mountObbDirectory(filesDir_ + "/obb/" + packageName_);
+        }
+        if (!sCustomStoragePath.empty()) {
+            vfs.mountObbDirectory(sCustomStoragePath + "/obb/" + packageName_);
+        }
+    }
+    LOGI("ZipArchiveVfs: Montaggio completato (Totale file indicizzati: %zu)", vfs.getTotalIndexedFiles());
 }
 
 void GuestRuntimeEnvironment::setGameClassLoader(JNIEnv* env, jobject classLoader) {
@@ -4909,31 +4931,60 @@ void GuestRuntimeEnvironment::handleTrampolineCall(uint32_t trampolineId, uc_eng
         uc_reg_read(uc, UC_ARM_REG_R1, &namePtr);
         uc_reg_read(uc, UC_ARM_REG_R2, &mode);
         std::string filename = readGuestCString(uc, namePtr, 256);
+
+        // 1. Prova prima il filesystem reale (file estratti su disco)
         std::string resolved = resolveAssetPath(filename);
-        if (resolved.empty()) {
-            LOGW("AAssetManager_open: Asset '%s' non trovato!", filename.c_str());
-            uint32_t zero = 0;
-            uc_reg_write(uc, UC_ARM_REG_R0, &zero);
+        if (!resolved.empty()) {
+            FILE* fp = fopen(resolved.c_str(), "rb");
+            if (fp) {
+                fseek(fp, 0, SEEK_END);
+                size_t len = static_cast<size_t>(ftell(fp));
+                fseek(fp, 0, SEEK_SET);
+
+                uint32_t assetH = nextAssetHandle_++;
+                GuestAsset ga{};
+                ga.id = assetH;
+                ga.fp = fp;
+                ga.path = resolved;
+                ga.length = len;
+                ga.bufferGuestAddr = 0;
+                ga.vfsStream = nullptr;
+                ga.dataOffset = 0;
+                guestAssetMap_[assetH] = std::move(ga);
+
+                LOGI("AAssetManager_open('%s') -> File fisico Handle 0x%08x (%zu byte)", filename.c_str(), assetH, len);
+                uc_reg_write(uc, UC_ARM_REG_R0, &assetH);
+                return;
+            }
+        }
+
+        // 2. Accesso tramite Virtual File System (streaming OBB e APK)
+        auto vfsStream = ZipArchiveVfs::getInstance().openStream(filename);
+        if (vfsStream) {
+            size_t len = vfsStream->size();
+            off_t dOffset = vfsStream->dataOffset();
+            uint32_t assetH = nextAssetHandle_++;
+
+            GuestAsset ga{};
+            ga.id = assetH;
+            ga.fp = nullptr;
+            ga.path = filename;
+            ga.length = len;
+            ga.bufferGuestAddr = 0;
+            ga.dataOffset = dOffset;
+            ga.vfsStream = std::move(vfsStream);
+            guestAssetMap_[assetH] = std::move(ga);
+
+            LOGI("AAssetManager_open('%s') -> VFS Container Stream Handle 0x%08x (%zu byte, Offset: 0x%lx, Stored: %s)",
+                 filename.c_str(), assetH, len, static_cast<long>(dOffset),
+                 guestAssetMap_[assetH].vfsStream->isStored() ? "YES" : "NO");
+            uc_reg_write(uc, UC_ARM_REG_R0, &assetH);
             return;
         }
 
-        FILE* fp = fopen(resolved.c_str(), "rb");
-        if (!fp) {
-            LOGE("AAssetManager_open: Impossibile aprire file risolto '%s'!", resolved.c_str());
-            uint32_t zero = 0;
-            uc_reg_write(uc, UC_ARM_REG_R0, &zero);
-            return;
-        }
-
-        fseek(fp, 0, SEEK_END);
-        size_t len = static_cast<size_t>(ftell(fp));
-        fseek(fp, 0, SEEK_SET);
-
-        uint32_t assetH = nextAssetHandle_++;
-        guestAssetMap_[assetH] = {assetH, fp, resolved, len, 0};
-
-        LOGI("AAssetManager_open('%s') -> Handle 0x%08x (%zu byte)", filename.c_str(), assetH, len);
-        uc_reg_write(uc, UC_ARM_REG_R0, &assetH);
+        LOGW("AAssetManager_open: Asset '%s' non trovato ne' su disco ne' nei container VFS (.apk/.obb)!", filename.c_str());
+        uint32_t zero = 0;
+        uc_reg_write(uc, UC_ARM_REG_R0, &zero);
         return;
     }
 
@@ -4944,14 +4995,20 @@ void GuestRuntimeEnvironment::handleTrampolineCall(uint32_t trampolineId, uc_eng
         uc_reg_read(uc, UC_ARM_REG_R2, &count);
 
         auto it = guestAssetMap_.find(assetH);
-        if (it == guestAssetMap_.end() || !it->second.fp || bufPtr == 0 || count == 0) {
+        if (it == guestAssetMap_.end() || bufPtr == 0 || count == 0) {
             uint32_t zero = 0;
             uc_reg_write(uc, UC_ARM_REG_R0, &zero);
             return;
         }
 
         std::vector<uint8_t> tmp(count);
-        size_t nRead = fread(tmp.data(), 1, count, it->second.fp);
+        size_t nRead = 0;
+        if (it->second.vfsStream) {
+            nRead = it->second.vfsStream->read(tmp.data(), count);
+        } else if (it->second.fp) {
+            nRead = fread(tmp.data(), 1, count, it->second.fp);
+        }
+
         if (nRead > 0) {
             uc_mem_write(uc, bufPtr, tmp.data(), nRead);
         }
@@ -4967,16 +5024,23 @@ void GuestRuntimeEnvironment::handleTrampolineCall(uint32_t trampolineId, uc_eng
         uc_reg_read(uc, UC_ARM_REG_R2, &whence);
 
         auto it = guestAssetMap_.find(assetH);
-        if (it == guestAssetMap_.end() || !it->second.fp) {
+        if (it == guestAssetMap_.end()) {
             uint32_t err = 0xFFFFFFFFU;
             uc_reg_write(uc, UC_ARM_REG_R0, &err);
             return;
         }
 
         int w = (whence == 0) ? SEEK_SET : ((whence == 1) ? SEEK_CUR : SEEK_END);
-        fseek(it->second.fp, static_cast<long>(static_cast<int32_t>(offset)), w);
-        long cur = ftell(it->second.fp);
-        uint32_t res = static_cast<uint32_t>(cur);
+        uint32_t res = 0xFFFFFFFFU;
+        if (it->second.vfsStream) {
+            if (it->second.vfsStream->seek(static_cast<off_t>(static_cast<int32_t>(offset)), w) == 0) {
+                res = static_cast<uint32_t>(it->second.vfsStream->tell());
+            }
+        } else if (it->second.fp) {
+            fseek(it->second.fp, static_cast<long>(static_cast<int32_t>(offset)), w);
+            res = static_cast<uint32_t>(ftell(it->second.fp));
+        }
+
         uc_reg_write(uc, UC_ARM_REG_R0, &res);
         return;
     }
@@ -4995,9 +5059,18 @@ void GuestRuntimeEnvironment::handleTrampolineCall(uint32_t trampolineId, uc_eng
         uc_reg_read(uc, UC_ARM_REG_R0, &assetH);
         auto it = guestAssetMap_.find(assetH);
         uint32_t rem = 0;
-        if (it != guestAssetMap_.end() && it->second.fp) {
-            long cur = ftell(it->second.fp);
-            rem = (cur >= 0 && static_cast<size_t>(cur) < it->second.length) ? static_cast<uint32_t>(it->second.length - cur) : 0U;
+        if (it != guestAssetMap_.end()) {
+            if (it->second.vfsStream) {
+                off_t cur = it->second.vfsStream->tell();
+                if (cur >= 0 && static_cast<size_t>(cur) < it->second.length) {
+                    rem = static_cast<uint32_t>(it->second.length - cur);
+                }
+            } else if (it->second.fp) {
+                long cur = ftell(it->second.fp);
+                if (cur >= 0 && static_cast<size_t>(cur) < it->second.length) {
+                    rem = static_cast<uint32_t>(it->second.length - cur);
+                }
+            }
         }
         uc_reg_write(uc, UC_ARM_REG_R0, &rem);
         return;
@@ -5007,21 +5080,29 @@ void GuestRuntimeEnvironment::handleTrampolineCall(uint32_t trampolineId, uc_eng
         uint32_t assetH = 0;
         uc_reg_read(uc, UC_ARM_REG_R0, &assetH);
         auto it = guestAssetMap_.find(assetH);
-        if (it == guestAssetMap_.end() || !it->second.fp) {
+        if (it == guestAssetMap_.end()) {
             uint32_t zero = 0;
             uc_reg_write(uc, UC_ARM_REG_R0, &zero);
             return;
         }
 
-        if (it->second.bufferGuestAddr == 0) {
+        if (it->second.bufferGuestAddr == 0 && it->second.length > 0) {
             uint32_t gBuf = allocGuestHeap(uc, static_cast<uint32_t>(it->second.length + 16U), 16);
-            fseek(it->second.fp, 0, SEEK_SET);
-            std::vector<uint8_t> data(it->second.length);
-            if (it->second.length > 0) {
-                fread(data.data(), 1, it->second.length, it->second.fp);
-                uc_mem_write(uc, gBuf, data.data(), it->second.length);
+            if (gBuf != 0) {
+                if (it->second.vfsStream) {
+                    const uint8_t* raw = it->second.vfsStream->getBuffer();
+                    if (raw) {
+                        uc_mem_write(uc, gBuf, raw, it->second.length);
+                        it->second.bufferGuestAddr = gBuf;
+                    }
+                } else if (it->second.fp) {
+                    fseek(it->second.fp, 0, SEEK_SET);
+                    std::vector<uint8_t> data(it->second.length);
+                    fread(data.data(), 1, it->second.length, it->second.fp);
+                    uc_mem_write(uc, gBuf, data.data(), it->second.length);
+                    it->second.bufferGuestAddr = gBuf;
+                }
             }
-            it->second.bufferGuestAddr = gBuf;
         }
 
         uc_reg_write(uc, UC_ARM_REG_R0, &it->second.bufferGuestAddr);
@@ -5035,15 +5116,44 @@ void GuestRuntimeEnvironment::handleTrampolineCall(uint32_t trampolineId, uc_eng
         uc_reg_read(uc, UC_ARM_REG_R2, &outLength);
 
         auto it = guestAssetMap_.find(assetH);
-        if (it == guestAssetMap_.end() || !it->second.fp) {
+        if (it == guestAssetMap_.end()) {
             int err = -1;
             uc_reg_write(uc, UC_ARM_REG_R0, reinterpret_cast<uint32_t*>(&err));
             return;
         }
 
-        int fd = fileno(it->second.fp);
-        uint32_t start = 0;
+        int fd = -1;
+        uint32_t start = static_cast<uint32_t>(it->second.dataOffset);
         uint32_t len = static_cast<uint32_t>(it->second.length);
+
+        if (it->second.vfsStream) {
+            if (it->second.vfsStream->isStored()) {
+                fd = it->second.vfsStream->getContainerFd();
+                start = static_cast<uint32_t>(it->second.dataOffset);
+            } else {
+                const uint8_t* decomp = it->second.vfsStream->getBuffer();
+                if (decomp && len > 0) {
+                    FILE* tf = tmpfile();
+                    if (tf) {
+                        fwrite(decomp, 1, len, tf);
+                        fflush(tf);
+                        fseek(tf, 0, SEEK_SET);
+                        fd = fileno(tf);
+                        start = 0;
+                    }
+                }
+            }
+        } else if (it->second.fp) {
+            fd = fileno(it->second.fp);
+            start = 0;
+        }
+
+        if (fd < 0) {
+            int err = -1;
+            uc_reg_write(uc, UC_ARM_REG_R0, reinterpret_cast<uint32_t*>(&err));
+            return;
+        }
+
         if (outStart != 0) uc_mem_write(uc, outStart, &start, 4);
         if (outLength != 0) uc_mem_write(uc, outLength, &len, 4);
 
@@ -5065,6 +5175,7 @@ void GuestRuntimeEnvironment::handleTrampolineCall(uint32_t trampolineId, uc_eng
         auto it = guestAssetMap_.find(assetH);
         if (it != guestAssetMap_.end()) {
             if (it->second.fp) fclose(it->second.fp);
+            it->second.vfsStream.reset();
             guestAssetMap_.erase(it);
         }
         uint32_t zero = 0;
@@ -5078,12 +5189,12 @@ void GuestRuntimeEnvironment::handleTrampolineCall(uint32_t trampolineId, uc_eng
         uc_reg_read(uc, UC_ARM_REG_R1, &dirNamePtr);
         std::string dirName = readGuestCString(uc, dirNamePtr, 256);
 
-        std::string resolvedDir = filesDir_ + "/assets/" + packageName_ + "/" + dirName;
         uint32_t dirH = nextAssetDirHandle_++;
         GuestAssetDir gad;
         gad.id = dirH;
         gad.currentIndex = 0;
 
+        std::string resolvedDir = filesDir_ + "/assets/" + packageName_ + "/" + dirName;
         DIR* d = opendir(resolvedDir.c_str());
         if (d) {
             struct dirent* entry;
@@ -5094,7 +5205,13 @@ void GuestRuntimeEnvironment::handleTrampolineCall(uint32_t trampolineId, uc_eng
             }
             closedir(d);
         }
-        guestAssetDirMap_[dirH] = gad;
+
+        // Se la cartella fisica non esiste o e' vuota, interroga il Virtual File System OBB/APK
+        if (gad.files.empty()) {
+            gad.files = ZipArchiveVfs::getInstance().listDirectory(dirName);
+        }
+
+        guestAssetDirMap_[dirH] = std::move(gad);
         uc_reg_write(uc, UC_ARM_REG_R0, &dirH);
         return;
     }
