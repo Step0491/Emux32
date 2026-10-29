@@ -656,14 +656,31 @@ bool DbtEngine::startEmulation() {
     uint32_t activityPtr = 0x7d002900U;
     uint32_t winHandle = env.getJNIEnvPointer() + 0x2800U;
 
-    if (nativeActivityOnCreateAddr != 0 && env.getRegisteredMethods().empty()) {
+    bool hasJniLifecycle = false;
+    for (const auto& m : nativeMethods) {
+        std::string lower = m.name;
+        std::transform(lower.begin(), lower.end(), lower.begin(), ::tolower);
+        if (lower.find("init") != std::string::npos || lower.find("render") != std::string::npos ||
+            lower.find("file") != std::string::npos || lower.find("draw") != std::string::npos) {
+            hasJniLifecycle = true;
+            break;
+        }
+    }
+
+    if (nativeActivityOnCreateAddr != 0 && !hasJniLifecycle) {
         LOGI("ANativeActivity rilevata: avvio ANativeActivity_onCreate @ 0x%08x...", nativeActivityOnCreateAddr);
         uint32_t callbacksPtr = 0x7d002880U;
         uint32_t internalPathStr = env.createGuestCString(uc_, env.getFilesDir());
         uint32_t externalPathStr = env.createGuestCString(uc_, env.getObbDir().empty() ? env.getFilesDir() : env.getObbDir());
         uint32_t obbPathStr = env.createGuestCString(uc_, env.getObbDir());
 
+        std::vector<uint8_t> zeroAct(128, 0);
+        uc_mem_write(uc_, activityPtr, zeroAct.data(), zeroAct.size());
+        std::vector<uint8_t> zeroCb(64, 0);
+        uc_mem_write(uc_, callbacksPtr, zeroCb.data(), zeroCb.size());
+
         uint32_t sdkVer = 27;
+        uint32_t nullInst = 0;
         uint32_t mockAssetMgr = env.getJNIEnvPointer() + 0x2800U;
         uc_mem_write(uc_, activityPtr + 0, &callbacksPtr, 4);
         uc_mem_write(uc_, activityPtr + 4, &javaVMPtr, 4);
@@ -672,6 +689,7 @@ bool DbtEngine::startEmulation() {
         uc_mem_write(uc_, activityPtr + 16, &internalPathStr, 4);
         uc_mem_write(uc_, activityPtr + 20, &externalPathStr, 4);
         uc_mem_write(uc_, activityPtr + 24, &sdkVer, 4);
+        uc_mem_write(uc_, activityPtr + 28, &nullInst, 4);
         uc_mem_write(uc_, activityPtr + 32, &mockAssetMgr, 4);
         uc_mem_write(uc_, activityPtr + 36, &obbPathStr, 4);
 

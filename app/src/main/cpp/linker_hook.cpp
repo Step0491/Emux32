@@ -439,6 +439,32 @@ std::string SyscallDispatcher::resolveFilePath(const char* guestPath) {
                 if (access(customCand.c_str(), F_OK) == 0) {
                     return customCand;
                 }
+
+                if (sub.rfind("glu/", 0) == 0 || pkg.find("glu") != std::string::npos) {
+                    std::string gluSub = (sub.rfind("glu/", 0) == 0) ? sub.substr(4) : sub;
+                    std::vector<std::string> gluCands = {
+                        sCustomStoragePath + "/obb/" + pkg + "/" + sub,
+                        sCustomStoragePath + "/obb/" + pkg + "/" + gluSub,
+                        sCustomStoragePath + "/obb/com.glu.gladiator/" + sub,
+                        sCustomStoragePath + "/obb/com.glu.gladiator/" + gluSub,
+                        sCustomStoragePath + "/data/" + pkg + "/" + sub,
+                        sCustomStoragePath + "/data/" + pkg + "/" + gluSub,
+                        sCustomStoragePath + "/data/com.glu.gladiator/" + sub,
+                        sCustomStoragePath + "/data/com.glu.gladiator/" + gluSub
+                    };
+                    for (const auto& gc : gluCands) {
+                        if (access(gc.c_str(), F_OK) == 0) {
+                            LOGI("Redirezione Glu Mobile trovata: '%s' -> '%s'", guestPath, gc.c_str());
+                            return gc;
+                        }
+                    }
+                }
+
+                std::string obbCand1 = sCustomStoragePath + "/obb/" + pkg + "/" + sub;
+                if (access(obbCand1.c_str(), F_OK) == 0) return obbCand1;
+                std::string obbCand2 = sCustomStoragePath + "/obb/com.glu.gladiator/" + sub;
+                if (access(obbCand2.c_str(), F_OK) == 0) return obbCand2;
+
                 if (access(redirected.c_str(), F_OK) == 0) {
                     return redirected;
                 }

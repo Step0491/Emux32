@@ -394,16 +394,21 @@ class MainActivity : ComponentActivity() {
             // Linking cartelle Dati / Cache di gioco (es. unitycache per Blood & Glory)
             val baseStorage = resolveEmuxDirectory()
             val candidateSourceDataDirs = listOfNotNull(
+                rom.dataDir,
                 File(baseStorage, "obb/$pkg"),
                 File(baseStorage, "data/$pkg"),
                 File(baseStorage, "obb/com.glu.gladiator"),
                 File(baseStorage, "data/com.glu.gladiator"),
                 File(Environment.getExternalStorageDirectory(), "Android/data/$pkg")
-            )
+            ).distinctBy { it.absolutePath }
             val guestDataDir = File(filesDir, "guest_data/$pkg")
             val guestCacheDir = File(guestDataDir, "cache")
+            val guestGluDir = File(guestDataDir, "sdcard/glu")
+            val guestGluGladiatorDir = File(guestDataDir, "sdcard/glu/gladiator")
             if (!guestDataDir.exists()) guestDataDir.mkdirs()
             if (!guestCacheDir.exists()) guestCacheDir.mkdirs()
+            if (!guestGluDir.exists()) guestGluDir.mkdirs()
+            if (!guestGluGladiatorDir.exists()) guestGluGladiatorDir.mkdirs()
 
             for (srcDir in candidateSourceDataDirs) {
                 if (srcDir.exists() && srcDir.isDirectory) {
@@ -414,11 +419,19 @@ class MainActivity : ComponentActivity() {
                             try {
                                 val t1 = File(guestDataDir, item.name)
                                 val t2 = File(guestCacheDir, item.name)
+                                val t3 = File(guestGluDir, item.name)
+                                val t4 = File(guestGluGladiatorDir, item.name)
                                 if (!t1.exists()) {
                                     try { android.system.Os.symlink(item.absolutePath, t1.absolutePath) } catch (_: Exception) {}
                                 }
                                 if (!t2.exists()) {
                                     try { android.system.Os.symlink(item.absolutePath, t2.absolutePath) } catch (_: Exception) {}
+                                }
+                                if (!t3.exists()) {
+                                    try { android.system.Os.symlink(item.absolutePath, t3.absolutePath) } catch (_: Exception) {}
+                                }
+                                if (!t4.exists()) {
+                                    try { android.system.Os.symlink(item.absolutePath, t4.absolutePath) } catch (_: Exception) {}
                                 }
                             } catch (_: Exception) {}
                         }
@@ -432,31 +445,44 @@ class MainActivity : ComponentActivity() {
             EmuxLogger.i("Emux32", "[FASE 3/5] Analisi APK ed estrazione librerie native ARM32 (armeabi-v7a / armeabi)...")
             val zip = java.util.zip.ZipFile(apkFile)
             val allEntries = zip.entries().toList()
-            val hasArmV7a = allEntries.any { it.name.startsWith("lib/armeabi-v7a/") && it.name.endsWith(".so") }
-            val targetAbiPrefix = if (hasArmV7a) "lib/armeabi-v7a/" else "lib/armeabi/"
             val extractedSos = mutableListOf<File>()
+
+            // Raccoglie tutti i binari nativi .so con priorità ottimale ad armeabi-v7a
+            val soEntriesByName = mutableMapOf<String, java.util.zip.ZipEntry>()
+            for (entry in allEntries) {
+                if (entry.isDirectory || !entry.name.endsWith(".so")) continue
+                val soName = File(entry.name).name
+                if (entry.name.startsWith("lib/armeabi-v7a/")) {
+                    soEntriesByName[soName] = entry
+                } else if (entry.name.startsWith("lib/armeabi/") && !soEntriesByName.containsKey(soName)) {
+                    soEntriesByName[soName] = entry
+                } else if (entry.name.startsWith("lib/") && !soEntriesByName.containsKey(soName)) {
+                    soEntriesByName[soName] = entry
+                }
+            }
 
             val assetsTargetDir = File(cacheDir, "assets")
             if (!assetsTargetDir.exists()) assetsTargetDir.mkdirs()
             val filesAssetsDir = File(filesDir, "assets")
             if (!filesAssetsDir.exists()) filesAssetsDir.mkdirs()
 
-            var extractedAssetsCount = 0
+            for ((soName, entry) in soEntriesByName) {
+                val outFile = File(cacheDir, soName)
+                if (outFile.exists()) {
+                    outFile.delete()
+                }
+                zip.getInputStream(entry).use { inStream ->
+                    outFile.outputStream().use { outStream -> inStream.copyTo(outStream) }
+                }
+                if (outFile.length() > 0) {
+                    extractedSos.add(outFile)
+                    EmuxLogger.i("Emux32", "   -> Estratta libreria ARM32 (${entry.name}): $soName (${outFile.length()} byte)")
+                }
+            }
 
+            var extractedAssetsCount = 0
             for (entry in allEntries) {
-                if (entry.name.startsWith(targetAbiPrefix) && entry.name.endsWith(".so")) {
-                    val outFile = File(cacheDir, File(entry.name).name)
-                    if (outFile.exists()) {
-                        outFile.delete()
-                    }
-                    zip.getInputStream(entry).use { inStream ->
-                        outFile.outputStream().use { outStream -> inStream.copyTo(outStream) }
-                    }
-                    if (outFile.length() > 0) {
-                        extractedSos.add(outFile)
-                        EmuxLogger.i("Emux32", "   -> Estratta libreria ARM32 ($targetAbiPrefix): ${outFile.name} (${outFile.length()} byte)")
-                    }
-                } else if (entry.name.startsWith("assets/") && !entry.isDirectory) {
+                if (entry.name.startsWith("assets/") && !entry.isDirectory) {
                     val relPath = entry.name.substring("assets/".length)
                     val targetInCache = File(assetsTargetDir, relPath)
                     targetInCache.parentFile?.mkdirs()
@@ -551,8 +577,14 @@ class MainActivity : ComponentActivity() {
             try {
                 val dexOptDir = File(cacheDir, "dex_opt")
                 if (!dexOptDir.exists()) dexOptDir.mkdirs()
+                val safeDexFile = File(cacheDir, "game_dex/${apkFile.name}")
+                safeDexFile.parentFile?.mkdirs()
+                if (!safeDexFile.exists() || safeDexFile.length() != apkFile.length()) {
+                    apkFile.copyTo(safeDexFile, overwrite = true)
+                }
+                safeDexFile.setReadOnly() // Obbligatorio per Android 14+ ART (SDK 34-36)
                 val gameClassLoader = dalvik.system.DexClassLoader(
-                    apkFile.absolutePath,
+                    safeDexFile.absolutePath,
                     dexOptDir.absolutePath,
                     cacheDir.absolutePath,
                     classLoader

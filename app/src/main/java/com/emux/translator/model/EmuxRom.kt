@@ -21,6 +21,7 @@ data class EmuxRom(
     val coverUri: Uri?,
     val apkFile: File,
     val obbFiles: List<File> = emptyList(),
+    val dataDir: File? = null,
     val packageName: String? = null,
     val hasObb: Boolean = false,
     val hasData: Boolean = false,
@@ -48,20 +49,43 @@ fun scanEmuxStorage(context: Context, apkDir: File, obbDir: File): List<EmuxRom>
     val upscaledCoversDir = File(apkDir, ".upscaled_covers")
     if (!upscaledCoversDir.exists()) upscaledCoversDir.mkdirs()
 
-    // Raccoglie tutti i file .obb disponibili cercando ricorsivamente in:
+    // Raccoglie tutti i file .obb e cartelle dati disponibili cercando ricorsivamente in:
     // 1. obbDir configurata dall'emulatore (es. /storage/emulated/0/Emulators/Emux32/obb)
-    // 2. /storage/emulated/0/Android/obb (directory standard Android)
+    // 2. dataDir configurata dall'emulatore (es. /storage/emulated/0/Emulators/Emux32/data)
+    // 3. /storage/emulated/0/Android/obb e /storage/emulated/0/Android/data (standard Android)
     val allDiscoveredObbs = mutableListOf<File>()
+    val allDiscoveredDirs = mutableListOf<File>()
     try {
         if (obbDir.exists()) {
             obbDir.walkTopDown().filter { it.isFile && it.name.lowercase().endsWith(".obb") }.forEach {
                 allDiscoveredObbs.add(it)
+            }
+            obbDir.listFiles { file -> file.isDirectory }?.forEach {
+                allDiscoveredDirs.add(it)
+            }
+        }
+        val dataDir = File(obbDir.parentFile, "data")
+        if (dataDir.exists()) {
+            dataDir.walkTopDown().filter { it.isFile && it.name.lowercase().endsWith(".obb") }.forEach {
+                allDiscoveredObbs.add(it)
+            }
+            dataDir.listFiles { file -> file.isDirectory }?.forEach {
+                allDiscoveredDirs.add(it)
             }
         }
         val systemObbDir = File("/storage/emulated/0/Android/obb")
         if (systemObbDir.exists() && systemObbDir.canRead()) {
             systemObbDir.walkTopDown().maxDepth(3).filter { it.isFile && it.name.lowercase().endsWith(".obb") }.forEach {
                 allDiscoveredObbs.add(it)
+            }
+            systemObbDir.listFiles { file -> file.isDirectory }?.forEach {
+                allDiscoveredDirs.add(it)
+            }
+        }
+        val systemDataDir = File("/storage/emulated/0/Android/data")
+        if (systemDataDir.exists() && systemDataDir.canRead()) {
+            systemDataDir.listFiles { file -> file.isDirectory }?.forEach {
+                allDiscoveredDirs.add(it)
             }
         }
     } catch (e: Throwable) {
@@ -138,30 +162,51 @@ fun scanEmuxStorage(context: Context, apkDir: File, obbDir: File): List<EmuxRom>
             }
         }
 
-        // 6. Rilevamento cartelle Dati / Cache di gioco (es. unitycache per Blood & Glory)
-        var hasGameData = false
-        val baseDataDir = File(obbDir.parentFile, "data")
-        val candidateDataDirs = listOfNotNull(
-            cleanPkg?.let { File(obbDir, it) },
-            cleanPkg?.let { File(baseDataDir, it) },
-            cleanPkg?.let { File(File("/storage/emulated/0/Android/data"), it) },
-            File(obbDir, "com.glu.gladiator"),
-            File(baseDataDir, "com.glu.gladiator"),
-            File(File("/storage/emulated/0/Android/data"), "com.glu.gladiator")
-        )
-        for (candDir in candidateDataDirs) {
-            if (candDir.exists() && candDir.isDirectory) {
-                val subFiles = try {
-                    candDir.walkTopDown().maxDepth(3).filter { it.isFile }.take(5).toList()
-                } catch (_: Throwable) {
-                    emptyList()
+        // 6. Rilevamento cartelle Dati / Cache di gioco (es. cartella con sottocartelle per Blood & Glory)
+        var matchedDataDir: File? = null
+        for (candDir in allDiscoveredDirs) {
+            val dName = candDir.name.lowercase()
+            val cleanDir = dName.replace("[^a-z0-9]".toRegex(), "")
+            var dirMatched = false
+
+            if (cleanPkg != null && (dName == cleanPkg || dName.contains(cleanPkg) || cleanPkg.contains(dName))) {
+                dirMatched = true
+            }
+            if (!dirMatched && cleanDir.isNotEmpty() && (cleanDir.contains(cleanBase) || cleanBase.contains(cleanDir))) {
+                dirMatched = true
+            }
+            if (!dirMatched) {
+                if (cleanBase.contains("blood") || cleanBase.contains("glory")) {
+                    if (dName.contains("gladiator") || dName.contains("glu")) {
+                        dirMatched = true
+                    }
                 }
-                if (subFiles.isNotEmpty()) {
-                    hasGameData = true
+                if (cleanBase.contains("cardwars") || cleanBase.contains("card_wars")) {
+                    if (dName.contains("cardwars") || dName.contains("turner")) {
+                        dirMatched = true
+                    }
+                }
+            }
+
+            if (dirMatched) {
+                val hasItems = try {
+                    candDir.listFiles()?.isNotEmpty() == true
+                } catch (_: Throwable) { false }
+
+                if (hasItems) {
+                    matchedDataDir = candDir
+                    try {
+                        candDir.walkTopDown().filter { it.isFile && it.name.lowercase().endsWith(".obb") }.forEach {
+                            if (!matchedObbList.contains(it)) matchedObbList.add(it)
+                        }
+                    } catch (_: Throwable) {}
                     break
                 }
             }
         }
+
+        val hasGameData = (matchedDataDir != null)
+        val hasObb = matchedObbList.isNotEmpty() || hasGameData
 
         // Cerca copertina custom omonima (es: nome.jpg, nome.png, cover.jpg)
         var sourceCoverFile: File? = null
@@ -198,8 +243,9 @@ fun scanEmuxStorage(context: Context, apkDir: File, obbDir: File): List<EmuxRom>
                 coverUri = finalCoverUri,
                 apkFile = apkFile,
                 obbFiles = matchedObbList,
+                dataDir = matchedDataDir,
                 packageName = pkgName,
-                hasObb = matchedObbList.isNotEmpty(),
+                hasObb = hasObb,
                 hasData = hasGameData,
                 preferredOrientation = orientation
             )

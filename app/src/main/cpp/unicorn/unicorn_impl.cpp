@@ -531,7 +531,7 @@ struct UnicornInstance {
 
     inline void branchWritePC(uint32_t target) {
         itstate = 0;
-        if (target == 0xDEADBEEF || target == 0) {
+        if ((target & ~1U) == 0xDEADBEEEU || target == 0) {
             regs[15] = target;
             return;
         }
@@ -1217,6 +1217,11 @@ public:
     }
 
     std::optional<std::uint32_t> MemoryReadCode(Dynarmic::A32::VAddr vaddr) override {
+        if ((vaddr & ~1U) == 0xDEADBEEEU || vaddr == 0) {
+            inst_->dynarmic_jit->HaltExecution(Dynarmic::HaltReason::UserDefined2);
+            return std::nullopt;
+        }
+
         if ((vaddr & 0xFFFFF000U) == 0xFFFF0000U) {
             // [0xFFFF0FE0] __kuser_get_tls
             if (vaddr == 0xFFFF0FE0U) return 0xee1d0f70U; // mrc p15, 0, r0, c13, c0, 3
@@ -1270,6 +1275,11 @@ public:
             exception == Dynarmic::A32::Exception::SendEvent ||
             exception == Dynarmic::A32::Exception::SendEventLocal) {
             sched_yield();
+            return;
+        }
+
+        if ((pc & ~1U) == 0xDEADBEEEU || pc == 0) {
+            inst_->dynarmic_jit->HaltExecution(Dynarmic::HaltReason::UserDefined2);
             return;
         }
 
@@ -1380,20 +1390,20 @@ uc_err UnicornInstance::runDynarmic(uint64_t begin, uint64_t until, size_t count
            !stop_requested.load(std::memory_order_relaxed)) {
         uint32_t curPc = dynarmic_jit->Regs()[15];
 
-        if (targetUntil != 0 && curPc == targetUntil) {
+        if (targetUntil != 0 && (curPc & ~1U) == (targetUntil & ~1U)) {
             break;
         }
-        if (curPc == 0xDEADBEEFU || curPc == 0) {
+        if ((curPc & ~1U) == 0xDEADBEEEU || curPc == 0) {
             break;
         }
 
         Dynarmic::HaltReason hr = dynarmic_jit->Run();
 
         curPc = dynarmic_jit->Regs()[15];
-        if (targetUntil != 0 && curPc == targetUntil) {
+        if (targetUntil != 0 && (curPc & ~1U) == (targetUntil & ~1U)) {
             break;
         }
-        if (curPc == 0xDEADBEEFU || curPc == 0) {
+        if ((curPc & ~1U) == 0xDEADBEEEU || curPc == 0) {
             break;
         }
 
@@ -1401,13 +1411,18 @@ uc_err UnicornInstance::runDynarmic(uint64_t begin, uint64_t until, size_t count
             break;
         }
 
-        if (Dynarmic::Has(hr, Dynarmic::HaltReason::UserDefined2)) {
+        if (Dynarmic::Has(hr, Dynarmic::HaltReason::UserDefined2) ||
+            Dynarmic::Has(hr, Dynarmic::HaltReason::UserDefined1)) {
             break;
         }
 
         if (count > 0) {
             break;
         }
+    }
+
+    if ((dynarmic_jit->Regs()[15] & ~1U) == 0xDEADBEEEU) {
+        dynarmic_jit->Regs()[15] = targetUntil ? targetUntil : 0xDEADBEEFU;
     }
 
     auto& finalRegs = dynarmic_jit->Regs();
@@ -1962,8 +1977,8 @@ uc_err runInterpreter(UnicornInstance* inst, uint64_t begin, uint64_t until, siz
     while (inst->is_running.load(std::memory_order_relaxed) && !inst->stop_requested.load(std::memory_order_relaxed)) {
         uint32_t pc = inst->regs[15];
 
-        if (until != 0 && pc == static_cast<uint32_t>(until)) break;
-        if (pc == 0xDEADBEEF) break;
+        if (until != 0 && (pc & ~1U) == (static_cast<uint32_t>(until) & ~1U)) break;
+        if ((pc & ~1U) == 0xDEADBEEEU || pc == 0) break;
 
         // Linux ARM32 Kernel User Helpers (0xFFFF0F60 .. 0xFFFF0FE0)
         if ((pc & 0xFFFFF000U) == 0xFFFF0000U) {
@@ -2018,7 +2033,7 @@ uc_err runInterpreter(UnicornInstance* inst, uint64_t begin, uint64_t until, siz
             if (emux::GuestSignalManager::getInstance().deliverSignal(reinterpret_cast<uc_engine*>(inst), emux::GUEST_SIGSEGV, pc, 1)) {
                 continue;
             }
-            if (lr >= 0x1000U && lr != 0xDEADBEEFU && lr != lastValidPc && nullRecoveries < 64) {
+            if (lr >= 0x1000U && (lr & ~1U) != 0xDEADBEEEU && lr != lastValidPc && nullRecoveries < 64) {
                 nullRecoveries++;
                 inst->regs[0] = 0;
                 inst->branchWritePC(lr);
@@ -2046,7 +2061,7 @@ uc_err runInterpreter(UnicornInstance* inst, uint64_t begin, uint64_t until, siz
                 if (emux::GuestSignalManager::getInstance().deliverSignal(reinterpret_cast<uc_engine*>(inst), emux::GUEST_SIGSEGV, pc, 1)) {
                     continue;
                 }
-                if (inst->regs[14] >= 0x1000U && inst->regs[14] != 0xDEADBEEFU && nullRecoveries < 32) {
+                if (inst->regs[14] >= 0x1000U && (inst->regs[14] & ~1U) != 0xDEADBEEEU && nullRecoveries < 32) {
                     nullRecoveries++;
                     inst->regs[0] = 0;
                     inst->branchWritePC(inst->regs[14]);
@@ -2439,7 +2454,7 @@ uc_err runInterpreter(UnicornInstance* inst, uint64_t begin, uint64_t until, siz
                 if (emux::GuestSignalManager::getInstance().deliverSignal(reinterpret_cast<uc_engine*>(inst), emux::GUEST_SIGSEGV, pc, 1)) {
                     continue;
                 }
-                if (inst->regs[14] >= 0x1000U && inst->regs[14] != 0xDEADBEEFU && nullRecoveries < 32) {
+                if (inst->regs[14] >= 0x1000U && (inst->regs[14] & ~1U) != 0xDEADBEEEU && nullRecoveries < 32) {
                     nullRecoveries++;
                     inst->regs[0] = 0;
                     inst->branchWritePC(inst->regs[14]);
