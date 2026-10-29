@@ -809,8 +809,10 @@ void DbtEngine::onInterrupt(uint32_t intno) {
     uc_reg_read(uc_, UC_ARM_REG_R5, &r5);
 
     int32_t ret = SyscallDispatcher::handleSyscall(r7, r0, r1, r2, r3, r4, r5, uc_);
-    uint32_t retVal = static_cast<uint32_t>(ret);
-    uc_reg_write(uc_, UC_ARM_REG_R0, &retVal);
+    if (r7 != 173) { // 173 = rt_sigreturn (lo stato dei registri è già stato ripristinato da ucontext_t)
+        uint32_t retVal = static_cast<uint32_t>(ret);
+        uc_reg_write(uc_, UC_ARM_REG_R0, &retVal);
+    }
 }
 
 } // namespace emux

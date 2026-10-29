@@ -1015,6 +1015,212 @@ void GuestRuntimeEnvironment::handleJavaVmCall(uint32_t slotIndex, uc_engine* uc
     uc_reg_write(uc, UC_ARM_REG_R0, &retOk);
 }
 
+jobject GuestRuntimeEnvironment::resolveHostObject(uint32_t guestHandle, JNIEnv* hostEnv, uc_engine* uc) {
+    if (!hostEnv || guestHandle == 0) return nullptr;
+
+    auto oit = hostObjectMap_.find(guestHandle);
+    if (oit != hostObjectMap_.end()) {
+        return oit->second;
+    }
+
+    auto cit = hostClassMap_.find(guestHandle);
+    if (cit != hostClassMap_.end()) {
+        return cit->second;
+    }
+
+    auto sit = jstringMap_.find(guestHandle);
+    if (sit != jstringMap_.end()) {
+        return hostEnv->NewStringUTF(sit->second.c_str());
+    }
+
+    if (uc && guestHandle >= 0x10000 && guestHandle < 0xFF000000) {
+        std::string rawStr = readGuestCString(uc, guestHandle, 256);
+        if (!rawStr.empty()) {
+            return hostEnv->NewStringUTF(rawStr.c_str());
+        }
+    }
+
+    return nullptr;
+}
+
+struct JniArgUnpackResult {
+    std::vector<jvalue> args;
+    std::vector<jobject> localRefsToDelete;
+};
+
+static JniArgUnpackResult unpackJniArguments(
+    uc_engine* uc,
+    const std::string& signature,
+    uint32_t r3,
+    uint32_t slotIndex,
+    JNIEnv* hostEnv,
+    GuestRuntimeEnvironment& env
+) {
+    JniArgUnpackResult result;
+    size_t openParen = signature.find('(');
+    size_t closeParen = signature.find(')');
+    if (openParen == std::string::npos || closeParen == std::string::npos) {
+        return result;
+    }
+
+    uint32_t sp = 0;
+    uc_reg_read(uc, UC_ARM_REG_SP, &sp);
+
+    int callMode = 0; // 0=variadic, 1=va_list, 2=array
+    if (slotIndex >= 28 && slotIndex <= 30) {
+        callMode = (slotIndex - 28);
+    } else if (slotIndex >= 34 && slotIndex <= 93) {
+        callMode = (slotIndex - 34) % 3;
+    } else if (slotIndex >= 114 && slotIndex <= 143) {
+        callMode = (slotIndex - 114) % 3;
+    }
+
+    size_t sigIdx = openParen + 1;
+    int regIdx = 3;
+    uint32_t stackOff = 0;
+    uint32_t vaListPtr = r3;
+    uint32_t jvaluePtr = r3;
+    size_t argIndex = 0;
+
+    if (slotIndex >= 64 && slotIndex <= 93) {
+        regIdx = 4;
+        if (callMode == 1 || callMode == 2) {
+            uc_mem_read(uc, sp, &vaListPtr, 4);
+            jvaluePtr = vaListPtr;
+            stackOff = 4;
+        }
+    }
+
+    auto readNextWord = [&]() -> uint32_t {
+        if (callMode == 1) { // va_list
+            uint32_t w = 0;
+            uc_mem_read(uc, vaListPtr, &w, 4);
+            vaListPtr += 4;
+            return w;
+        } else { // variadic
+            if (regIdx == 3) {
+                regIdx = 4;
+                return r3;
+            }
+            uint32_t w = 0;
+            uc_mem_read(uc, sp + stackOff, &w, 4);
+            stackOff += 4;
+            return w;
+        }
+    };
+
+    while (sigIdx < closeParen) {
+        char type = signature[sigIdx++];
+        jvalue val{};
+
+        if (callMode == 2) { // Array jvalue*
+            uint64_t rawVal = 0;
+            uc_mem_read(uc, jvaluePtr + (argIndex * 8), &rawVal, 8);
+            argIndex++;
+
+            switch (type) {
+                case 'Z': val.z = static_cast<jboolean>(rawVal & 0xFF); break;
+                case 'B': val.b = static_cast<jbyte>(rawVal & 0xFF); break;
+                case 'C': val.c = static_cast<jchar>(rawVal & 0xFFFF); break;
+                case 'S': val.s = static_cast<jshort>(rawVal & 0xFFFF); break;
+                case 'I': val.i = static_cast<jint>(rawVal & 0xFFFFFFFFU); break;
+                case 'J': val.j = static_cast<jlong>(rawVal); break;
+                case 'F': {
+                    uint32_t rawF = static_cast<uint32_t>(rawVal);
+                    std::memcpy(&val.f, &rawF, 4);
+                    break;
+                }
+                case 'D': {
+                    std::memcpy(&val.d, &rawVal, 8);
+                    break;
+                }
+                case 'L': {
+                    while (sigIdx < closeParen && signature[sigIdx++] != ';') {}
+                    uint32_t h = static_cast<uint32_t>(rawVal & 0xFFFFFFFFU);
+                    jobject obj = env.resolveHostObject(h, hostEnv, uc);
+                    if (obj) result.localRefsToDelete.push_back(obj);
+                    val.l = obj;
+                    break;
+                }
+                case '[': {
+                    while (sigIdx < closeParen && signature[sigIdx] == '[') sigIdx++;
+                    if (sigIdx < closeParen && signature[sigIdx] == 'L') {
+                        while (sigIdx < closeParen && signature[sigIdx++] != ';') {}
+                    } else if (sigIdx < closeParen) {
+                        sigIdx++;
+                    }
+                    uint32_t h = static_cast<uint32_t>(rawVal & 0xFFFFFFFFU);
+                    jobject obj = env.resolveHostObject(h, hostEnv, uc);
+                    if (obj) result.localRefsToDelete.push_back(obj);
+                    val.l = obj;
+                    break;
+                }
+            }
+            result.args.push_back(val);
+            continue;
+        }
+
+        switch (type) {
+            case 'Z': val.z = static_cast<jboolean>(readNextWord() != 0); break;
+            case 'B': val.b = static_cast<jbyte>(readNextWord()); break;
+            case 'C': val.c = static_cast<jchar>(readNextWord()); break;
+            case 'S': val.s = static_cast<jshort>(readNextWord()); break;
+            case 'I': val.i = static_cast<jint>(readNextWord()); break;
+            case 'F': {
+                uint32_t raw = readNextWord();
+                std::memcpy(&val.f, &raw, 4);
+                break;
+            }
+            case 'J':
+            case 'D': {
+                uint32_t lo = 0, hi = 0;
+                if (callMode == 1) { // va_list
+                    if (vaListPtr % 8 != 0) vaListPtr = (vaListPtr + 7) & ~7U;
+                    uc_mem_read(uc, vaListPtr, &lo, 4);
+                    uc_mem_read(uc, vaListPtr + 4, &hi, 4);
+                    vaListPtr += 8;
+                } else { // variadic AAPCS
+                    if (regIdx == 3) {
+                        regIdx = 4;
+                    }
+                    if (stackOff % 8 != 0) stackOff = (stackOff + 7) & ~7U;
+                    uc_mem_read(uc, sp + stackOff, &lo, 4);
+                    uc_mem_read(uc, sp + stackOff + 4, &hi, 4);
+                    stackOff += 8;
+                }
+                uint64_t raw64 = (static_cast<uint64_t>(hi) << 32) | lo;
+                if (type == 'J') val.j = static_cast<jlong>(raw64);
+                else std::memcpy(&val.d, &raw64, 8);
+                break;
+            }
+            case 'L': {
+                while (sigIdx < closeParen && signature[sigIdx++] != ';') {}
+                uint32_t h = readNextWord();
+                jobject obj = env.resolveHostObject(h, hostEnv, uc);
+                if (obj) result.localRefsToDelete.push_back(obj);
+                val.l = obj;
+                break;
+            }
+            case '[': {
+                while (sigIdx < closeParen && signature[sigIdx] == '[') sigIdx++;
+                if (sigIdx < closeParen && signature[sigIdx] == 'L') {
+                    while (sigIdx < closeParen && signature[sigIdx++] != ';') {}
+                } else if (sigIdx < closeParen) {
+                    sigIdx++;
+                }
+                uint32_t h = readNextWord();
+                jobject obj = env.resolveHostObject(h, hostEnv, uc);
+                if (obj) result.localRefsToDelete.push_back(obj);
+                val.l = obj;
+                break;
+            }
+        }
+        result.args.push_back(val);
+    }
+
+    return result;
+}
+
 void GuestRuntimeEnvironment::handleJniCall(uint32_t slotIndex, uc_engine* uc) {
     uint32_t r1 = 0, r2 = 0, r3 = 0;
     uc_reg_read(uc, UC_ARM_REG_R1, &r1);
@@ -1064,6 +1270,23 @@ void GuestRuntimeEnvironment::handleJniCall(uint32_t slotIndex, uc_engine* uc) {
 
         case 10: // GetSuperclass
         case 31: { // GetObjectClass(env, jobject obj)
+            if (slotIndex == 31 && hostJavaVm_ && r1 != 0) {
+                auto hit = hostObjectMap_.find(r1);
+                if (hit != hostObjectMap_.end()) {
+                    JNIEnv* hostEnv = nullptr;
+                    if (hostJavaVm_->GetEnv(reinterpret_cast<void**>(&hostEnv), JNI_VERSION_1_6) == JNI_OK && hostEnv) {
+                        jclass objCls = hostEnv->GetObjectClass(hit->second);
+                        if (hostEnv->ExceptionCheck()) hostEnv->ExceptionClear();
+                        if (objCls) {
+                            uint32_t handle = nextMockHandle_++;
+                            hostClassMap_[handle] = static_cast<jclass>(hostEnv->NewGlobalRef(objCls));
+                            hostEnv->DeleteLocalRef(objCls);
+                            setReturnU32(handle);
+                            return;
+                        }
+                    }
+                }
+            }
             auto it = classHandleMap_.find(r1);
             if (it != classHandleMap_.end()) {
                 setReturnU32(r1);
@@ -1108,6 +1331,16 @@ void GuestRuntimeEnvironment::handleJniCall(uint32_t slotIndex, uc_engine* uc) {
         case 22: // DeleteGlobalRef
         case 23: // DeleteLocalRef
         case 227: // DeleteWeakGlobalRef
+            if (hostJavaVm_ && r1 != 0) {
+                auto hit = hostObjectMap_.find(r1);
+                if (hit != hostObjectMap_.end()) {
+                    JNIEnv* hostEnv = nullptr;
+                    if (hostJavaVm_->GetEnv(reinterpret_cast<void**>(&hostEnv), JNI_VERSION_1_6) == JNI_OK && hostEnv) {
+                        hostEnv->DeleteGlobalRef(hit->second);
+                    }
+                    hostObjectMap_.erase(hit);
+                }
+            }
             setReturnU32(0);
             return;
 
@@ -1119,6 +1352,33 @@ void GuestRuntimeEnvironment::handleJniCall(uint32_t slotIndex, uc_engine* uc) {
             if (classHandleMap_.count(r1)) {
                 classHandleMap_[handle] = classHandleMap_[r1];
             }
+
+            if (hostClassMap_.count(r1) && hostJavaVm_) {
+                JNIEnv* hostEnv = nullptr;
+                if (hostJavaVm_->GetEnv(reinterpret_cast<void**>(&hostEnv), JNI_VERSION_1_6) == JNI_OK && hostEnv) {
+                    jclass realCls = hostClassMap_[r1];
+                    jobject realObj = nullptr;
+                    if (slotIndex == 27) {
+                        realObj = hostEnv->AllocObject(realCls);
+                    } else if (hostMethodMap_.count(r2)) {
+                        jmethodID initMethod = hostMethodMap_[r2];
+                        std::string sig = methodHandleMap_.count(r2) ? methodHandleMap_[r2].signature : "()V";
+                        auto unpacked = unpackJniArguments(uc, sig, r3, slotIndex, hostEnv, *this);
+                        realObj = hostEnv->NewObjectA(realCls, initMethod, unpacked.args.data());
+                        for (auto ref : unpacked.localRefsToDelete) {
+                            hostEnv->DeleteLocalRef(ref);
+                        }
+                    }
+                    if (hostEnv->ExceptionCheck()) hostEnv->ExceptionClear();
+                    if (realObj) {
+                        hostObjectMap_[handle] = hostEnv->NewGlobalRef(realObj);
+                        hostEnv->DeleteLocalRef(realObj);
+                        LOGI("JNI NewObject instanziato vero oggetto host ART per %s (handle=0x%x)",
+                             classHandleMap_[r1].c_str(), handle);
+                    }
+                }
+            }
+
             setReturnU32(handle);
             return;
         }
@@ -1174,17 +1434,42 @@ void GuestRuntimeEnvironment::handleJniCall(uint32_t slotIndex, uc_engine* uc) {
             if (hit != hostMethodMap_.end() && hostJavaVm_) {
                 JNIEnv* hostEnv = nullptr;
                 if (hostJavaVm_->GetEnv(reinterpret_cast<void**>(&hostEnv), JNI_VERSION_1_6) == JNI_OK && hostEnv) {
+                    bool isStatic = (slotIndex >= 114);
                     jclass realCls = hostClassMap_.count(r1) ? hostClassMap_[r1] : nullptr;
-                    if (realCls && (slotIndex >= 114)) {
-                        jobject resObj = hostEnv->CallStaticObjectMethod(realCls, hit->second);
+                    jobject targetObj = isStatic ? nullptr : resolveHostObject(r1, hostEnv, uc);
+                    if ((isStatic && realCls) || (!isStatic && targetObj)) {
+                        std::string sig = methodHandleMap_.count(r2) ? methodHandleMap_[r2].signature : "()Ljava/lang/Object;";
+                        auto unpacked = unpackJniArguments(uc, sig, r3, slotIndex, hostEnv, *this);
+                        jobject resObj = isStatic
+                            ? hostEnv->CallStaticObjectMethodA(realCls, hit->second, unpacked.args.data())
+                            : hostEnv->CallObjectMethodA(targetObj, hit->second, unpacked.args.data());
+                        for (auto ref : unpacked.localRefsToDelete) {
+                            hostEnv->DeleteLocalRef(ref);
+                        }
                         if (hostEnv->ExceptionCheck()) hostEnv->ExceptionClear();
                         if (resObj) {
+                            jclass strCls = hostEnv->FindClass("java/lang/String");
+                            if (strCls && hostEnv->IsInstanceOf(resObj, strCls)) {
+                                const char* utf = hostEnv->GetStringUTFChars(static_cast<jstring>(resObj), nullptr);
+                                uint32_t guestStr = createGuestJString(uc, utf ? utf : "");
+                                if (utf) hostEnv->ReleaseStringUTFChars(static_cast<jstring>(resObj), utf);
+                                hostEnv->DeleteLocalRef(strCls);
+                                hostEnv->DeleteLocalRef(resObj);
+                                setReturnU32(guestStr);
+                                return;
+                            }
+                            if (strCls) hostEnv->DeleteLocalRef(strCls);
+
                             uint32_t objH = nextMockHandle_++;
                             jclass objCls = hostEnv->GetObjectClass(resObj);
                             hostClassMap_[objH] = static_cast<jclass>(hostEnv->NewGlobalRef(objCls));
+                            hostObjectMap_[objH] = hostEnv->NewGlobalRef(resObj);
                             hostEnv->DeleteLocalRef(objCls);
                             hostEnv->DeleteLocalRef(resObj);
                             setReturnU32(objH);
+                            return;
+                        } else {
+                            setReturnU32(0);
                             return;
                         }
                     }
@@ -1359,9 +1644,18 @@ void GuestRuntimeEnvironment::handleJniCall(uint32_t slotIndex, uc_engine* uc) {
             if (hit != hostMethodMap_.end() && hostJavaVm_) {
                 JNIEnv* hostEnv = nullptr;
                 if (hostJavaVm_->GetEnv(reinterpret_cast<void**>(&hostEnv), JNI_VERSION_1_6) == JNI_OK && hostEnv) {
+                    bool isStatic = (slotIndex >= 117);
                     jclass realCls = hostClassMap_.count(r1) ? hostClassMap_[r1] : nullptr;
-                    if (realCls && (slotIndex >= 117)) {
-                        jboolean bRes = hostEnv->CallStaticBooleanMethod(realCls, hit->second);
+                    jobject targetObj = isStatic ? nullptr : resolveHostObject(r1, hostEnv, uc);
+                    if ((isStatic && realCls) || (!isStatic && targetObj)) {
+                        std::string sig = methodHandleMap_.count(r2) ? methodHandleMap_[r2].signature : "()Z";
+                        auto unpacked = unpackJniArguments(uc, sig, r3, slotIndex, hostEnv, *this);
+                        jboolean bRes = isStatic
+                            ? hostEnv->CallStaticBooleanMethodA(realCls, hit->second, unpacked.args.data())
+                            : hostEnv->CallBooleanMethodA(targetObj, hit->second, unpacked.args.data());
+                        for (auto ref : unpacked.localRefsToDelete) {
+                            hostEnv->DeleteLocalRef(ref);
+                        }
                         if (hostEnv->ExceptionCheck()) hostEnv->ExceptionClear();
                         setReturnU32(bRes ? 1U : 0U);
                         return;
@@ -1380,9 +1674,18 @@ void GuestRuntimeEnvironment::handleJniCall(uint32_t slotIndex, uc_engine* uc) {
             if (hit != hostMethodMap_.end() && hostJavaVm_) {
                 JNIEnv* hostEnv = nullptr;
                 if (hostJavaVm_->GetEnv(reinterpret_cast<void**>(&hostEnv), JNI_VERSION_1_6) == JNI_OK && hostEnv) {
+                    bool isStatic = (slotIndex >= 129);
                     jclass realCls = hostClassMap_.count(r1) ? hostClassMap_[r1] : nullptr;
-                    if (realCls && (slotIndex >= 129)) {
-                        jint iRes = hostEnv->CallStaticIntMethod(realCls, hit->second);
+                    jobject targetObj = isStatic ? nullptr : resolveHostObject(r1, hostEnv, uc);
+                    if ((isStatic && realCls) || (!isStatic && targetObj)) {
+                        std::string sig = methodHandleMap_.count(r2) ? methodHandleMap_[r2].signature : "()I";
+                        auto unpacked = unpackJniArguments(uc, sig, r3, slotIndex, hostEnv, *this);
+                        jint iRes = isStatic
+                            ? hostEnv->CallStaticIntMethodA(realCls, hit->second, unpacked.args.data())
+                            : hostEnv->CallIntMethodA(targetObj, hit->second, unpacked.args.data());
+                        for (auto ref : unpacked.localRefsToDelete) {
+                            hostEnv->DeleteLocalRef(ref);
+                        }
                         if (hostEnv->ExceptionCheck()) hostEnv->ExceptionClear();
                         setReturnU32(static_cast<uint32_t>(iRes));
                         return;
@@ -1463,6 +1766,79 @@ void GuestRuntimeEnvironment::handleJniCall(uint32_t slotIndex, uc_engine* uc) {
             return;
         }
 
+        // CallLongMethod / CallStaticLongMethod
+        case 52: case 53: case 54:
+        case 82: case 83: case 84:
+        case 132: case 133: case 134: {
+            auto hit = hostMethodMap_.find(r2);
+            if (hit != hostMethodMap_.end() && hostJavaVm_) {
+                JNIEnv* hostEnv = nullptr;
+                if (hostJavaVm_->GetEnv(reinterpret_cast<void**>(&hostEnv), JNI_VERSION_1_6) == JNI_OK && hostEnv) {
+                    bool isStatic = (slotIndex >= 132);
+                    jclass realCls = hostClassMap_.count(r1) ? hostClassMap_[r1] : nullptr;
+                    jobject targetObj = isStatic ? nullptr : resolveHostObject(r1, hostEnv, uc);
+                    if ((isStatic && realCls) || (!isStatic && targetObj)) {
+                        std::string sig = methodHandleMap_.count(r2) ? methodHandleMap_[r2].signature : "()J";
+                        auto unpacked = unpackJniArguments(uc, sig, r3, slotIndex, hostEnv, *this);
+                        jlong jRes = isStatic
+                            ? hostEnv->CallStaticLongMethodA(realCls, hit->second, unpacked.args.data())
+                            : hostEnv->CallLongMethodA(targetObj, hit->second, unpacked.args.data());
+                        for (auto ref : unpacked.localRefsToDelete) {
+                            hostEnv->DeleteLocalRef(ref);
+                        }
+                        if (hostEnv->ExceptionCheck()) hostEnv->ExceptionClear();
+                        uint32_t lo = static_cast<uint32_t>(jRes & 0xFFFFFFFFU);
+                        uint32_t hi = static_cast<uint32_t>((jRes >> 32) & 0xFFFFFFFFU);
+                        uc_reg_write(uc, UC_ARM_REG_R0, &lo);
+                        uc_reg_write(uc, UC_ARM_REG_R1, &hi);
+                        return;
+                    }
+                }
+            }
+            uint32_t zero = 0;
+            uc_reg_write(uc, UC_ARM_REG_R0, &zero);
+            uc_reg_write(uc, UC_ARM_REG_R1, &zero);
+            return;
+        }
+
+        // CallDoubleMethod / CallStaticDoubleMethod
+        case 58: case 59: case 60:
+        case 88: case 89: case 90:
+        case 138: case 139: case 140: {
+            auto hit = hostMethodMap_.find(r2);
+            if (hit != hostMethodMap_.end() && hostJavaVm_) {
+                JNIEnv* hostEnv = nullptr;
+                if (hostJavaVm_->GetEnv(reinterpret_cast<void**>(&hostEnv), JNI_VERSION_1_6) == JNI_OK && hostEnv) {
+                    bool isStatic = (slotIndex >= 138);
+                    jclass realCls = hostClassMap_.count(r1) ? hostClassMap_[r1] : nullptr;
+                    jobject targetObj = isStatic ? nullptr : resolveHostObject(r1, hostEnv, uc);
+                    if ((isStatic && realCls) || (!isStatic && targetObj)) {
+                        std::string sig = methodHandleMap_.count(r2) ? methodHandleMap_[r2].signature : "()D";
+                        auto unpacked = unpackJniArguments(uc, sig, r3, slotIndex, hostEnv, *this);
+                        jdouble dRes = isStatic
+                            ? hostEnv->CallStaticDoubleMethodA(realCls, hit->second, unpacked.args.data())
+                            : hostEnv->CallDoubleMethodA(targetObj, hit->second, unpacked.args.data());
+                        for (auto ref : unpacked.localRefsToDelete) {
+                            hostEnv->DeleteLocalRef(ref);
+                        }
+                        if (hostEnv->ExceptionCheck()) hostEnv->ExceptionClear();
+                        uint64_t raw64 = 0;
+                        std::memcpy(&raw64, &dRes, 8);
+                        uint32_t lo = static_cast<uint32_t>(raw64 & 0xFFFFFFFFU);
+                        uint32_t hi = static_cast<uint32_t>((raw64 >> 32) & 0xFFFFFFFFU);
+                        uc_reg_write(uc, UC_ARM_REG_R0, &lo);
+                        uc_reg_write(uc, UC_ARM_REG_R1, &hi);
+                        uc_reg_write(uc, UC_ARM_REG_D0, &raw64);
+                        return;
+                    }
+                }
+            }
+            uint32_t zero = 0;
+            uc_reg_write(uc, UC_ARM_REG_R0, &zero);
+            uc_reg_write(uc, UC_ARM_REG_R1, &zero);
+            return;
+        }
+
         // CallVoidMethod / CallNonvirtualVoidMethod / CallStaticVoidMethod
         case 61: case 62: case 63:
         case 91: case 92: case 93:
@@ -1471,13 +1847,24 @@ void GuestRuntimeEnvironment::handleJniCall(uint32_t slotIndex, uc_engine* uc) {
             if (hit != hostMethodMap_.end() && hostJavaVm_) {
                 JNIEnv* hostEnv = nullptr;
                 if (hostJavaVm_->GetEnv(reinterpret_cast<void**>(&hostEnv), JNI_VERSION_1_6) == JNI_OK && hostEnv) {
+                    bool isStatic = (slotIndex >= 141);
                     jclass realCls = hostClassMap_.count(r1) ? hostClassMap_[r1] : nullptr;
-                    if (realCls && (slotIndex >= 141)) {
-                        hostEnv->CallStaticVoidMethod(realCls, hit->second);
+                    jobject targetObj = isStatic ? nullptr : resolveHostObject(r1, hostEnv, uc);
+                    if ((isStatic && realCls) || (!isStatic && targetObj)) {
+                        std::string sig = methodHandleMap_.count(r2) ? methodHandleMap_[r2].signature : "()V";
+                        auto unpacked = unpackJniArguments(uc, sig, r3, slotIndex, hostEnv, *this);
+                        if (isStatic) {
+                            hostEnv->CallStaticVoidMethodA(realCls, hit->second, unpacked.args.data());
+                        } else {
+                            hostEnv->CallVoidMethodA(targetObj, hit->second, unpacked.args.data());
+                        }
+                        for (auto ref : unpacked.localRefsToDelete) {
+                            hostEnv->DeleteLocalRef(ref);
+                        }
+                        if (hostEnv->ExceptionCheck()) hostEnv->ExceptionClear();
+                        setReturnU32(0);
+                        return;
                     }
-                    if (hostEnv->ExceptionCheck()) hostEnv->ExceptionClear();
-                    setReturnU32(0);
-                    return;
                 }
             }
             auto mit = methodHandleMap_.find(r2);
@@ -1503,6 +1890,32 @@ void GuestRuntimeEnvironment::handleJniCall(uint32_t slotIndex, uc_engine* uc) {
         case 55: case 56: case 57:
         case 85: case 86: case 87:
         case 135: case 136: case 137: {
+            auto hit = hostMethodMap_.find(r2);
+            if (hit != hostMethodMap_.end() && hostJavaVm_) {
+                JNIEnv* hostEnv = nullptr;
+                if (hostJavaVm_->GetEnv(reinterpret_cast<void**>(&hostEnv), JNI_VERSION_1_6) == JNI_OK && hostEnv) {
+                    bool isStatic = (slotIndex >= 135);
+                    jclass realCls = hostClassMap_.count(r1) ? hostClassMap_[r1] : nullptr;
+                    jobject targetObj = isStatic ? nullptr : resolveHostObject(r1, hostEnv, uc);
+                    if ((isStatic && realCls) || (!isStatic && targetObj)) {
+                        std::string sig = methodHandleMap_.count(r2) ? methodHandleMap_[r2].signature : "()F";
+                        auto unpacked = unpackJniArguments(uc, sig, r3, slotIndex, hostEnv, *this);
+                        jfloat fRes = isStatic
+                            ? hostEnv->CallStaticFloatMethodA(realCls, hit->second, unpacked.args.data())
+                            : hostEnv->CallFloatMethodA(targetObj, hit->second, unpacked.args.data());
+                        for (auto ref : unpacked.localRefsToDelete) {
+                            hostEnv->DeleteLocalRef(ref);
+                        }
+                        if (hostEnv->ExceptionCheck()) hostEnv->ExceptionClear();
+                        uint32_t raw = 0;
+                        std::memcpy(&raw, &fRes, 4);
+                        setReturnU32(raw);
+                        uint64_t d0Val = static_cast<uint64_t>(raw);
+                        uc_reg_write(uc, UC_ARM_REG_D0, &d0Val);
+                        return;
+                    }
+                }
+            }
             float fVal = 0.0f;
             auto mit = methodHandleMap_.find(r2);
             if (mit != methodHandleMap_.end()) {

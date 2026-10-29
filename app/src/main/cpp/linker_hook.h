@@ -253,6 +253,8 @@ private:
     jmethodID loadClassMethod_{nullptr};
     std::unordered_map<uint32_t, jclass> hostClassMap_;
     std::unordered_map<uint32_t, jmethodID> hostMethodMap_;
+    std::unordered_map<uint32_t, jobject> hostObjectMap_;
+    jobject resolveHostObject(uint32_t guestHandle, JNIEnv* hostEnv, uc_engine* uc);
 };
 
 } // namespace emux

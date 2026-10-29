@@ -89,8 +89,10 @@ static void workerInterruptCallback(uc_engine* uc, uint32_t intno, void* /* user
     uc_reg_read(uc, UC_ARM_REG_R5, &r5);
 
     int32_t ret = SyscallDispatcher::handleSyscall(r7, r0, r1, r2, r3, r4, r5, uc);
-    uint32_t retVal = static_cast<uint32_t>(ret);
-    uc_reg_write(uc, UC_ARM_REG_R0, &retVal);
+    if (r7 != 173) {
+        uint32_t retVal = static_cast<uint32_t>(ret);
+        uc_reg_write(uc, UC_ARM_REG_R0, &retVal);
+    }
 }
 
 int32_t GuestThreadScheduler::createThread(
