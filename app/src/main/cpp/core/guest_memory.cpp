@@ -1,8 +1,12 @@
 #include "core/guest_memory.h"
+#include "unicorn/unicorn.h"
 
 #include <sys/mman.h>
 #include <unistd.h>
 #include <cstring>
+#include <cerrno>
+#include <algorithm>
+#include <vector>
 #include <android/log.h>
 
 #define LOG_TAG "EmuxGuestMemory"
@@ -95,6 +99,7 @@ void GuestMemory::destroy() {
         pageProt_ = nullptr;
     }
     refCount_ = 0;
+    resetAllocators();
 }
 
 bool GuestMemory::map(guest_addr_t addr, uint32_t size, uint8_t prot) {
@@ -182,6 +187,174 @@ bool GuestMemory::protect(guest_addr_t addr, uint32_t size, uint8_t prot) {
         pageProt_[p] = effectiveProt;
     }
     return true;
+}
+
+guest_addr_t GuestMemory::handleBrk(guest_addr_t newBrk, uc_engine* uc) {
+    std::lock_guard<std::mutex> lock(vmaMutex_);
+    if (heapBreak_ < kHeapBase) heapBreak_ = kHeapBase;
+    if (newBrk == 0 || newBrk == heapBreak_) {
+        return heapBreak_;
+    }
+    if (newBrk < kHeapBase || newBrk > kHeapLimit) {
+        LOGW("GuestMemory::handleBrk richiesta fuori limiti: 0x%08x (HeapBase=0x%08x, Limit=0x%08x)",
+             newBrk, kHeapBase, kHeapLimit);
+        return heapBreak_;
+    }
+
+    guest_addr_t alignedNew = (newBrk + 0xFFFU) & ~0xFFFU;
+    guest_addr_t alignedCur = (heapBreak_ + 0xFFFU) & ~0xFFFU;
+
+    if (alignedNew > alignedCur) {
+        uint32_t expandSize = alignedNew - alignedCur;
+        map(alignedCur, expandSize, GP_READ | GP_WRITE);
+        if (uc) {
+            uc_mem_map(uc, alignedCur, expandSize, UC_PROT_READ | UC_PROT_WRITE);
+        }
+    } else if (alignedNew < alignedCur) {
+        uint32_t shrinkSize = alignedCur - alignedNew;
+        unmap(alignedNew, shrinkSize);
+        if (uc) {
+            uc_mem_unmap(uc, alignedNew, shrinkSize);
+        }
+    }
+    heapBreak_ = newBrk;
+    return heapBreak_;
+}
+
+guest_addr_t GuestMemory::handleMmap(guest_addr_t addr, uint32_t len, int prot, int flags, int fd, uint64_t offset, uc_engine* uc) {
+    if (len == 0) return static_cast<guest_addr_t>(-EINVAL);
+    std::lock_guard<std::mutex> lock(vmaMutex_);
+
+    uint32_t alignedSize = (len + 0xFFFU) & ~0xFFFU;
+    guest_addr_t targetAddr = 0;
+
+    bool isFixed = (flags & MAP_FIXED) != 0;
+    if (addr != 0 && isFixed) {
+        targetAddr = addr & ~0xFFFU;
+    } else if (addr != 0 && (addr >= kMmapBase && (addr + alignedSize) <= kMmapLimit)) {
+        bool conflict = false;
+        for (const auto& reg : mmapRegions_) {
+            if (!(addr + alignedSize <= reg.first || addr >= (reg.first + reg.second.size))) {
+                conflict = true;
+                break;
+            }
+        }
+        targetAddr = conflict ? 0 : (addr & ~0xFFFU);
+    }
+
+    if (targetAddr == 0) {
+        if (mmapCurrent_ + alignedSize > kMmapLimit) {
+            mmapCurrent_ = kMmapBase;
+        }
+        targetAddr = mmapCurrent_;
+        mmapCurrent_ += alignedSize;
+    }
+
+    uint8_t gprot = GP_NONE;
+    if (prot & PROT_READ)  gprot |= GP_READ;
+    if (prot & PROT_WRITE) gprot |= GP_WRITE;
+    if (prot & PROT_EXEC)  gprot |= GP_EXEC;
+    if (gprot == GP_NONE)  gprot = GP_RWX;
+
+    uint32_t ucProt = UC_PROT_NONE;
+    if (prot & PROT_READ)  ucProt |= UC_PROT_READ;
+    if (prot & PROT_WRITE) ucProt |= UC_PROT_WRITE;
+    if (prot & PROT_EXEC)  ucProt |= UC_PROT_EXEC;
+    if (ucProt == UC_PROT_NONE) ucProt = UC_PROT_ALL;
+
+    if (!map(targetAddr, alignedSize, gprot)) {
+        LOGE("GuestMemory::handleMmap fallita allocazione arena: addr=0x%08x, size=0x%x", targetAddr, alignedSize);
+        return static_cast<guest_addr_t>(-ENOMEM);
+    }
+
+    if (uc) {
+        uc_mem_map(uc, targetAddr, alignedSize, ucProt);
+    }
+
+    if (fd >= 0 && !(flags & MAP_ANONYMOUS)) {
+        uint8_t* hostDest = g2h(targetAddr);
+        ssize_t bytesRead = pread(fd, hostDest, len, static_cast<off_t>(offset));
+        if (bytesRead > 0 && static_cast<size_t>(bytesRead) < alignedSize) {
+            std::memset(hostDest + bytesRead, 0, alignedSize - static_cast<size_t>(bytesRead));
+        }
+        if (uc && bytesRead > 0) {
+            uc_mem_write(uc, targetAddr, hostDest, bytesRead);
+        }
+    } else {
+        std::memset(g2h(targetAddr), 0, alignedSize);
+    }
+
+    mmapRegions_[targetAddr] = { targetAddr, alignedSize, prot, flags, fd };
+    return targetAddr;
+}
+
+int GuestMemory::handleMunmap(guest_addr_t addr, uint32_t len, uc_engine* uc) {
+    if (addr == 0 || len == 0) return -EINVAL;
+    std::lock_guard<std::mutex> lock(vmaMutex_);
+
+    guest_addr_t alignedAddr = addr & ~0xFFFU;
+    uint32_t alignedSize = (len + 0xFFFU) & ~0xFFFU;
+
+    unmap(alignedAddr, alignedSize);
+    if (uc) {
+        uc_mem_unmap(uc, alignedAddr, alignedSize);
+    }
+
+    auto it = mmapRegions_.find(alignedAddr);
+    if (it != mmapRegions_.end()) {
+        mmapRegions_.erase(it);
+    }
+    return 0;
+}
+
+int GuestMemory::handleMprotect(guest_addr_t addr, uint32_t len, int prot, uc_engine* uc) {
+    if (addr == 0 || len == 0) return -EINVAL;
+    std::lock_guard<std::mutex> lock(vmaMutex_);
+
+    guest_addr_t alignedAddr = addr & ~0xFFFU;
+    uint32_t alignedSize = (len + 0xFFFU) & ~0xFFFU;
+
+    uint8_t gprot = GP_NONE;
+    if (prot & PROT_READ)  gprot |= GP_READ;
+    if (prot & PROT_WRITE) gprot |= GP_WRITE;
+    if (prot & PROT_EXEC)  gprot |= GP_EXEC;
+    if (gprot == GP_NONE)  gprot = GP_RWX;
+
+    protect(alignedAddr, alignedSize, gprot);
+    return 0;
+}
+
+guest_addr_t GuestMemory::allocateHeap(uint32_t size, uint32_t align, uc_engine* uc) {
+    std::lock_guard<std::mutex> lock(vmaMutex_);
+    if (size == 0) size = 16;
+    if (align < 8) align = 8;
+    if (heapBreak_ < kHeapBase) heapBreak_ = kHeapBase;
+
+    guest_addr_t alignedStart = (heapBreak_ + (align - 1U)) & ~(align - 1U);
+    guest_addr_t nextBreak = alignedStart + ((size + 15U) & ~15U);
+
+    if (nextBreak > kHeapLimit) {
+        LOGE("GuestMemory::allocateHeap Out Of Memory: richiesta size=%u eccede HeapLimit 0x%08x", size, kHeapLimit);
+        return 0;
+    }
+
+    guest_addr_t pageStart = alignedStart & ~0xFFFU;
+    guest_addr_t pageEnd = (nextBreak + 0xFFFU) & ~0xFFFU;
+    if (pageEnd > pageStart && !isMappedRange(pageStart, pageEnd - pageStart)) {
+        map(pageStart, pageEnd - pageStart, GP_READ | GP_WRITE);
+        if (uc) {
+            uc_mem_map(uc, pageStart, pageEnd - pageStart, UC_PROT_READ | UC_PROT_WRITE);
+        }
+    }
+    heapBreak_ = nextBreak;
+    return alignedStart;
+}
+
+void GuestMemory::resetAllocators() {
+    std::lock_guard<std::mutex> lock(vmaMutex_);
+    heapBreak_ = kHeapBase;
+    mmapCurrent_ = kMmapBase;
+    mmapRegions_.clear();
 }
 
 } // namespace emux

@@ -6,6 +6,7 @@
 #include "core/guest_memory.h"
 #include "core/gles_virtualizer.h"
 #include "core/guest_signal.h"
+#include "core/guest_proc_fs.h"
 #include "unicorn/arm.h"
 
 #include <EGL/egl.h>
@@ -47,7 +48,6 @@
 namespace emux {
 
 static std::string sCustomStoragePath = "/sdcard/Emux32";
-static uint32_t sHeapCurrent = 0x58000000;
 
 static std::unordered_map<uint32_t, FILE*> sFileTable;
 static uint32_t sNextFileHandle = 0x30000001;
@@ -101,25 +101,7 @@ static inline std::string readGuestCString(uc_engine* uc, uint32_t addr, size_t 
 }
 
 static inline uint32_t allocGuestHeap(uc_engine* uc, uint32_t size, uint32_t align = 16) {
-    static std::mutex sHeapMutex;
-    std::lock_guard<std::mutex> lock(sHeapMutex);
-    if (size == 0) size = 16;
-    if (align < 8) align = 8;
-    uint32_t alignedStart = (sHeapCurrent + (align - 1U)) & ~(align - 1U);
-    uint32_t nextEnd = alignedStart + ((size + 15U) & ~15U);
-
-    // Mappa on-demand nello shared arena se oltre i limiti correnti
-    auto& gm = GuestMemory::getSharedInstance();
-    uint32_t pageStart = alignedStart & ~0xFFFU;
-    uint32_t pageEnd = (nextEnd + 0xFFFU) & ~0xFFFU;
-    if (pageEnd > pageStart && !gm.isMappedRange(pageStart, pageEnd - pageStart)) {
-        gm.map(pageStart, pageEnd - pageStart, GP_READ | GP_WRITE);
-    }
-    if (uc && pageEnd > 0x60000000U) {
-        uc_mem_map(uc, pageStart, pageEnd - pageStart, UC_PROT_READ | UC_PROT_WRITE);
-    }
-    sHeapCurrent = nextEnd;
-    return alignedStart;
+    return GuestMemory::getSharedInstance().allocateHeap(size, align, uc);
 }
 
 void SyscallDispatcher::setStoragePath(const std::string& path) {
@@ -416,6 +398,12 @@ std::string SyscallDispatcher::resolveFilePath(const char* guestPath) {
     if (!guestPath || guestPath[0] == '\0') return "";
     std::string pathStr(guestPath);
     auto& env = GuestRuntimeEnvironment::getInstance();
+
+    // 0. Intercettazione filesystem virtuale di sistema (/proc e /sys) per ambiente ARMv7-A
+    std::string procCand = GuestProcFs::getInstance().resolveProcPath(pathStr);
+    if (!procCand.empty()) {
+        return procCand;
+    }
 
     // Redirezione sandbox Android SDK 36 per percorsi dati privati del gioco (/data/data/<pkg> o /data/user/0/<pkg>)
     const std::string& pkg = env.getPackageName();
@@ -817,35 +805,20 @@ int32_t SyscallDispatcher::handleSyscall(
         case ARM_NR_fcntl:
         case ARM_NR_fcntl64:   return 0;
         case ARM_NR_brk: {
-            if (r0 != 0 && r0 > sHeapCurrent) {
-                sHeapCurrent = (r0 + 0xFFFU) & ~0xFFFU;
-            }
-            return static_cast<int32_t>(sHeapCurrent);
+            uint32_t res = GuestMemory::getSharedInstance().handleBrk(r0, uc);
+            return static_cast<int32_t>(res);
         }
         case ARM_NR_mmap2: {
-            uint32_t guestAddr = r0;
-            size_t length = static_cast<size_t>(r1);
-            if (length == 0) length = 0x1000;
-            uint32_t alignedSize = ( static_cast<uint32_t>(length) + 0xFFFU ) & ~0xFFFU;
-            if (guestAddr == 0) {
-                guestAddr = (sHeapCurrent + 0xFFFU) & ~0xFFFU;
-                sHeapCurrent = guestAddr + alignedSize;
-            }
-            uint32_t alignedBase = guestAddr & ~0xFFFU;
-            if (uc) {
-                uc_mem_map(uc, alignedBase, alignedSize, UC_PROT_ALL);
-            }
-            return static_cast<int32_t>(alignedBase);
+            uint64_t offset = static_cast<uint64_t>(r5) * 4096ULL;
+            uint32_t res = GuestMemory::getSharedInstance().handleMmap(r0, r1, static_cast<int>(r2), static_cast<int>(r3), static_cast<int>(r4), offset, uc);
+            return static_cast<int32_t>(res);
         }
         case ARM_NR_munmap: {
-            if (uc && r0 != 0 && r1 != 0) {
-                uint32_t alignedBase = r0 & ~0xFFFU;
-                uint32_t alignedSize = (r1 + 0xFFFU) & ~0xFFFU;
-                uc_mem_unmap(uc, alignedBase, alignedSize);
-            }
-            return 0;
+            return GuestMemory::getSharedInstance().handleMunmap(r0, r1, uc);
         }
-        case ARM_NR_mprotect:
+        case ARM_NR_mprotect: {
+            return GuestMemory::getSharedInstance().handleMprotect(r0, r1, static_cast<int>(r2), uc);
+        }
         case ARM_NR_prctl:
             return 0;
         case 173: // rt_sigreturn
@@ -957,6 +930,7 @@ void GuestRuntimeEnvironment::setGameContext(
         }
     }
     LOGI("ZipArchiveVfs: Montaggio completato (Totale file indicizzati: %zu)", vfs.getTotalIndexedFiles());
+    GuestProcFs::getInstance().initialize(filesDir_, packageName_);
 }
 
 void GuestRuntimeEnvironment::setGameClassLoader(JNIEnv* env, jobject classLoader) {
@@ -986,7 +960,7 @@ bool GuestRuntimeEnvironment::initialize(uc_engine* uc) {
 
     // Reset completo dello stato runtime per evitare puntatori di istanze uc_ precedenti
     GuestSignalManager::getInstance().reset();
-    sHeapCurrent = 0x58000000;
+    GuestMemory::getSharedInstance().resetAllocators();
     nextTrampolineId_ = 1;
     symbolToTrampolineMap_.clear();
     trampolineToSymbolMap_.clear();
@@ -1176,6 +1150,7 @@ static bool isSystemHookSymbol(const std::string& name) {
         name == "malloc" || name == "free" || name == "calloc" || name == "realloc" ||
         name == "memalign" || name == "posix_memalign" || name == "valloc" ||
         name == "mmap" || name == "munmap" || name == "mprotect" || name == "sysconf" ||
+        name == "getauxval" ||
         name == "__errno" || name == "abort" || name == "raise" || name == "signal" ||
         name == "sigaction" || name == "__sigaction" || name == "clock_gettime" ||
         name == "gettimeofday" || name == "time" || name == "nanosleep" || name == "usleep" ||
@@ -2859,6 +2834,60 @@ void GuestRuntimeEnvironment::handleTrampolineCall(uint32_t trampolineId, uc_eng
     if (name == "getenv") {
         uint32_t zero = 0;
         uc_reg_write(uc, UC_ARM_REG_R0, &zero);
+        return;
+    }
+    if (name == "getauxval") {
+        uint32_t type = 0;
+        uc_reg_read(uc, UC_ARM_REG_R0, &type);
+        uint32_t ret = 0;
+        switch (type) {
+            case 16: ret = 0x000F7F96U; break; // AT_HWCAP (VFP, NEON, VFPv3, VFPv4, IDIVA, IDIVT, EDSP, THUMB, HALF, FAST_MULT, TLS)
+            case 26: ret = 0x0000001FU; break; // AT_HWCAP2 (AES, PMULL, SHA1, SHA2, CRC32)
+            case 6:  ret = 4096U; break;       // AT_PAGESZ
+            case 17: ret = 100U; break;        // AT_CLKTCK
+            case 11: ret = static_cast<uint32_t>(getuid()); break;
+            case 12: ret = static_cast<uint32_t>(geteuid()); break;
+            case 13: ret = static_cast<uint32_t>(getgid()); break;
+            case 14: ret = static_cast<uint32_t>(getegid()); break;
+            case 23: ret = 0U; break;          // AT_SECURE
+            default: ret = 0U; break;
+        }
+        uc_reg_write(uc, UC_ARM_REG_R0, &ret);
+        return;
+    }
+    if (name == "mmap" || name == "mmap64") {
+        uint32_t addr = 0, len = 0, prot = 0, flags = 0, fd = 0, offset = 0;
+        uc_reg_read(uc, UC_ARM_REG_R0, &addr);
+        uc_reg_read(uc, UC_ARM_REG_R1, &len);
+        uc_reg_read(uc, UC_ARM_REG_R2, &prot);
+        uc_reg_read(uc, UC_ARM_REG_R3, &flags);
+        uint32_t sp = 0;
+        uc_reg_read(uc, UC_ARM_REG_SP, &sp);
+        if (sp != 0) {
+            uc_mem_read(uc, sp, &fd, 4);
+            uc_mem_read(uc, sp + 4, &offset, 4);
+        }
+        uint32_t res = GuestMemory::getSharedInstance().handleMmap(addr, len, static_cast<int>(prot), static_cast<int>(flags), static_cast<int>(fd), static_cast<uint64_t>(offset), uc);
+        uc_reg_write(uc, UC_ARM_REG_R0, &res);
+        return;
+    }
+    if (name == "munmap") {
+        uint32_t addr = 0, len = 0;
+        uc_reg_read(uc, UC_ARM_REG_R0, &addr);
+        uc_reg_read(uc, UC_ARM_REG_R1, &len);
+        int res = GuestMemory::getSharedInstance().handleMunmap(addr, len, uc);
+        uint32_t ret = static_cast<uint32_t>(res);
+        uc_reg_write(uc, UC_ARM_REG_R0, &ret);
+        return;
+    }
+    if (name == "mprotect") {
+        uint32_t addr = 0, len = 0, prot = 0;
+        uc_reg_read(uc, UC_ARM_REG_R0, &addr);
+        uc_reg_read(uc, UC_ARM_REG_R1, &len);
+        uc_reg_read(uc, UC_ARM_REG_R2, &prot);
+        int res = GuestMemory::getSharedInstance().handleMprotect(addr, len, static_cast<int>(prot), uc);
+        uint32_t ret = static_cast<uint32_t>(res);
+        uc_reg_write(uc, UC_ARM_REG_R0, &ret);
         return;
     }
 

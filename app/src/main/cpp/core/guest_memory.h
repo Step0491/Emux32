@@ -3,6 +3,11 @@
 #include <cstdint>
 #include <cstddef>
 #include <mutex>
+#include <map>
+#include <string>
+
+struct uc_struct;
+typedef struct uc_struct uc_engine;
 
 namespace emux {
 
@@ -31,6 +36,12 @@ public:
     static constexpr uint32_t kGuestPageSize    = 1U << kGuestPageShift; // 4096 byte
     static constexpr size_t   kTotalGuestPages  = 1ULL << (32 - kGuestPageShift); // 1.048.576 pagine
 
+    // Partizionamento Layout Memoria Virtuale Guest (ARM32)
+    static constexpr guest_addr_t kHeapBase   = 0x58000000U; // Inizio Heap brk
+    static constexpr guest_addr_t kHeapLimit  = 0x70000000U; // Limite Heap brk (384 MB)
+    static constexpr guest_addr_t kMmapBase   = 0x80000000U; // Inizio Arena Mmap anonima / file-backed
+    static constexpr guest_addr_t kMmapLimit  = 0xC0000000U; // Limite Arena Mmap (1 GB)
+
     GuestMemory();
     ~GuestMemory();
 
@@ -54,6 +65,24 @@ public:
 
     // Aggiorna i permessi software a granularità 4KB
     bool protect(guest_addr_t addr, uint32_t size, uint8_t prot);
+
+    // Gestione unificata Syscall e Libc per brk (espansione e contrazione dinamica dell'heap)
+    guest_addr_t handleBrk(guest_addr_t newBrk, uc_engine* uc);
+
+    // Gestione unificata Syscall e Libc per mmap/mmap2 (supporto anonimo e file-backed con pread)
+    guest_addr_t handleMmap(guest_addr_t addr, uint32_t len, int prot, int flags, int fd, uint64_t offset, uc_engine* uc);
+
+    // Gestione unificata Syscall e Libc per munmap
+    int handleMunmap(guest_addr_t addr, uint32_t len, uc_engine* uc);
+
+    // Gestione unificata Syscall e Libc per mprotect
+    int handleMprotect(guest_addr_t addr, uint32_t len, int prot, uc_engine* uc);
+
+    // Allocatore heap thread-safe per runtime guest (malloc, calloc, realloc)
+    guest_addr_t allocateHeap(uint32_t size, uint32_t align, uc_engine* uc);
+
+    // Reset allocatori virtuali (heap break e mmap cursor)
+    void resetAllocators();
 
     // Traduzione diretta O(1) Guest -> Host (1 ciclo CPU: addizione base + offset 32-bit)
     inline uint8_t* g2h(guest_addr_t addr) const noexcept {
@@ -94,11 +123,24 @@ public:
     inline size_t hostPageSize() const noexcept { return hostPageSize_; }
 
 private:
+    struct MmapRegion {
+        guest_addr_t addr;
+        uint32_t size;
+        int prot;
+        int flags;
+        int fd;
+    };
+
     uint8_t* base_{nullptr};
     uint8_t* pageProt_{nullptr}; // Tabella software da 1 MB (1 byte per pagina guest da 4 KB)
     size_t   hostPageSize_{4096};
     int      refCount_{0};
     mutable std::mutex mutex_;
+
+    mutable std::mutex vmaMutex_;
+    guest_addr_t heapBreak_{kHeapBase};
+    guest_addr_t mmapCurrent_{kMmapBase};
+    std::map<guest_addr_t, MmapRegion> mmapRegions_;
 };
 
 } // namespace emux
