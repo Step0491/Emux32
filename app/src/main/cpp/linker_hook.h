@@ -161,6 +161,7 @@ public:
     EGLDisplay getEglDisplay() const { return eglDisplay_; }
     EGLSurface getEglSurface() const { return eglSurface_; }
     EGLContext getEglContext() const { return eglContext_; }
+    EGLConfig getEglConfig() const { return eglConfig_; }
 
 private:
     GuestRuntimeEnvironment();
