@@ -42,9 +42,37 @@ fun scanEmuxStorage(context: Context, apkDir: File, obbDir: File): List<EmuxRom>
     if (!apkDir.exists()) apkDir.mkdirs()
     if (!obbDir.exists()) obbDir.mkdirs()
 
-    val apkFiles = apkDir.listFiles { file ->
-        file.isFile && file.name.lowercase().endsWith(".apk")
-    } ?: emptyArray()
+    val candidateApkDirs = mutableListOf<File>()
+    candidateApkDirs.add(apkDir)
+    apkDir.parentFile?.let { parent ->
+        if (parent.exists()) {
+            candidateApkDirs.add(parent)
+            val romsDir = File(parent, "roms")
+            if (romsDir.exists()) candidateApkDirs.add(romsDir)
+            val gamesDir = File(parent, "games")
+            if (gamesDir.exists()) candidateApkDirs.add(gamesDir)
+        }
+    }
+    val downloadDir = File("/storage/emulated/0/Download")
+    if (downloadDir.exists() && downloadDir.canRead()) {
+        candidateApkDirs.add(downloadDir)
+    }
+
+    val discoveredApkFiles = mutableSetOf<File>()
+    for (dir in candidateApkDirs) {
+        if (!dir.exists()) continue
+        dir.listFiles { file ->
+            file.isFile && file.name.lowercase().endsWith(".apk")
+        }?.forEach { discoveredApkFiles.add(it) }
+        if (dir != downloadDir) {
+            try {
+                dir.walkTopDown().maxDepth(2).filter { it.isFile && it.name.lowercase().endsWith(".apk") }.forEach {
+                    discoveredApkFiles.add(it)
+                }
+            } catch (_: Throwable) {}
+        }
+    }
+    val apkFiles = discoveredApkFiles.toTypedArray()
 
     val upscaledCoversDir = File(apkDir, ".upscaled_covers")
     if (!upscaledCoversDir.exists()) upscaledCoversDir.mkdirs()
