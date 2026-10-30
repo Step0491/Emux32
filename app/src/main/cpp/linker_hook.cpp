@@ -80,8 +80,6 @@ static std::shared_ptr<std::condition_variable_any> getOrCreateGuestCond(uint32_
     return c;
 }
 
-
-
 static inline std::string readGuestCString(uc_engine* uc, uint32_t addr, size_t maxLen = 512) {
     if (!uc || addr == 0) return "";
     std::string out;
@@ -100,9 +98,125 @@ static inline std::string readGuestCString(uc_engine* uc, uint32_t addr, size_t 
     return out;
 }
 
+#pragma pack(push, 4)
+struct GuestHeapHeader {
+    uint32_t magic;    // 0x48454150 ("HEAP")
+    uint32_t size;     // Dimensione richiesta dal chiamante
+    uint32_t capacity; // Capacità utile del blocco allocato
+    uint32_t is_free;  // 1 se libero, 0 se in uso
+};
+#pragma pack(pop)
+
+struct GuestFreeBlock {
+    uint32_t payloadAddr;
+    uint32_t capacity;
+};
+
+static std::vector<GuestFreeBlock> sHeapFreeList;
+static std::mutex sHeapMutex;
+
 static inline uint32_t allocGuestHeap(uc_engine* uc, uint32_t size, uint32_t align = 16) {
-    return GuestMemory::getSharedInstance().allocateHeap(size, align, uc);
+    std::lock_guard<std::mutex> lock(sHeapMutex);
+    if (size == 0) size = 16;
+    if (align < 16) align = 16;
+    uint32_t neededCap = (size + 15U) & ~15U;
+
+    // 1. Ricerca nella free list dei blocchi riutilizzabili (first-fit)
+    for (auto it = sHeapFreeList.begin(); it != sHeapFreeList.end(); ++it) {
+        if (it->capacity >= neededCap && (it->payloadAddr % align == 0)) {
+            uint32_t foundAddr = it->payloadAddr;
+            uint32_t foundCap = it->capacity;
+            sHeapFreeList.erase(it);
+
+            uint32_t hdrAddr = foundAddr - sizeof(GuestHeapHeader);
+            GuestHeapHeader hdr{0x48454150U, size, foundCap, 0};
+            if (uc) uc_mem_write(uc, hdrAddr, &hdr, sizeof(hdr));
+
+            return foundAddr;
+        }
+    }
+
+    // 2. Allocazione tramite il gestore VMA di GuestMemory
+    uint32_t totalAlloc = sizeof(GuestHeapHeader) + neededCap + (align - 1U);
+    uint32_t raw = GuestMemory::getSharedInstance().allocateHeap(totalAlloc, 16, uc);
+    if (raw == 0) return 0;
+
+    uint32_t payloadAddr = (raw + sizeof(GuestHeapHeader) + (align - 1U)) & ~(align - 1U);
+    uint32_t headerAddr = payloadAddr - sizeof(GuestHeapHeader);
+
+    GuestHeapHeader hdr{0x48454150U, size, neededCap, 0};
+    if (uc) {
+        uc_mem_write(uc, headerAddr, &hdr, sizeof(hdr));
+    }
+    return payloadAddr;
 }
+
+static inline void freeGuestHeap(uint32_t ptr, uc_engine* uc) {
+    if (ptr < 0x60000000U) return;
+    std::lock_guard<std::mutex> lock(sHeapMutex);
+    uint32_t hdrAddr = ptr - sizeof(GuestHeapHeader);
+    GuestHeapHeader hdr{};
+    if (uc && uc_mem_read(uc, hdrAddr, &hdr, sizeof(hdr)) == UC_ERR_OK) {
+        if (hdr.magic == 0x48454150U && hdr.is_free == 0) {
+            hdr.is_free = 1;
+            uc_mem_write(uc, hdrAddr, &hdr, sizeof(hdr));
+            sHeapFreeList.push_back({ptr, hdr.capacity});
+        }
+    }
+}
+
+static inline uint32_t reallocGuestHeap(uc_engine* uc, uint32_t oldPtr, uint32_t newSize) {
+    if (oldPtr == 0) return allocGuestHeap(uc, newSize, 16);
+    if (newSize == 0) {
+        freeGuestHeap(oldPtr, uc);
+        return 0;
+    }
+
+    std::unique_lock<std::mutex> lock(sHeapMutex);
+    uint32_t hdrAddr = oldPtr - sizeof(GuestHeapHeader);
+    GuestHeapHeader hdr{};
+    bool validHdr = false;
+    if (uc && uc_mem_read(uc, hdrAddr, &hdr, sizeof(hdr)) == UC_ERR_OK && hdr.magic == 0x48454150U) {
+        validHdr = true;
+        if (hdr.capacity >= newSize) {
+            hdr.size = newSize;
+            uc_mem_write(uc, hdrAddr, &hdr, sizeof(hdr));
+            return oldPtr;
+        }
+    }
+    lock.unlock();
+
+    uint32_t newPtr = allocGuestHeap(uc, newSize, 16);
+    if (newPtr != 0 && oldPtr != 0) {
+        size_t copyBytes = validHdr ? std::min<size_t>(hdr.size, newSize) : newSize;
+        if (copyBytes > 0 && copyBytes < 0x04000000U) {
+            std::vector<uint8_t> buf(copyBytes, 0);
+            uc_mem_read(uc, oldPtr, buf.data(), copyBytes);
+            uc_mem_write(uc, newPtr, buf.data(), copyBytes);
+        }
+        freeGuestHeap(oldPtr, uc);
+    }
+    return newPtr;
+}
+
+// Strutture per tracciamento directory POSIX guest
+struct GuestDirEntry {
+    DIR* hostDir{nullptr};
+    uint32_t direntBufAddr{0};
+};
+static std::unordered_map<uint32_t, GuestDirEntry> sGuestDirMap;
+static uint32_t sNextDirHandle = 0x50000001U;
+static std::mutex sDirMutex;
+
+#pragma pack(push, 4)
+struct guest_dirent32 {
+    uint64_t d_ino;
+    int64_t  d_off;
+    uint16_t d_reclen;
+    uint8_t  d_type;
+    char     d_name[256];
+};
+#pragma pack(pop)
 
 void SyscallDispatcher::setStoragePath(const std::string& path) {
     sCustomStoragePath = path;
@@ -398,95 +512,32 @@ std::string SyscallDispatcher::resolveFilePath(const char* guestPath) {
     if (!guestPath || guestPath[0] == '\0') return "";
     std::string pathStr(guestPath);
     auto& env = GuestRuntimeEnvironment::getInstance();
-
     // 0. Intercettazione filesystem virtuale di sistema (/proc e /sys) per ambiente ARMv7-A
     std::string procCand = GuestProcFs::getInstance().resolveProcPath(pathStr);
     if (!procCand.empty()) {
         return procCand;
     }
 
-    // Redirezione sandbox Android SDK 36 per percorsi dati privati del gioco (/data/data/<pkg> o /data/user/0/<pkg>)
     const std::string& pkg = env.getPackageName();
-    if (!pkg.empty() && !env.getFilesDir().empty()) {
+    const std::string& fDir = env.getFilesDir();
+
+    // 1. Redirezione sandbox assoluta Android SDK 34-36 per percorsi dati privati (/data/data/<pkg> o /data/user/0/<pkg>)
+    if (!pkg.empty() && !fDir.empty()) {
         std::string p1 = "/data/data/" + pkg;
         std::string p2 = "/data/user/0/" + pkg;
         if (pathStr.rfind(p1, 0) == 0) {
-            std::string redirected = env.getFilesDir() + "/guest_data/" + pkg + pathStr.substr(p1.size());
+            std::string redirected = fDir + "/guest_data/" + pkg + pathStr.substr(p1.size());
             ensureParentDirs(redirected);
             return redirected;
         }
         if (pathStr.rfind(p2, 0) == 0) {
-            std::string redirected = env.getFilesDir() + "/guest_data/" + pkg + pathStr.substr(p2.size());
+            std::string redirected = fDir + "/guest_data/" + pkg + pathStr.substr(p2.size());
             ensureParentDirs(redirected);
             return redirected;
         }
     }
 
-    // Redirezione salvataggi e percorsi dati legacy arbitrari (/sdcard/, /mnt/sdcard/, /storage/emulated/0/)
-    // Risolve i blocchi Scoped Storage su Android 14/15/16 (SDK 34-36) per cartelle tipo /sdcard/glu/, /sdcard/titolo/
-    if (!pkg.empty()) {
-        std::string prefix;
-        if (pathStr.rfind("/sdcard/", 0) == 0) prefix = "/sdcard/";
-        else if (pathStr.rfind("/mnt/sdcard/", 0) == 0) prefix = "/mnt/sdcard/";
-        else if (pathStr.rfind("/storage/emulated/0/", 0) == 0) prefix = "/storage/emulated/0/";
-
-        if (!prefix.empty()) {
-            std::string sub = pathStr.substr(prefix.size());
-            if (sub.rfind("Android/obb", 0) != 0 && sub.rfind("Android/data", 0) != 0 &&
-                sub.rfind("Emux32", 0) != 0 && sub.rfind("Emulators/Emux32", 0) != 0) {
-                std::string redirected = env.getFilesDir() + "/guest_data/" + pkg + "/sdcard/" + sub;
-                std::string customCand = sCustomStoragePath + "/" + sub;
-                if (access(customCand.c_str(), F_OK) == 0) {
-                    return customCand;
-                }
-
-                if (sub.rfind("glu/", 0) == 0 || pkg.find("glu") != std::string::npos) {
-                    std::string gluSub = (sub.rfind("glu/", 0) == 0) ? sub.substr(4) : sub;
-                    std::vector<std::string> gluCands = {
-                        sCustomStoragePath + "/obb/" + pkg + "/" + sub,
-                        sCustomStoragePath + "/obb/" + pkg + "/" + gluSub,
-                        sCustomStoragePath + "/obb/com.glu.gladiator/" + sub,
-                        sCustomStoragePath + "/obb/com.glu.gladiator/" + gluSub,
-                        sCustomStoragePath + "/data/" + pkg + "/" + sub,
-                        sCustomStoragePath + "/data/" + pkg + "/" + gluSub,
-                        sCustomStoragePath + "/data/com.glu.gladiator/" + sub,
-                        sCustomStoragePath + "/data/com.glu.gladiator/" + gluSub
-                    };
-                    for (const auto& gc : gluCands) {
-                        if (access(gc.c_str(), F_OK) == 0) {
-                            LOGI("Redirezione Glu Mobile trovata: '%s' -> '%s'", guestPath, gc.c_str());
-                            return gc;
-                        }
-                    }
-                }
-
-                std::string obbCand1 = sCustomStoragePath + "/obb/" + pkg + "/" + sub;
-                if (access(obbCand1.c_str(), F_OK) == 0) return obbCand1;
-                std::string obbCand2 = sCustomStoragePath + "/obb/com.glu.gladiator/" + sub;
-                if (access(obbCand2.c_str(), F_OK) == 0) return obbCand2;
-
-                if (access(redirected.c_str(), F_OK) == 0) {
-                    return redirected;
-                }
-                ensureParentDirs(redirected);
-                LOGI("Redirezione storage/save legacy: '%s' -> '%s'", guestPath, redirected.c_str());
-                return redirected;
-            }
-        }
-    }
-
-    if (access(guestPath, F_OK) == 0) {
-        return pathStr;
-    }
-
-    // Risoluzione prioritaria tramite la cartella assets estratta dall'APK
-    std::string assetCand = env.resolveAssetPath(pathStr);
-    if (!assetCand.empty()) {
-        LOGI("Risoluzione asset guest via SyscallDispatcher: '%s' -> '%s'", guestPath, assetCand.c_str());
-        return assetCand;
-    }
-
-    // Risoluzione specifica per percorsi di Cache / Dati esterni (es. unitycache o Android/data)
+    // 2. Risoluzione prioritaria assoluta per cache Unity (/unitycache/)
     size_t ucPos = pathStr.find("/unitycache/");
     if (ucPos != std::string::npos) {
         std::string subUc = pathStr.substr(ucPos);
@@ -497,8 +548,8 @@ std::string SyscallDispatcher::resolveFilePath(const char* guestPath) {
             sCustomStoragePath + "/data/" + pkg + "/cache" + subUc,
             sCustomStoragePath + "/obb/com.glu.gladiator" + subUc,
             sCustomStoragePath + "/data/com.glu.gladiator" + subUc,
-            env.getFilesDir() + "/guest_data/" + pkg + subUc,
-            env.getFilesDir() + "/guest_data/" + pkg + "/cache" + subUc,
+            fDir + "/guest_data/" + pkg + subUc,
+            fDir + "/guest_data/" + pkg + "/cache" + subUc,
             "/storage/emulated/0/Android/data/" + pkg + subUc,
             "/storage/emulated/0/Android/data/" + pkg + "/cache" + subUc,
             "/storage/emulated/0/Android/data/com.glu.gladiator" + subUc,
@@ -507,12 +558,18 @@ std::string SyscallDispatcher::resolveFilePath(const char* guestPath) {
         };
         for (const auto& cand : ucCandidates) {
             if (access(cand.c_str(), F_OK) == 0) {
-                LOGI("Risoluzione unitycache: '%s' -> '%s'", guestPath, cand.c_str());
+                LOGI("Risoluzione unitycache (esistente): '%s' -> '%s'", guestPath, cand.c_str());
                 return cand;
             }
         }
+        // Redirezione assoluta per Scoped Storage: scrittura e creazione garantita sotto sandbox
+        std::string targetUc = fDir + "/guest_data/" + (pkg.empty() ? "common" : pkg) + "/cache" + subUc;
+        ensureParentDirs(targetUc);
+        LOGI("Redirezione assoluta unitycache (nuovo): '%s' -> '%s'", guestPath, targetUc.c_str());
+        return targetUc;
     }
 
+    // 3. Risoluzione prioritaria assoluta per Android/data/
     size_t dataPos = pathStr.find("/Android/data/");
     if (dataPos != std::string::npos && !pkg.empty()) {
         std::string afterData = pathStr.substr(dataPos + 14);
@@ -524,8 +581,8 @@ std::string SyscallDispatcher::resolveFilePath(const char* guestPath) {
                 sCustomStoragePath + "/data/" + pkg + relPath,
                 sCustomStoragePath + "/obb/com.glu.gladiator" + relPath,
                 sCustomStoragePath + "/data/com.glu.gladiator" + relPath,
-                env.getFilesDir() + "/guest_data/" + pkg + relPath,
-                env.getFilesDir() + "/guest_data/" + pkg + "/cache" + relPath,
+                fDir + "/guest_data/" + pkg + relPath,
+                fDir + "/guest_data/" + pkg + "/cache" + relPath,
                 "/storage/emulated/0/Emux32/obb/" + pkg + relPath,
                 "/storage/emulated/0/Emux32/data/" + pkg + relPath
             };
@@ -533,17 +590,58 @@ std::string SyscallDispatcher::resolveFilePath(const char* guestPath) {
                 std::string noCache = relPath.substr(6);
                 dataCandidates.push_back(sCustomStoragePath + "/obb/" + pkg + noCache);
                 dataCandidates.push_back(sCustomStoragePath + "/data/" + pkg + noCache);
-                dataCandidates.push_back(env.getFilesDir() + "/guest_data/" + pkg + noCache);
+                dataCandidates.push_back(fDir + "/guest_data/" + pkg + noCache);
             }
             for (const auto& cand : dataCandidates) {
                 if (access(cand.c_str(), F_OK) == 0) {
-                    LOGI("Risoluzione Android/data: '%s' -> '%s'", guestPath, cand.c_str());
+                    LOGI("Risoluzione Android/data (esistente): '%s' -> '%s'", guestPath, cand.c_str());
                     return cand;
                 }
             }
+            // Scrittura/Creazione file assoluta sotto Scoped Storage sandbox
+            std::string targetData = fDir + "/guest_data/" + pkg + relPath;
+            ensureParentDirs(targetData);
+            LOGI("Redirezione assoluta Android/data (nuovo): '%s' -> '%s'", guestPath, targetData.c_str());
+            return targetData;
         }
     }
 
+    // 4. Redirezione assoluta percorsi storage arbitrari (/sdcard/, /mnt/sdcard/, /storage/emulated/0/)
+    std::string prefix;
+    if (pathStr.rfind("/sdcard/", 0) == 0) prefix = "/sdcard/";
+    else if (pathStr.rfind("/mnt/sdcard/", 0) == 0) prefix = "/mnt/sdcard/";
+    else if (pathStr.rfind("/storage/emulated/0/", 0) == 0) prefix = "/storage/emulated/0/";
+
+    if (!prefix.empty()) {
+        std::string sub = pathStr.substr(prefix.size());
+        if (sub.rfind("Android/obb", 0) != 0 && sub.rfind("Android/data", 0) != 0 &&
+            sub.rfind("Emux32", 0) != 0 && sub.rfind("Emulators/Emux32", 0) != 0) {
+            std::string customCand = sCustomStoragePath + "/" + sub;
+            if (access(customCand.c_str(), F_OK) == 0) {
+                return customCand;
+            }
+            std::string redirected = fDir + "/guest_data/" + (pkg.empty() ? "common" : pkg) + "/sdcard/" + sub;
+            if (access(redirected.c_str(), F_OK) == 0) {
+                return redirected;
+            }
+            ensureParentDirs(redirected);
+            LOGI("Redirezione assoluta storage/save legacy: '%s' -> '%s'", guestPath, redirected.c_str());
+            return redirected;
+        }
+    }
+
+    if (access(guestPath, F_OK) == 0) {
+        return pathStr;
+    }
+
+    // 5. Risoluzione prioritaria tramite la cartella assets estratta dall'APK
+    std::string assetCand = env.resolveAssetPath(pathStr);
+    if (!assetCand.empty()) {
+        LOGI("Risoluzione asset guest via SyscallDispatcher: '%s' -> '%s'", guestPath, assetCand.c_str());
+        return assetCand;
+    }
+
+    // 6. Ricerca file fra cartelle OBB, Custom Storage e APK
     size_t lastSlash = pathStr.find_last_of('/');
     std::string filename = (lastSlash != std::string::npos) ? pathStr.substr(lastSlash + 1) : pathStr;
 
@@ -551,11 +649,11 @@ std::string SyscallDispatcher::resolveFilePath(const char* guestPath) {
     if (!env.getObbDir().empty()) {
         candidates.push_back(env.getObbDir() + "/" + filename);
     }
-    if (!env.getFilesDir().empty() && !pkg.empty()) {
-        candidates.push_back(env.getFilesDir() + "/obb/" + pkg + "/" + filename);
-        candidates.push_back(env.getFilesDir() + "/data/" + pkg + "/" + filename);
-        candidates.push_back(env.getFilesDir() + "/assets/" + pkg + "/" + filename);
-        candidates.push_back(env.getFilesDir() + "/assets/" + filename);
+    if (!fDir.empty() && !pkg.empty()) {
+        candidates.push_back(fDir + "/obb/" + pkg + "/" + filename);
+        candidates.push_back(fDir + "/data/" + pkg + "/" + filename);
+        candidates.push_back(fDir + "/assets/" + pkg + "/" + filename);
+        candidates.push_back(fDir + "/assets/" + filename);
     }
     if (!env.getNativeLibDir().empty()) {
         candidates.push_back(env.getNativeLibDir() + "/" + filename);
@@ -580,6 +678,15 @@ std::string SyscallDispatcher::resolveFilePath(const char* guestPath) {
             LOGI("Risoluzione file guest: '%s' -> '%s'", guestPath, cand.c_str());
             return cand;
         }
+    }
+
+    // 7. Redirezione di sicurezza assoluta per percorsi non-root /sdcard/ o /storage/
+    if (!prefix.empty() && !fDir.empty()) {
+        std::string sub = pathStr.substr(prefix.size());
+        std::string finalRedirect = fDir + "/guest_data/" + (pkg.empty() ? "common" : pkg) + "/sdcard/" + sub;
+        ensureParentDirs(finalRedirect);
+        LOGI("Redirezione assoluta finale Scoped Storage: '%s' -> '%s'", guestPath, finalRedirect.c_str());
+        return finalRedirect;
     }
 
     return pathStr;
@@ -1180,8 +1287,8 @@ static bool isSystemHookSymbol(const std::string& name) {
         name == "__errno" || name == "abort" || name == "raise" || name == "signal" ||
         name == "sigaction" || name == "__sigaction" || name == "clock_gettime" ||
         name == "gettimeofday" || name == "time" || name == "nanosleep" || name == "usleep" ||
-        name == "open" || name == "close" || name == "read" || name == "write" ||
-        name == "ioctl" || name == "lseek" || name == "stat" || name == "fstat" ||
+        name == "open" || name == "open64" || name == "close" || name == "read" || name == "write" ||
+        name == "ioctl" || name == "lseek" || name == "lseek64" || name == "stat" || name == "stat64" || name == "fstat" || name == "fstat64" ||
         name == "access" || name == "opendir" || name == "closedir" || name == "readdir" ||
         name == "memcpy" || name == "memset" || name == "memmove" || name == "memcmp" ||
         name == "strlen" || name == "strcpy" || name == "strncpy" || name == "strcmp" ||
@@ -2942,13 +3049,15 @@ void GuestRuntimeEnvironment::handleTrampolineCall(uint32_t trampolineId, uc_eng
         uint32_t ptr = 0, size = 0;
         uc_reg_read(uc, UC_ARM_REG_R0, &ptr);
         uc_reg_read(uc, UC_ARM_REG_R1, &size);
-        uint32_t newAddr = allocGuestHeap(uc, size, 16);
-        if (ptr != 0 && size > 0 && size < 0x04000000U) {
-            std::vector<uint8_t> buf(size, 0);
-            uc_mem_read(uc, ptr, buf.data(), size);
-            uc_mem_write(uc, newAddr, buf.data(), size);
-        }
+        uint32_t newAddr = reallocGuestHeap(uc, ptr, size);
         uc_reg_write(uc, UC_ARM_REG_R0, &newAddr);
+        return;
+    }
+    if (name == "valloc") {
+        uint32_t size = 0;
+        uc_reg_read(uc, UC_ARM_REG_R0, &size);
+        uint32_t allocAddr = allocGuestHeap(uc, size, 4096);
+        uc_reg_write(uc, UC_ARM_REG_R0, &allocAddr);
         return;
     }
     if (name == "posix_memalign") {
@@ -2973,6 +3082,11 @@ void GuestRuntimeEnvironment::handleTrampolineCall(uint32_t trampolineId, uc_eng
         return;
     }
     if (name == "free" || name == "_ZdlPv" || name == "_ZdaPv") {
+        uint32_t ptr = 0;
+        uc_reg_read(uc, UC_ARM_REG_R0, &ptr);
+        if (ptr != 0) {
+            freeGuestHeap(ptr, uc);
+        }
         return;
     }
 
@@ -3252,7 +3366,7 @@ void GuestRuntimeEnvironment::handleTrampolineCall(uint32_t trampolineId, uc_eng
         uc_reg_write(uc, UC_ARM_REG_R0, &writtenCount);
         return;
     }
-    if (name == "fseek" || name == "fseeko" || name == "fseeko64") {
+    if (name == "fseek" || name == "fseeko") {
         uint32_t handle = 0, offset = 0, whence = 0;
         uc_reg_read(uc, UC_ARM_REG_R0, &handle);
         uc_reg_read(uc, UC_ARM_REG_R1, &offset);
@@ -3269,7 +3383,29 @@ void GuestRuntimeEnvironment::handleTrampolineCall(uint32_t trampolineId, uc_eng
         uc_reg_write(uc, UC_ARM_REG_R0, &ret);
         return;
     }
-    if (name == "ftell" || name == "ftello" || name == "ftello64") {
+    if (name == "fseeko64") {
+        // AAPCS ARM32: R0=FILE*, R1=pad, R2=offset_lo, R3=offset_hi, [SP]=whence
+        uint32_t handle = 0, offLo = 0, offHi = 0, sp = 0, whence = 0;
+        uc_reg_read(uc, UC_ARM_REG_R0, &handle);
+        uc_reg_read(uc, UC_ARM_REG_R2, &offLo);
+        uc_reg_read(uc, UC_ARM_REG_R3, &offHi);
+        uc_reg_read(uc, UC_ARM_REG_SP, &sp);
+        if (sp != 0) uc_mem_read(uc, sp, &whence, 4);
+
+        int64_t off64 = (static_cast<int64_t>(offHi) << 32) | offLo;
+        int res = -1;
+        FILE* fp = nullptr;
+        {
+            std::lock_guard<std::mutex> lock(sFileMutex);
+            auto fit = sFileTable.find(handle);
+            if (fit != sFileTable.end()) fp = fit->second;
+        }
+        if (fp) res = fseeko(fp, static_cast<off_t>(off64), static_cast<int>(whence));
+        uint32_t ret = static_cast<uint32_t>(res);
+        uc_reg_write(uc, UC_ARM_REG_R0, &ret);
+        return;
+    }
+    if (name == "ftell" || name == "ftello") {
         uint32_t handle = 0;
         uc_reg_read(uc, UC_ARM_REG_R0, &handle);
         long pos = -1;
@@ -3282,6 +3418,24 @@ void GuestRuntimeEnvironment::handleTrampolineCall(uint32_t trampolineId, uc_eng
         if (fp) pos = ftell(fp);
         uint32_t ret = static_cast<uint32_t>(pos);
         uc_reg_write(uc, UC_ARM_REG_R0, &ret);
+        return;
+    }
+    if (name == "ftello64") {
+        // AAPCS ARM32: R0=FILE*, return 64-bit in R0 (lo) and R1 (hi)
+        uint32_t handle = 0;
+        uc_reg_read(uc, UC_ARM_REG_R0, &handle);
+        off_t pos = -1;
+        FILE* fp = nullptr;
+        {
+            std::lock_guard<std::mutex> lock(sFileMutex);
+            auto fit = sFileTable.find(handle);
+            if (fit != sFileTable.end()) fp = fit->second;
+        }
+        if (fp) pos = ftello(fp);
+        uint32_t retLo = static_cast<uint32_t>(pos & 0xFFFFFFFFU);
+        uint32_t retHi = static_cast<uint32_t>((static_cast<uint64_t>(pos) >> 32) & 0xFFFFFFFFU);
+        uc_reg_write(uc, UC_ARM_REG_R0, &retLo);
+        uc_reg_write(uc, UC_ARM_REG_R1, &retHi);
         return;
     }
     if (name == "fclose" || name == "fflush") {
@@ -3752,6 +3906,457 @@ void GuestRuntimeEnvironment::handleTrampolineCall(uint32_t trampolineId, uc_eng
     }
     if (name == "ANativeWindow_setBuffersGeometry" || name == "ANativeWindow_acquire" ||
         name == "ANativeWindow_release" || name == "ANativeWindow_lock" || name == "ANativeWindow_unlockAndPost") {
+        uint32_t zero = 0;
+        uc_reg_write(uc, UC_ARM_REG_R0, &zero);
+        return;
+    }
+
+    // =========================================================================
+    // 8a. Sostituzione & Implementazione Completa Funzioni POSIX / Bionic Libc
+    // =========================================================================
+
+    // File Descriptor & IO: open, open64
+    if (name == "open" || name == "open64") {
+        uint32_t pathPtr = 0, flags = 0, mode = 0;
+        uc_reg_read(uc, UC_ARM_REG_R0, &pathPtr);
+        uc_reg_read(uc, UC_ARM_REG_R1, &flags);
+        uc_reg_read(uc, UC_ARM_REG_R2, &mode);
+        std::string gpath = readGuestCString(uc, pathPtr, 1024);
+        if (gpath.empty()) {
+            uint32_t negOne = 0xFFFFFFFFU;
+            uc_reg_write(uc, UC_ARM_REG_R0, &negOne);
+            return;
+        }
+        std::string resolved = SyscallDispatcher::resolveFilePath(gpath.c_str());
+        ensureParentDirs(resolved);
+        int fd = ::open(resolved.c_str(), static_cast<int>(flags), static_cast<mode_t>(mode));
+        if (fd >= 0) {
+            uint32_t ufd = static_cast<uint32_t>(fd);
+            uc_reg_write(uc, UC_ARM_REG_R0, &ufd);
+        } else {
+            uint32_t negOne = 0xFFFFFFFFU;
+            uc_reg_write(uc, UC_ARM_REG_R0, &negOne);
+            uint32_t err = static_cast<uint32_t>(errno);
+            uc_mem_write(uc, guestJniBase_ + 0x2000U, &err, 4);
+            uc_mem_write(uc, guestTlsBase_ + 0x100U, &err, 4);
+        }
+        return;
+    }
+
+    // close
+    if (name == "close") {
+        uint32_t fd = 0;
+        uc_reg_read(uc, UC_ARM_REG_R0, &fd);
+        int res = 0;
+        if (fd > 2) {
+            res = ::close(static_cast<int>(fd));
+        }
+        uint32_t ret = (res == 0) ? 0 : 0xFFFFFFFFU;
+        uc_reg_write(uc, UC_ARM_REG_R0, &ret);
+        return;
+    }
+
+    // read
+    if (name == "read") {
+        uint32_t fd = 0, bufPtr = 0, count = 0;
+        uc_reg_read(uc, UC_ARM_REG_R0, &fd);
+        uc_reg_read(uc, UC_ARM_REG_R1, &bufPtr);
+        uc_reg_read(uc, UC_ARM_REG_R2, &count);
+        if (bufPtr == 0 || count == 0) {
+            uint32_t zero = 0;
+            uc_reg_write(uc, UC_ARM_REG_R0, &zero);
+            return;
+        }
+        size_t toRead = std::min<size_t>(count, 0x1000000U);
+        std::vector<uint8_t> tmp(toRead);
+        ssize_t nRead = ::read(static_cast<int>(fd), tmp.data(), toRead);
+        if (nRead > 0) {
+            uc_mem_write(uc, bufPtr, tmp.data(), static_cast<size_t>(nRead));
+        }
+        uint32_t ret = (nRead >= 0) ? static_cast<uint32_t>(nRead) : 0xFFFFFFFFU;
+        if (nRead < 0) {
+            uint32_t err = static_cast<uint32_t>(errno);
+            uc_mem_write(uc, guestJniBase_ + 0x2000U, &err, 4);
+            uc_mem_write(uc, guestTlsBase_ + 0x100U, &err, 4);
+        }
+        uc_reg_write(uc, UC_ARM_REG_R0, &ret);
+        return;
+    }
+
+    // write
+    if (name == "write") {
+        uint32_t fd = 0, bufPtr = 0, count = 0;
+        uc_reg_read(uc, UC_ARM_REG_R0, &fd);
+        uc_reg_read(uc, UC_ARM_REG_R1, &bufPtr);
+        uc_reg_read(uc, UC_ARM_REG_R2, &count);
+        if (bufPtr == 0 || count == 0) {
+            uint32_t zero = 0;
+            uc_reg_write(uc, UC_ARM_REG_R0, &zero);
+            return;
+        }
+        size_t toWrite = std::min<size_t>(count, 0x1000000U);
+        std::vector<uint8_t> tmp(toWrite);
+        uc_mem_read(uc, bufPtr, tmp.data(), toWrite);
+        if (fd == 1 || fd == 2) {
+            std::string logMsg(reinterpret_cast<char*>(tmp.data()), toWrite);
+            LOGI("GuestStdout/Stderr: %s", logMsg.c_str());
+            uint32_t ret = static_cast<uint32_t>(toWrite);
+            uc_reg_write(uc, UC_ARM_REG_R0, &ret);
+            return;
+        }
+        ssize_t nWritten = ::write(static_cast<int>(fd), tmp.data(), toWrite);
+        uint32_t ret = (nWritten >= 0) ? static_cast<uint32_t>(nWritten) : 0xFFFFFFFFU;
+        if (nWritten < 0) {
+            uint32_t err = static_cast<uint32_t>(errno);
+            uc_mem_write(uc, guestJniBase_ + 0x2000U, &err, 4);
+            uc_mem_write(uc, guestTlsBase_ + 0x100U, &err, 4);
+        }
+        uc_reg_write(uc, UC_ARM_REG_R0, &ret);
+        return;
+    }
+
+    // lseek
+    if (name == "lseek") {
+        uint32_t fd = 0, off = 0, whence = 0;
+        uc_reg_read(uc, UC_ARM_REG_R0, &fd);
+        uc_reg_read(uc, UC_ARM_REG_R1, &off);
+        uc_reg_read(uc, UC_ARM_REG_R2, &whence);
+        off_t res = ::lseek(static_cast<int>(fd), static_cast<off_t>(static_cast<int32_t>(off)), static_cast<int>(whence));
+        uint32_t ret = (res != (off_t)-1) ? static_cast<uint32_t>(res) : 0xFFFFFFFFU;
+        if (res == (off_t)-1) {
+            uint32_t err = static_cast<uint32_t>(errno);
+            uc_mem_write(uc, guestJniBase_ + 0x2000U, &err, 4);
+            uc_mem_write(uc, guestTlsBase_ + 0x100U, &err, 4);
+        }
+        uc_reg_write(uc, UC_ARM_REG_R0, &ret);
+        return;
+    }
+
+    // lseek64 (AAPCS: R0=fd, R1=pad, R2:R3=off64, [SP]=whence -> R0:R1=ret64)
+    if (name == "lseek64") {
+        uint32_t fd = 0, offLo = 0, offHi = 0, sp = 0, whence = 0;
+        uc_reg_read(uc, UC_ARM_REG_R0, &fd);
+        uc_reg_read(uc, UC_ARM_REG_R2, &offLo);
+        uc_reg_read(uc, UC_ARM_REG_R3, &offHi);
+        uc_reg_read(uc, UC_ARM_REG_SP, &sp);
+        if (sp != 0) uc_mem_read(uc, sp, &whence, 4);
+
+        int64_t off64 = (static_cast<int64_t>(offHi) << 32) | offLo;
+        off_t res = ::lseek(static_cast<int>(fd), static_cast<off_t>(off64), static_cast<int>(whence));
+        if (res != (off_t)-1) {
+            uint32_t retLo = static_cast<uint32_t>(res & 0xFFFFFFFFU);
+            uint32_t retHi = static_cast<uint32_t>((static_cast<uint64_t>(res) >> 32) & 0xFFFFFFFFU);
+            uc_reg_write(uc, UC_ARM_REG_R0, &retLo);
+            uc_reg_write(uc, UC_ARM_REG_R1, &retHi);
+        } else {
+            uint32_t negOne = 0xFFFFFFFFU;
+            uc_reg_write(uc, UC_ARM_REG_R0, &negOne);
+            uc_reg_write(uc, UC_ARM_REG_R1, &negOne);
+            uint32_t err = static_cast<uint32_t>(errno);
+            uc_mem_write(uc, guestJniBase_ + 0x2000U, &err, 4);
+            uc_mem_write(uc, guestTlsBase_ + 0x100U, &err, 4);
+        }
+        return;
+    }
+
+    // stat, stat64, lstat, lstat64
+    if (name == "stat" || name == "stat64" || name == "lstat" || name == "lstat64") {
+        uint32_t pathPtr = 0, statPtr = 0;
+        uc_reg_read(uc, UC_ARM_REG_R0, &pathPtr);
+        uc_reg_read(uc, UC_ARM_REG_R1, &statPtr);
+        std::string gpath = readGuestCString(uc, pathPtr, 1024);
+        std::string resolved = SyscallDispatcher::resolveFilePath(gpath.c_str());
+        struct stat hostSt{};
+        int res = ::stat(resolved.c_str(), &hostSt);
+        if (res == 0 && statPtr != 0) {
+            kernel_stat64_arm32 st32{};
+            fillStat64(hostSt, st32);
+            uc_mem_write(uc, statPtr, &st32, sizeof(st32));
+            uint32_t zero = 0;
+            uc_reg_write(uc, UC_ARM_REG_R0, &zero);
+        } else {
+            uint32_t negOne = 0xFFFFFFFFU;
+            uc_reg_write(uc, UC_ARM_REG_R0, &negOne);
+            uint32_t err = static_cast<uint32_t>(errno);
+            uc_mem_write(uc, guestJniBase_ + 0x2000U, &err, 4);
+            uc_mem_write(uc, guestTlsBase_ + 0x100U, &err, 4);
+        }
+        return;
+    }
+
+    // fstat, fstat64
+    if (name == "fstat" || name == "fstat64") {
+        uint32_t fd = 0, statPtr = 0;
+        uc_reg_read(uc, UC_ARM_REG_R0, &fd);
+        uc_reg_read(uc, UC_ARM_REG_R1, &statPtr);
+        struct stat hostSt{};
+        int res = ::fstat(static_cast<int>(fd), &hostSt);
+        if (res == 0 && statPtr != 0) {
+            kernel_stat64_arm32 st32{};
+            fillStat64(hostSt, st32);
+            uc_mem_write(uc, statPtr, &st32, sizeof(st32));
+            uint32_t zero = 0;
+            uc_reg_write(uc, UC_ARM_REG_R0, &zero);
+        } else {
+            uint32_t negOne = 0xFFFFFFFFU;
+            uc_reg_write(uc, UC_ARM_REG_R0, &negOne);
+            uint32_t err = static_cast<uint32_t>(errno);
+            uc_mem_write(uc, guestJniBase_ + 0x2000U, &err, 4);
+            uc_mem_write(uc, guestTlsBase_ + 0x100U, &err, 4);
+        }
+        return;
+    }
+
+    // access
+    if (name == "access") {
+        uint32_t pathPtr = 0, mode = 0;
+        uc_reg_read(uc, UC_ARM_REG_R0, &pathPtr);
+        uc_reg_read(uc, UC_ARM_REG_R1, &mode);
+        std::string gpath = readGuestCString(uc, pathPtr, 1024);
+        std::string resolved = SyscallDispatcher::resolveFilePath(gpath.c_str());
+        int res = ::access(resolved.c_str(), static_cast<int>(mode));
+        uint32_t ret = (res == 0) ? 0 : 0xFFFFFFFFU;
+        if (res != 0) {
+            uint32_t err = static_cast<uint32_t>(errno);
+            uc_mem_write(uc, guestJniBase_ + 0x2000U, &err, 4);
+            uc_mem_write(uc, guestTlsBase_ + 0x100U, &err, 4);
+        }
+        uc_reg_write(uc, UC_ARM_REG_R0, &ret);
+        return;
+    }
+
+    // opendir, readdir, closedir
+    if (name == "opendir") {
+        uint32_t pathPtr = 0;
+        uc_reg_read(uc, UC_ARM_REG_R0, &pathPtr);
+        std::string gpath = readGuestCString(uc, pathPtr, 1024);
+        std::string resolved = SyscallDispatcher::resolveFilePath(gpath.c_str());
+        DIR* d = ::opendir(resolved.c_str());
+        if (d) {
+            std::lock_guard<std::mutex> lk(sDirMutex);
+            uint32_t h = sNextDirHandle++;
+            uint32_t direntAddr = allocGuestHeap(uc, sizeof(guest_dirent32), 8);
+            sGuestDirMap[h] = { d, direntAddr };
+            uc_reg_write(uc, UC_ARM_REG_R0, &h);
+        } else {
+            uint32_t zero = 0;
+            uc_reg_write(uc, UC_ARM_REG_R0, &zero);
+            uint32_t err = static_cast<uint32_t>(errno);
+            uc_mem_write(uc, guestJniBase_ + 0x2000U, &err, 4);
+            uc_mem_write(uc, guestTlsBase_ + 0x100U, &err, 4);
+        }
+        return;
+    }
+    if (name == "readdir") {
+        uint32_t dirH = 0;
+        uc_reg_read(uc, UC_ARM_REG_R0, &dirH);
+        std::lock_guard<std::mutex> lk(sDirMutex);
+        auto it = sGuestDirMap.find(dirH);
+        if (it != sGuestDirMap.end() && it->second.hostDir) {
+            struct dirent* de = ::readdir(it->second.hostDir);
+            if (de) {
+                guest_dirent32 gd32{};
+                gd32.d_ino = de->d_ino;
+                gd32.d_off = de->d_off;
+                gd32.d_reclen = sizeof(guest_dirent32);
+                gd32.d_type = de->d_type;
+                std::strncpy(gd32.d_name, de->d_name, sizeof(gd32.d_name) - 1);
+                uc_mem_write(uc, it->second.direntBufAddr, &gd32, sizeof(gd32));
+                uc_reg_write(uc, UC_ARM_REG_R0, &it->second.direntBufAddr);
+                return;
+            }
+        }
+        uint32_t zero = 0;
+        uc_reg_write(uc, UC_ARM_REG_R0, &zero);
+        return;
+    }
+    if (name == "closedir") {
+        uint32_t dirH = 0;
+        uc_reg_read(uc, UC_ARM_REG_R0, &dirH);
+        std::lock_guard<std::mutex> lk(sDirMutex);
+        auto it = sGuestDirMap.find(dirH);
+        if (it != sGuestDirMap.end()) {
+            if (it->second.hostDir) ::closedir(it->second.hostDir);
+            if (it->second.direntBufAddr) freeGuestHeap(it->second.direntBufAddr, uc);
+            sGuestDirMap.erase(it);
+        }
+        uint32_t zero = 0;
+        uc_reg_write(uc, UC_ARM_REG_R0, &zero);
+        return;
+    }
+
+    // clock_gettime, gettimeofday, time
+    if (name == "clock_gettime") {
+        uint32_t clkId = 0, tpPtr = 0;
+        uc_reg_read(uc, UC_ARM_REG_R0, &clkId);
+        uc_reg_read(uc, UC_ARM_REG_R1, &tpPtr);
+        struct timespec ts{};
+        int res = ::clock_gettime(static_cast<clockid_t>(clkId), &ts);
+        if (res == 0 && tpPtr != 0) {
+            uint32_t buf[2] = { static_cast<uint32_t>(ts.tv_sec), static_cast<uint32_t>(ts.tv_nsec) };
+            uc_mem_write(uc, tpPtr, buf, sizeof(buf));
+        }
+        uint32_t ret = static_cast<uint32_t>(res);
+        uc_reg_write(uc, UC_ARM_REG_R0, &ret);
+        return;
+    }
+    if (name == "gettimeofday") {
+        uint32_t tvPtr = 0, tzPtr = 0;
+        uc_reg_read(uc, UC_ARM_REG_R0, &tvPtr);
+        uc_reg_read(uc, UC_ARM_REG_R1, &tzPtr);
+        struct timeval tv{};
+        int res = ::gettimeofday(&tv, nullptr);
+        if (res == 0 && tvPtr != 0) {
+            uint32_t buf[2] = { static_cast<uint32_t>(tv.tv_sec), static_cast<uint32_t>(tv.tv_usec) };
+            uc_mem_write(uc, tvPtr, buf, sizeof(buf));
+        }
+        uint32_t ret = static_cast<uint32_t>(res);
+        uc_reg_write(uc, UC_ARM_REG_R0, &ret);
+        return;
+    }
+    if (name == "time") {
+        uint32_t tlocPtr = 0;
+        uc_reg_read(uc, UC_ARM_REG_R0, &tlocPtr);
+        time_t cur = ::time(nullptr);
+        uint32_t ucur = static_cast<uint32_t>(cur);
+        if (tlocPtr != 0) {
+            uc_mem_write(uc, tlocPtr, &ucur, 4);
+        }
+        uc_reg_write(uc, UC_ARM_REG_R0, &ucur);
+        return;
+    }
+
+    // nanosleep, usleep
+    if (name == "nanosleep") {
+        uint32_t reqPtr = 0, remPtr = 0;
+        uc_reg_read(uc, UC_ARM_REG_R0, &reqPtr);
+        uc_reg_read(uc, UC_ARM_REG_R1, &remPtr);
+        if (reqPtr != 0) {
+            uint32_t buf[2]{0};
+            uc_mem_read(uc, reqPtr, buf, sizeof(buf));
+            struct timespec req{ static_cast<time_t>(buf[0]), static_cast<long>(buf[1]) };
+            ::nanosleep(&req, nullptr);
+        }
+        uint32_t zero = 0;
+        uc_reg_write(uc, UC_ARM_REG_R0, &zero);
+        return;
+    }
+    if (name == "usleep") {
+        uint32_t usec = 0;
+        uc_reg_read(uc, UC_ARM_REG_R0, &usec);
+        ::usleep(static_cast<useconds_t>(usec));
+        uint32_t zero = 0;
+        uc_reg_write(uc, UC_ARM_REG_R0, &zero);
+        return;
+    }
+
+    // mmap, munmap, mprotect
+    if (name == "mmap") {
+        uint32_t addr = 0, length = 0, prot = 0, flags = 0;
+        uc_reg_read(uc, UC_ARM_REG_R0, &addr);
+        uc_reg_read(uc, UC_ARM_REG_R1, &length);
+        uc_reg_read(uc, UC_ARM_REG_R2, &prot);
+        uc_reg_read(uc, UC_ARM_REG_R3, &flags);
+        if (length == 0) length = 4096;
+        uint32_t alignedSize = (length + 0xFFFU) & ~0xFFFU;
+        uint32_t allocBase = (addr != 0) ? (addr & ~0xFFFU) : allocGuestHeap(uc, alignedSize, 4096);
+        auto& gm = GuestMemory::getSharedInstance();
+        if (!gm.isMappedRange(allocBase, alignedSize)) {
+            gm.map(allocBase, alignedSize, GP_READ | GP_WRITE);
+        }
+        if (uc) {
+            uc_mem_map(uc, allocBase, alignedSize, UC_PROT_ALL);
+        }
+        uc_reg_write(uc, UC_ARM_REG_R0, &allocBase);
+        return;
+    }
+    if (name == "munmap") {
+        uint32_t addr = 0, length = 0;
+        uc_reg_read(uc, UC_ARM_REG_R0, &addr);
+        uc_reg_read(uc, UC_ARM_REG_R1, &length);
+        if (addr != 0 && length != 0) {
+            uint32_t alignedBase = addr & ~0xFFFU;
+            uint32_t alignedSize = (length + 0xFFFU) & ~0xFFFU;
+            GuestMemory::getSharedInstance().unmap(alignedBase, alignedSize);
+            if (uc) uc_mem_unmap(uc, alignedBase, alignedSize);
+        }
+        uint32_t zero = 0;
+        uc_reg_write(uc, UC_ARM_REG_R0, &zero);
+        return;
+    }
+    if (name == "mprotect") {
+        uint32_t zero = 0;
+        uc_reg_write(uc, UC_ARM_REG_R0, &zero);
+        return;
+    }
+
+    // ioctl
+    if (name == "ioctl") {
+        uint32_t fd = 0, req = 0, arg = 0;
+        uc_reg_read(uc, UC_ARM_REG_R0, &fd);
+        uc_reg_read(uc, UC_ARM_REG_R1, &req);
+        uc_reg_read(uc, UC_ARM_REG_R2, &arg);
+        int res = ::ioctl(static_cast<int>(fd), static_cast<int>(req), nullptr);
+        uint32_t ret = (res >= 0) ? static_cast<uint32_t>(res) : 0;
+        uc_reg_write(uc, UC_ARM_REG_R0, &ret);
+        return;
+    }
+
+    // printf, sscanf, strncat, setenv, system
+    if (name == "printf") {
+        uint32_t fmtAddr = 0;
+        uc_reg_read(uc, UC_ARM_REG_R0, &fmtAddr);
+        std::string fmt = readGuestCString(uc, fmtAddr, 2048);
+        std::string formatted = formatGuestPrintf(uc, fmt, 1, 0);
+        LOGI("GUEST_PRINTF: %s", formatted.c_str());
+        uint32_t len = static_cast<uint32_t>(formatted.size());
+        uc_reg_write(uc, UC_ARM_REG_R0, &len);
+        return;
+    }
+    if (name == "sscanf") {
+        uint32_t srcAddr = 0, fmtAddr = 0, out1 = 0;
+        uc_reg_read(uc, UC_ARM_REG_R0, &srcAddr);
+        uc_reg_read(uc, UC_ARM_REG_R1, &fmtAddr);
+        uc_reg_read(uc, UC_ARM_REG_R2, &out1);
+        std::string src = readGuestCString(uc, srcAddr, 1024);
+        std::string fmt = readGuestCString(uc, fmtAddr, 256);
+        int parsedVal = 0;
+        int count = sscanf(src.c_str(), fmt.c_str(), &parsedVal);
+        if (count == 1 && out1 != 0) {
+            uint32_t uVal = static_cast<uint32_t>(parsedVal);
+            uc_mem_write(uc, out1, &uVal, 4);
+        }
+        uint32_t ret = (count >= 0) ? static_cast<uint32_t>(count) : 0;
+        uc_reg_write(uc, UC_ARM_REG_R0, &ret);
+        return;
+    }
+    if (name == "strncat") {
+        uint32_t dst = 0, src = 0, n = 0;
+        uc_reg_read(uc, UC_ARM_REG_R0, &dst);
+        uc_reg_read(uc, UC_ARM_REG_R1, &src);
+        uc_reg_read(uc, UC_ARM_REG_R2, &n);
+        std::string sDst = readGuestCString(uc, dst, 8192);
+        std::string sSrc = readGuestCString(uc, src, std::min<size_t>(n, 8192));
+        std::string combined = sDst + sSrc.substr(0, n);
+        uc_mem_write(uc, dst, combined.c_str(), combined.size() + 1);
+        uc_reg_write(uc, UC_ARM_REG_R0, &dst);
+        return;
+    }
+    if (name == "setenv") {
+        uint32_t namePtr = 0, valPtr = 0, overwrite = 0;
+        uc_reg_read(uc, UC_ARM_REG_R0, &namePtr);
+        uc_reg_read(uc, UC_ARM_REG_R1, &valPtr);
+        uc_reg_read(uc, UC_ARM_REG_R2, &overwrite);
+        std::string envName = readGuestCString(uc, namePtr, 256);
+        std::string envVal = readGuestCString(uc, valPtr, 1024);
+        if (!envName.empty()) {
+            ::setenv(envName.c_str(), envVal.c_str(), static_cast<int>(overwrite));
+        }
+        uint32_t zero = 0;
+        uc_reg_write(uc, UC_ARM_REG_R0, &zero);
+        return;
+    }
+    if (name == "system") {
         uint32_t zero = 0;
         uc_reg_write(uc, UC_ARM_REG_R0, &zero);
         return;
@@ -5214,6 +5819,14 @@ void GuestRuntimeEnvironment::handleTrampolineCall(uint32_t trampolineId, uc_eng
 
         // 1. Prova prima il filesystem reale (file estratti su disco)
         std::string resolved = resolveAssetPath(filename);
+        if (resolved.empty()) {
+            if (access(filename.c_str(), F_OK) == 0) {
+                resolved = filename;
+            } else {
+                std::string pCustom = sCustomStoragePath + "/assets/" + filename;
+                if (access(pCustom.c_str(), F_OK) == 0) resolved = pCustom;
+            }
+        }
         if (!resolved.empty()) {
             FILE* fp = fopen(resolved.c_str(), "rb");
             if (fp) {
@@ -5434,8 +6047,17 @@ void GuestRuntimeEnvironment::handleTrampolineCall(uint32_t trampolineId, uc_eng
             return;
         }
 
-        if (outStart != 0) uc_mem_write(uc, outStart, &start, 4);
-        if (outLength != 0) uc_mem_write(uc, outLength, &len, 4);
+        if (name == "AAsset_openFileDescriptor64") {
+            uint64_t start64 = static_cast<uint64_t>(start);
+            uint64_t len64 = static_cast<uint64_t>(len);
+            if (outStart != 0) uc_mem_write(uc, outStart, &start64, 8);
+            if (outLength != 0) uc_mem_write(uc, outLength, &len64, 8);
+        } else {
+            uint32_t start32 = start;
+            uint32_t len32 = len;
+            if (outStart != 0) uc_mem_write(uc, outStart, &start32, 4);
+            if (outLength != 0) uc_mem_write(uc, outLength, &len32, 4);
+        }
 
         int dupFd = dup(fd);
         uint32_t retFd = static_cast<uint32_t>(dupFd >= 0 ? dupFd : fd);
@@ -5469,21 +6091,29 @@ void GuestRuntimeEnvironment::handleTrampolineCall(uint32_t trampolineId, uc_eng
         uc_reg_read(uc, UC_ARM_REG_R1, &dirNamePtr);
         std::string dirName = readGuestCString(uc, dirNamePtr, 256);
 
+        std::vector<std::string> dirCandidates = {
+            filesDir_ + "/assets/" + packageName_ + "/" + dirName,
+            filesDir_ + "/assets/" + dirName,
+            nativeLibDir_ + "/assets/" + dirName,
+            sCustomStoragePath + "/assets/" + dirName
+        };
         uint32_t dirH = nextAssetDirHandle_++;
         GuestAssetDir gad;
         gad.id = dirH;
         gad.currentIndex = 0;
 
-        std::string resolvedDir = filesDir_ + "/assets/" + packageName_ + "/" + dirName;
-        DIR* d = opendir(resolvedDir.c_str());
-        if (d) {
-            struct dirent* entry;
-            while ((entry = readdir(d)) != nullptr) {
-                if (entry->d_name[0] != '.') {
-                    gad.files.push_back(entry->d_name);
+        for (const auto& resolvedDir : dirCandidates) {
+            DIR* d = opendir(resolvedDir.c_str());
+            if (d) {
+                struct dirent* entry;
+                while ((entry = readdir(d)) != nullptr) {
+                    if (entry->d_name[0] != '.') {
+                        gad.files.push_back(entry->d_name);
+                    }
                 }
+                closedir(d);
+                if (!gad.files.empty()) break;
             }
-            closedir(d);
         }
 
         // Se la cartella fisica non esiste o e' vuota, interroga il Virtual File System OBB/APK
@@ -5557,7 +6187,8 @@ void GuestRuntimeEnvironment::handleTrampolineCall(uint32_t trampolineId, uc_eng
         return;
     }
 
-    // Default fallback per stub non critici: ritorna 0
+    // Default fallback per stub non critici: traccia warning e ritorna 0
+    LOGW("Trampoline: Simbolo '%s' non intercettato esplicitamente, restituzione fallback 0", name.c_str());
     uint32_t zero = 0;
     uc_reg_write(uc, UC_ARM_REG_R0, &zero);
 }

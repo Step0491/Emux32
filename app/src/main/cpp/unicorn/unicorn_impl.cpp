@@ -316,6 +316,7 @@ struct UnicornInstance {
     std::mutex hook_mutex;
 
 #if defined(EMUX_ENABLE_DYNARMIC)
+    uint32_t target_until{0};
     std::unique_ptr<DynarmicUserCallbacks> dynarmic_cb;
     std::shared_ptr<DynarmicCp15> dynarmic_cp15;
     std::unique_ptr<Dynarmic::A32::Jit> dynarmic_jit;
@@ -1217,9 +1218,11 @@ public:
     }
 
     std::optional<std::uint32_t> MemoryReadCode(Dynarmic::A32::VAddr vaddr) override {
-        if ((vaddr & ~1U) == 0xDEADBEEEU || vaddr == 0) {
-            inst_->dynarmic_jit->HaltExecution(Dynarmic::HaltReason::UserDefined2);
-            return std::nullopt;
+        // Intercetta ritorni da funzioni guest (LR=0xDEADBEEF) o raggiungimento del target di esecuzione:
+        // restituisce l'istruzione ARM32 BKPT #0 (0xe1200070) per provocare un'interruzione pulita sia in ARM che Thumb
+        if ((vaddr & 0xFFFFF000U) == 0xDEADB000U || (vaddr & ~1U) == 0xDEADBEEEU || vaddr == 0 ||
+            (inst_->target_until != 0 && (vaddr & ~1U) == (inst_->target_until & ~1U))) {
+            return 0xe1200070U; // ARM32 BKPT #0
         }
 
         if ((vaddr & 0xFFFFF000U) == 0xFFFF0000U) {
@@ -1269,6 +1272,15 @@ public:
     }
 
     void ExceptionRaised(Dynarmic::A32::VAddr pc, Dynarmic::A32::Exception exception) override {
+        // Se il PC ha raggiunto l'indirizzo sentinella di ritorno (0xDEADBEEF) o il target_until esplicito,
+        // arresta il JIT immediatamente senza propagare falsi segnali SIGSEGV al gestore del guest
+        if (pc == 0xDEADBEEFU || (pc & 0xFFFFF000U) == 0xDEADB000U || pc == 0 ||
+            (inst_->target_until != 0 && (pc & ~1U) == (inst_->target_until & ~1U))) {
+            inst_->dynarmic_jit->Regs()[15] = pc;
+            inst_->dynarmic_jit->HaltExecution(Dynarmic::HaltReason::UserDefined1);
+            return;
+        }
+
         if (exception == Dynarmic::A32::Exception::Yield ||
             exception == Dynarmic::A32::Exception::WaitForEvent ||
             exception == Dynarmic::A32::Exception::WaitForInterrupt ||
@@ -1384,7 +1396,8 @@ uc_err UnicornInstance::runDynarmic(uint64_t begin, uint64_t until, size_t count
     bool wasRunning = is_running.exchange(true);
     bool prevStop = stop_requested.exchange(false);
 
-    uint32_t targetUntil = static_cast<uint32_t>(until);
+    target_until = static_cast<uint32_t>(until);
+    uint32_t targetUntil = target_until;
 
     while (is_running.load(std::memory_order_relaxed) &&
            !stop_requested.load(std::memory_order_relaxed)) {
@@ -1393,7 +1406,7 @@ uc_err UnicornInstance::runDynarmic(uint64_t begin, uint64_t until, size_t count
         if (targetUntil != 0 && (curPc & ~1U) == (targetUntil & ~1U)) {
             break;
         }
-        if ((curPc & ~1U) == 0xDEADBEEEU || curPc == 0) {
+        if ((curPc & ~1U) == 0xDEADBEEEU || curPc == 0xDEADBEEFU || (curPc & 0xFFFFF000U) == 0xDEADB000U || curPc == 0) {
             break;
         }
 
@@ -1403,7 +1416,7 @@ uc_err UnicornInstance::runDynarmic(uint64_t begin, uint64_t until, size_t count
         if (targetUntil != 0 && (curPc & ~1U) == (targetUntil & ~1U)) {
             break;
         }
-        if ((curPc & ~1U) == 0xDEADBEEEU || curPc == 0) {
+        if ((curPc & ~1U) == 0xDEADBEEEU || curPc == 0xDEADBEEFU || (curPc & 0xFFFFF000U) == 0xDEADB000U || curPc == 0) {
             break;
         }
 
@@ -1411,8 +1424,8 @@ uc_err UnicornInstance::runDynarmic(uint64_t begin, uint64_t until, size_t count
             break;
         }
 
-        if (Dynarmic::Has(hr, Dynarmic::HaltReason::UserDefined2) ||
-            Dynarmic::Has(hr, Dynarmic::HaltReason::UserDefined1)) {
+        if (Dynarmic::Has(hr, Dynarmic::HaltReason::UserDefined1) ||
+            Dynarmic::Has(hr, Dynarmic::HaltReason::UserDefined2)) {
             break;
         }
 
@@ -1420,6 +1433,7 @@ uc_err UnicornInstance::runDynarmic(uint64_t begin, uint64_t until, size_t count
             break;
         }
     }
+    target_until = 0;
 
     if ((dynarmic_jit->Regs()[15] & ~1U) == 0xDEADBEEEU) {
         dynarmic_jit->Regs()[15] = targetUntil ? targetUntil : 0xDEADBEEFU;
