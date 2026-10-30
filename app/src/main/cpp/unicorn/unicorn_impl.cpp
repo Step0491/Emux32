@@ -532,7 +532,7 @@ struct UnicornInstance {
 
     inline void branchWritePC(uint32_t target) {
         itstate = 0;
-        if ((target & ~1U) == 0xDEADBEEEU || target == 0) {
+        if ((target & 0xFFFF0000U) == 0xDEAD0000U || (target & ~1U) == 0xDEADBEEEU || target == 0) {
             regs[15] = target;
             return;
         }
@@ -1218,9 +1218,9 @@ public:
     }
 
     std::optional<std::uint32_t> MemoryReadCode(Dynarmic::A32::VAddr vaddr) override {
-        // Intercetta ritorni da funzioni guest (LR=0xDEADBEEF) o raggiungimento del target di esecuzione:
+        // Intercetta ritorni da funzioni guest (LR=0xDEADxxxx) o raggiungimento del target di esecuzione:
         // restituisce l'istruzione ARM32 BKPT #0 (0xe1200070) per provocare un'interruzione pulita sia in ARM che Thumb
-        if ((vaddr & 0xFFFFF000U) == 0xDEADB000U || (vaddr & ~1U) == 0xDEADBEEEU || vaddr == 0 ||
+        if ((vaddr & 0xFFFF0000U) == 0xDEAD0000U || (vaddr & ~1U) == 0xDEADBEEEU || vaddr == 0 ||
             (inst_->target_until != 0 && (vaddr & ~1U) == (inst_->target_until & ~1U))) {
             return 0xe1200070U; // ARM32 BKPT #0
         }
@@ -1272,9 +1272,9 @@ public:
     }
 
     void ExceptionRaised(Dynarmic::A32::VAddr pc, Dynarmic::A32::Exception exception) override {
-        // Se il PC ha raggiunto l'indirizzo sentinella di ritorno (0xDEADBEEF) o il target_until esplicito,
+        // Se il PC ha raggiunto l'indirizzo sentinella di ritorno (0xDEADxxxx) o il target_until esplicito,
         // arresta il JIT immediatamente senza propagare falsi segnali SIGSEGV al gestore del guest
-        if (pc == 0xDEADBEEFU || (pc & 0xFFFFF000U) == 0xDEADB000U || pc == 0 ||
+        if ((pc & 0xFFFF0000U) == 0xDEAD0000U || pc == 0xDEADBEEFU || pc == 0 ||
             (inst_->target_until != 0 && (pc & ~1U) == (inst_->target_until & ~1U))) {
             inst_->dynarmic_jit->Regs()[15] = pc;
             inst_->dynarmic_jit->HaltExecution(Dynarmic::HaltReason::UserDefined1);
@@ -1290,7 +1290,7 @@ public:
             return;
         }
 
-        if ((pc & ~1U) == 0xDEADBEEEU || pc == 0) {
+        if ((pc & ~1U) == 0xDEADBEEEU || (pc & 0xFFFF0000U) == 0xDEAD0000U || pc == 0) {
             inst_->dynarmic_jit->HaltExecution(Dynarmic::HaltReason::UserDefined2);
             return;
         }
@@ -1406,7 +1406,7 @@ uc_err UnicornInstance::runDynarmic(uint64_t begin, uint64_t until, size_t count
         if (targetUntil != 0 && (curPc & ~1U) == (targetUntil & ~1U)) {
             break;
         }
-        if ((curPc & ~1U) == 0xDEADBEEEU || curPc == 0xDEADBEEFU || (curPc & 0xFFFFF000U) == 0xDEADB000U || curPc == 0) {
+        if ((curPc & ~1U) == 0xDEADBEEEU || curPc == 0xDEADBEEFU || (curPc & 0xFFFF0000U) == 0xDEAD0000U || curPc == 0) {
             break;
         }
 
@@ -1416,7 +1416,7 @@ uc_err UnicornInstance::runDynarmic(uint64_t begin, uint64_t until, size_t count
         if (targetUntil != 0 && (curPc & ~1U) == (targetUntil & ~1U)) {
             break;
         }
-        if ((curPc & ~1U) == 0xDEADBEEEU || curPc == 0xDEADBEEFU || (curPc & 0xFFFFF000U) == 0xDEADB000U || curPc == 0) {
+        if ((curPc & ~1U) == 0xDEADBEEEU || curPc == 0xDEADBEEFU || (curPc & 0xFFFF0000U) == 0xDEAD0000U || curPc == 0) {
             break;
         }
 
@@ -1435,8 +1435,11 @@ uc_err UnicornInstance::runDynarmic(uint64_t begin, uint64_t until, size_t count
     }
     target_until = 0;
 
-    if ((dynarmic_jit->Regs()[15] & ~1U) == 0xDEADBEEEU) {
-        dynarmic_jit->Regs()[15] = targetUntil ? targetUntil : 0xDEADBEEFU;
+    if ((dynarmic_jit->Regs()[15] & ~1U) == 0xDEADBEEEU ||
+        (dynarmic_jit->Regs()[15] & 0xFFFF0000U) == 0xDEAD0000U) {
+        if (targetUntil != 0) {
+            dynarmic_jit->Regs()[15] = targetUntil;
+        }
     }
 
     auto& finalRegs = dynarmic_jit->Regs();
@@ -1992,7 +1995,7 @@ uc_err runInterpreter(UnicornInstance* inst, uint64_t begin, uint64_t until, siz
         uint32_t pc = inst->regs[15];
 
         if (until != 0 && (pc & ~1U) == (static_cast<uint32_t>(until) & ~1U)) break;
-        if ((pc & ~1U) == 0xDEADBEEEU || pc == 0) break;
+        if ((pc & ~1U) == 0xDEADBEEEU || (pc & 0xFFFF0000U) == 0xDEAD0000U || pc == 0) break;
 
         // Linux ARM32 Kernel User Helpers (0xFFFF0F60 .. 0xFFFF0FE0)
         if ((pc & 0xFFFFF000U) == 0xFFFF0000U) {
@@ -2047,7 +2050,7 @@ uc_err runInterpreter(UnicornInstance* inst, uint64_t begin, uint64_t until, siz
             if (emux::GuestSignalManager::getInstance().deliverSignal(reinterpret_cast<uc_engine*>(inst), emux::GUEST_SIGSEGV, pc, 1)) {
                 continue;
             }
-            if (lr >= 0x1000U && (lr & ~1U) != 0xDEADBEEEU && lr != lastValidPc && nullRecoveries < 64) {
+            if (lr >= 0x1000U && (lr & 0xFFFF0000U) != 0xDEAD0000U && (lr & ~1U) != 0xDEADBEEEU && lr != lastValidPc && nullRecoveries < 64) {
                 nullRecoveries++;
                 inst->regs[0] = 0;
                 inst->branchWritePC(lr);
@@ -2075,7 +2078,7 @@ uc_err runInterpreter(UnicornInstance* inst, uint64_t begin, uint64_t until, siz
                 if (emux::GuestSignalManager::getInstance().deliverSignal(reinterpret_cast<uc_engine*>(inst), emux::GUEST_SIGSEGV, pc, 1)) {
                     continue;
                 }
-                if (inst->regs[14] >= 0x1000U && (inst->regs[14] & ~1U) != 0xDEADBEEEU && nullRecoveries < 32) {
+                if (inst->regs[14] >= 0x1000U && (inst->regs[14] & 0xFFFF0000U) != 0xDEAD0000U && (inst->regs[14] & ~1U) != 0xDEADBEEEU && nullRecoveries < 32) {
                     nullRecoveries++;
                     inst->regs[0] = 0;
                     inst->branchWritePC(inst->regs[14]);
@@ -2468,7 +2471,7 @@ uc_err runInterpreter(UnicornInstance* inst, uint64_t begin, uint64_t until, siz
                 if (emux::GuestSignalManager::getInstance().deliverSignal(reinterpret_cast<uc_engine*>(inst), emux::GUEST_SIGSEGV, pc, 1)) {
                     continue;
                 }
-                if (inst->regs[14] >= 0x1000U && (inst->regs[14] & ~1U) != 0xDEADBEEEU && nullRecoveries < 32) {
+                if (inst->regs[14] >= 0x1000U && (inst->regs[14] & 0xFFFF0000U) != 0xDEAD0000U && (inst->regs[14] & ~1U) != 0xDEADBEEEU && nullRecoveries < 32) {
                     nullRecoveries++;
                     inst->regs[0] = 0;
                     inst->branchWritePC(inst->regs[14]);
