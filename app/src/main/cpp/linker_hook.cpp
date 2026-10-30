@@ -27,6 +27,7 @@
 #include <sys/mman.h>
 #include <zlib.h>
 #include "core/vfs_zip.h"
+#include "core/pvrtc_decompress.h"
 #include <cstring>
 #include <cerrno>
 #include <cmath>
@@ -569,6 +570,29 @@ std::string SyscallDispatcher::resolveFilePath(const char* guestPath) {
         return targetUc;
     }
 
+    // 2b. Risoluzione prioritaria assoluta per Android/obb/ (Card Wars, ecc.)
+    size_t obbPos = pathStr.find("/Android/obb/");
+    if (obbPos != std::string::npos && !pkg.empty()) {
+        std::string afterObb = pathStr.substr(obbPos + 13);
+        size_t nextSlash = afterObb.find('/');
+        std::string relPath = (nextSlash != std::string::npos) ? afterObb.substr(nextSlash + 1) : afterObb;
+        std::vector<std::string> obbCandidates = {
+            fDir + "/obb/" + pkg + "/" + relPath,
+            env.getObbDir() + "/" + relPath,
+            sCustomStoragePath + "/obb/" + pkg + "/" + relPath,
+            sCustomStoragePath + "/obb/" + relPath,
+            "/storage/emulated/0/Android/obb/" + pkg + "/" + relPath,
+            "/storage/emulated/0/Emux32/obb/" + pkg + "/" + relPath,
+            "/storage/emulated/0/Emux32/obb/" + relPath
+        };
+        for (const auto& cand : obbCandidates) {
+            if (access(cand.c_str(), F_OK) == 0) {
+                LOGI("Risoluzione Android/obb (esistente): '%s' -> '%s'", guestPath, cand.c_str());
+                return cand;
+            }
+        }
+    }
+
     // 3. Risoluzione prioritaria assoluta per Android/data/
     size_t dataPos = pathStr.find("/Android/data/");
     if (dataPos != std::string::npos && !pkg.empty()) {
@@ -616,6 +640,34 @@ std::string SyscallDispatcher::resolveFilePath(const char* guestPath) {
         std::string sub = pathStr.substr(prefix.size());
         if (sub.rfind("Android/obb", 0) != 0 && sub.rfind("Android/data", 0) != 0 &&
             sub.rfind("Emux32", 0) != 0 && sub.rfind("Emulators/Emux32", 0) != 0) {
+
+            // Supporto specifico titoli storici Glu Mobile (es: Blood & Glory 2011 /sdcard/glu/gladiator/...)
+            if (sub.rfind("glu/", 0) == 0) {
+                std::string gluSub = sub.substr(4);
+                std::vector<std::string> gluCandidates = {
+                    fDir + "/guest_data/" + pkg + "/sdcard/glu/" + gluSub,
+                    fDir + "/guest_data/" + pkg + "/glu/" + gluSub,
+                    fDir + "/guest_data/" + pkg + "/" + gluSub,
+                    fDir + "/guest_data/com.glu.gladiator/sdcard/glu/" + gluSub,
+                    fDir + "/guest_data/com.glu.gladiator/" + gluSub,
+                    sCustomStoragePath + "/glu/" + gluSub,
+                    sCustomStoragePath + "/data/" + pkg + "/" + gluSub,
+                    sCustomStoragePath + "/data/com.glu.gladiator/" + gluSub,
+                    sCustomStoragePath + "/obb/" + pkg + "/" + gluSub,
+                    sCustomStoragePath + "/data/" + pkg + "/sdcard/glu/" + gluSub
+                };
+                for (const auto& gCand : gluCandidates) {
+                    if (access(gCand.c_str(), F_OK) == 0) {
+                        LOGI("Risoluzione Glu Legacy (esistente): '%s' -> '%s'", guestPath, gCand.c_str());
+                        return gCand;
+                    }
+                }
+                std::string targetGlu = fDir + "/guest_data/" + (pkg.empty() ? "com.glu.gladiator" : pkg) + "/sdcard/glu/" + gluSub;
+                ensureParentDirs(targetGlu);
+                LOGI("Redirezione assoluta Glu Legacy (nuovo): '%s' -> '%s'", guestPath, targetGlu.c_str());
+                return targetGlu;
+            }
+
             std::string customCand = sCustomStoragePath + "/" + sub;
             if (access(customCand.c_str(), F_OK) == 0) {
                 return customCand;
@@ -4845,12 +4897,73 @@ void GuestRuntimeEnvironment::handleTrampolineCall(uint32_t trampolineId, uc_eng
         uc_mem_read(uc, sp + 4, &border, 4);
         uc_mem_read(uc, sp + 8, &imgSize, 4);
         uc_mem_read(uc, sp + 12, &dataPtr, 4);
-        if (dataPtr != 0 && imgSize > 0 && imgSize < 0x04000000U) {
+        if (dataPtr != 0 && imgSize > 0 && imgSize < 0x04000000U && width > 0 && height > 0) {
             std::vector<uint8_t> data(imgSize);
             if (uc_mem_read(uc, dataPtr, data.data(), imgSize) == UC_ERR_OK) {
-                glCompressedTexImage2D(target, static_cast<GLint>(level), internalFmt,
-                                       static_cast<GLsizei>(width), static_cast<GLsizei>(height),
-                                       static_cast<GLint>(border), static_cast<GLsizei>(imgSize), data.data());
+                // Supporto nativo PVRTC per titoli PowerVR (es: Blood & Glory 2011)
+                // 0x8C00: GL_COMPRESSED_RGB_PVRTC_4BPPV1_IMG
+                // 0x8C01: GL_COMPRESSED_RGB_PVRTC_2BPPV1_IMG
+                // 0x8C02: GL_COMPRESSED_RGBA_PVRTC_4BPPV1_IMG
+                // 0x8C03: GL_COMPRESSED_RGBA_PVRTC_2BPPV1_IMG
+                if (internalFmt >= 0x8C00 && internalFmt <= 0x8C03) {
+                    uint32_t is2bpp = (internalFmt == 0x8C01 || internalFmt == 0x8C03) ? 1 : 0;
+                    std::vector<uint8_t> rgba(width * height * 4);
+                    pvr::PVRTDecompressPVRTC(data.data(), is2bpp, width, height, rgba.data());
+                    glTexImage2D(target, static_cast<GLint>(level), GL_RGBA,
+                                 static_cast<GLsizei>(width), static_cast<GLsizei>(height),
+                                 static_cast<GLint>(border), GL_RGBA, GL_UNSIGNED_BYTE, rgba.data());
+                    LOGI("GLES Passthrough: Decompressione PVRTC (%s, fmt=0x%04x) ris=%ux%u su target=0x%x eseguita con successo",
+                         is2bpp ? "2bpp" : "4bpp", internalFmt, width, height, target);
+                } else {
+                    glCompressedTexImage2D(target, static_cast<GLint>(level), internalFmt,
+                                           static_cast<GLsizei>(width), static_cast<GLsizei>(height),
+                                           static_cast<GLint>(border), static_cast<GLsizei>(imgSize), data.data());
+                    GLenum glErr = glGetError();
+                    if (glErr != GL_NO_ERROR && internalFmt == 0x8D64 /* GL_ETC1_RGB8_OES */) {
+                        std::vector<uint8_t> rgba(width * height * 4);
+                        pvr::PVRTDecompressETC(data.data(), width, height, rgba.data(), 0);
+                        glTexImage2D(target, static_cast<GLint>(level), GL_RGBA,
+                                     static_cast<GLsizei>(width), static_cast<GLsizei>(height),
+                                     static_cast<GLint>(border), GL_RGBA, GL_UNSIGNED_BYTE, rgba.data());
+                        LOGI("GLES Passthrough: Fallback Software Decompressione ETC1 ris=%ux%u eseguita", width, height);
+                    }
+                }
+            }
+        }
+        return;
+    }
+    if (name == "glCompressedTexSubImage2D") {
+        uint32_t target = 0, level = 0, xoff = 0, yoff = 0;
+        uc_reg_read(uc, UC_ARM_REG_R0, &target);
+        uc_reg_read(uc, UC_ARM_REG_R1, &level);
+        uc_reg_read(uc, UC_ARM_REG_R2, &xoff);
+        uc_reg_read(uc, UC_ARM_REG_R3, &yoff);
+        uint32_t sp = 0, width = 0, height = 0, format = 0, imgSize = 0, dataPtr = 0;
+        uc_reg_read(uc, UC_ARM_REG_SP, &sp);
+        uc_mem_read(uc, sp + 0, &width, 4);
+        uc_mem_read(uc, sp + 4, &height, 4);
+        uc_mem_read(uc, sp + 8, &format, 4);
+        uc_mem_read(uc, sp + 12, &imgSize, 4);
+        uc_mem_read(uc, sp + 16, &dataPtr, 4);
+        if (dataPtr != 0 && imgSize > 0 && imgSize < 0x04000000U && width > 0 && height > 0) {
+            std::vector<uint8_t> data(imgSize);
+            if (uc_mem_read(uc, dataPtr, data.data(), imgSize) == UC_ERR_OK) {
+                if (format >= 0x8C00 && format <= 0x8C03) {
+                    uint32_t is2bpp = (format == 0x8C01 || format == 0x8C03) ? 1 : 0;
+                    std::vector<uint8_t> rgba(width * height * 4);
+                    pvr::PVRTDecompressPVRTC(data.data(), is2bpp, width, height, rgba.data());
+                    glTexSubImage2D(target, static_cast<GLint>(level),
+                                    static_cast<GLint>(xoff), static_cast<GLint>(yoff),
+                                    static_cast<GLsizei>(width), static_cast<GLsizei>(height),
+                                    GL_RGBA, GL_UNSIGNED_BYTE, rgba.data());
+                    LOGI("GLES Passthrough: Decompressione PVRTC SubImage (%s, fmt=0x%04x) %ux%u offset=(%u,%u)",
+                         is2bpp ? "2bpp" : "4bpp", format, width, height, xoff, yoff);
+                } else {
+                    glCompressedTexSubImage2D(target, static_cast<GLint>(level),
+                                              static_cast<GLint>(xoff), static_cast<GLint>(yoff),
+                                              static_cast<GLsizei>(width), static_cast<GLsizei>(height),
+                                              format, static_cast<GLsizei>(imgSize), data.data());
+                }
             }
         }
         return;
@@ -5189,10 +5302,25 @@ void GuestRuntimeEnvironment::handleTrampolineCall(uint32_t trampolineId, uc_eng
                 } else if (pname == GL_MAX_VIEWPORT_DIMS) {
                     GLint dims[2] = {4096, 4096};
                     uc_mem_write(uc, paramsPtr, dims, 8);
+                } else if (pname == GL_NUM_COMPRESSED_TEXTURE_FORMATS) {
+                    GLint val = 9;
+                    uc_mem_write(uc, paramsPtr, &val, 4);
+                } else if (pname == GL_COMPRESSED_TEXTURE_FORMATS) {
+                    GLint supportedFormats[] = {
+                        0x8C00, // GL_COMPRESSED_RGB_PVRTC_4BPPV1_IMG
+                        0x8C01, // GL_COMPRESSED_RGB_PVRTC_2BPPV1_IMG
+                        0x8C02, // GL_COMPRESSED_RGBA_PVRTC_4BPPV1_IMG
+                        0x8C03, // GL_COMPRESSED_RGBA_PVRTC_2BPPV1_IMG
+                        0x8D64, // GL_ETC1_RGB8_OES
+                        0x83F0, // GL_COMPRESSED_RGB_S3TC_DXT1_EXT
+                        0x83F1, // GL_COMPRESSED_RGBA_S3TC_DXT1_EXT
+                        0x83F2, // GL_COMPRESSED_RGBA_S3TC_DXT3_EXT
+                        0x83F3  // GL_COMPRESSED_RGBA_S3TC_DXT5_EXT
+                    };
+                    uc_mem_write(uc, paramsPtr, supportedFormats, sizeof(supportedFormats));
                 } else {
                     GLint val = 4096;
-                    if (pname == GL_NUM_COMPRESSED_TEXTURE_FORMATS) val = 10;
-                    else if (pname == GL_MAX_TEXTURE_IMAGE_UNITS || pname == GL_MAX_COMBINED_TEXTURE_IMAGE_UNITS) val = 16;
+                    if (pname == GL_MAX_TEXTURE_IMAGE_UNITS || pname == GL_MAX_COMBINED_TEXTURE_IMAGE_UNITS) val = 16;
                     else if (pname == GL_MAX_VERTEX_ATTRIBS) val = 16;
                     else if (pname == GL_MAX_RENDERBUFFER_SIZE) val = 4096;
                     else glGetIntegerv(pname, &val);
@@ -5218,7 +5346,7 @@ void GuestRuntimeEnvironment::handleTrampolineCall(uint32_t trampolineId, uc_eng
         else if (glEnum == GL_RENDERER) strVal = "Adreno / Mali Hardware Accelerated";
         else if (glEnum == GL_VERSION) strVal = "OpenGL ES 2.0 Emux32";
         else if (glEnum == GL_SHADING_LANGUAGE_VERSION) strVal = "OpenGL ES GLSL ES 1.00";
-        else if (glEnum == GL_EXTENSIONS) strVal = "GL_OES_compressed_ETC1_RGB8_texture GL_OES_depth24 GL_OES_depth_texture GL_OES_texture_npot GL_OES_packed_depth_stencil GL_OES_rgb8_rgba8 GL_OES_vertex_half_float GL_EXT_texture_format_BGRA8888 GL_OES_framebuffer_object GL_OES_element_index_uint GL_OES_standard_derivatives GL_EXT_discard_framebuffer GL_OES_mapbuffer GL_OES_point_size_array GL_OES_matrix_palette GL_OES_fixed_point";
+        else if (glEnum == GL_EXTENSIONS) strVal = "GL_OES_compressed_ETC1_RGB8_texture GL_IMG_texture_compression_pvrtc GL_IMG_texture_compression_pvrtc2 GL_EXT_texture_compression_s3tc GL_EXT_texture_compression_dxt1 GL_ANGLE_texture_compression_dxt3 GL_ANGLE_texture_compression_dxt5 GL_OES_depth24 GL_OES_depth_texture GL_OES_texture_npot GL_OES_packed_depth_stencil GL_OES_rgb8_rgba8 GL_OES_vertex_half_float GL_EXT_texture_format_BGRA8888 GL_OES_framebuffer_object GL_OES_element_index_uint GL_OES_standard_derivatives GL_EXT_discard_framebuffer GL_OES_mapbuffer GL_OES_point_size_array GL_OES_matrix_palette GL_OES_fixed_point";
         uint32_t strGuestAddr = createGuestString(uc, strVal);
         uc_reg_write(uc, UC_ARM_REG_R0, &strGuestAddr);
         return;

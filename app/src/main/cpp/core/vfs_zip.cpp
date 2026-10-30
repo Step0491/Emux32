@@ -407,11 +407,24 @@ size_t ZipArchiveVfs::mountObbDirectory(const std::string& obbDir) {
     while ((ent = readdir(d)) != nullptr) {
         if (ent->d_name[0] == '.') continue;
         std::string fname(ent->d_name);
+        std::string fullPath = obbDir + "/" + fname;
+
+        struct stat st{};
+        if (stat(fullPath.c_str(), &st) == 0 && S_ISDIR(st.st_mode)) {
+            // Ricorsione controllata in sottocartelle (es: obb/com.turner.cardwars o data/com.glu.gladiator)
+            mountedCount += mountObbDirectory(fullPath);
+            continue;
+        }
+
         std::string lower = fname;
         std::transform(lower.begin(), lower.end(), lower.begin(), ::tolower);
 
-        if (lower.size() >= 4 && lower.substr(lower.size() - 4) == ".obb") {
-            std::string fullPath = obbDir + "/" + fname;
+        bool isArchive = false;
+        if (lower.size() >= 4 && lower.substr(lower.size() - 4) == ".obb") isArchive = true;
+        else if (lower.size() >= 4 && lower.substr(lower.size() - 4) == ".zip") isArchive = true;
+        else if (lower.size() >= 6 && lower.substr(lower.size() - 6) == ".cache") isArchive = true;
+
+        if (isArchive) {
             if (mountArchive(fullPath)) {
                 mountedCount++;
             }
@@ -419,7 +432,9 @@ size_t ZipArchiveVfs::mountObbDirectory(const std::string& obbDir) {
     }
     closedir(d);
 
-    LOGI("ZipArchiveVfs: Rilevati e montati %zu archivi .obb da '%s'", mountedCount, obbDir.c_str());
+    if (mountedCount > 0) {
+        LOGI("ZipArchiveVfs: Rilevati e montati %zu archivi (.obb/.zip) da '%s'", mountedCount, obbDir.c_str());
+    }
     return mountedCount;
 }
 

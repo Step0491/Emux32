@@ -331,47 +331,67 @@ class MainActivity : ComponentActivity() {
             EmuxLogger.i("Emux32", "[FASE 1/5] Package Name target: $pkg")
 
             // ==========================================
-            // FASE 2: Verifica e Linking File OBB
+            // FASE 2: Verifica, Decompressione e Linking File OBB / Cache
             // ==========================================
-            EmuxLogger.i("Emux32", "[FASE 2/5] Verifica file OBB associati...")
-            val obbList = rom.obbFiles
+            EmuxLogger.i("Emux32", "[FASE 2/5] Verifica file OBB e archivi cache associati...")
+            val baseStorage = resolveEmuxDirectory()
             val primaryObbDir = File(filesDir, "obb/$pkg")
-            if (!primaryObbDir.exists()) {
-                primaryObbDir.mkdirs()
+            if (!primaryObbDir.exists()) primaryObbDir.mkdirs()
+
+            val guestDataDir = File(filesDir, "guest_data/$pkg")
+            val guestCacheDir = File(guestDataDir, "cache")
+            val guestGluDir = File(guestDataDir, "sdcard/glu")
+            val guestGluGladiatorDir = File(guestDataDir, "sdcard/glu/gladiator")
+            if (!guestDataDir.exists()) guestDataDir.mkdirs()
+            if (!guestCacheDir.exists()) guestCacheDir.mkdirs()
+            if (!guestGluDir.exists()) guestGluDir.mkdirs()
+            if (!guestGluGladiatorDir.exists()) guestGluGladiatorDir.mkdirs()
+
+            val obbList = rom.obbFiles
+            val activeObbFiles = mutableListOf<File>()
+
+            for (cand in obbList) {
+                val cName = cand.name.lowercase()
+                if (cName.endsWith(".zip") || cName.endsWith(".cache")) {
+                    EmuxLogger.i("Emux32", "[FASE 2/5] Rilevato archivio compresso cache: ${cand.name} (${cand.length()} byte)")
+                    val extractedFromZip = unpackCacheArchiveIfNeeded(cand, pkg, primaryObbDir, guestDataDir, baseStorage)
+                    activeObbFiles.addAll(extractedFromZip)
+                } else if (cName.endsWith(".obb")) {
+                    activeObbFiles.add(cand)
+                }
             }
 
-            if (obbList.isEmpty()) {
-                EmuxLogger.i("Emux32", "[FASE 2/5] Nessun file OBB richiesto o presente per questo titolo.")
+            // Ricerca OBB già estratti nella cartella di destinazione
+            primaryObbDir.listFiles { f -> f.isFile && f.name.lowercase().endsWith(".obb") }?.forEach {
+                if (!activeObbFiles.contains(it)) activeObbFiles.add(it)
+            }
+
+            if (activeObbFiles.isEmpty()) {
+                EmuxLogger.i("Emux32", "[FASE 2/5] Nessun file OBB aggiuntivo richiesto o presente per questo titolo.")
             } else {
-                EmuxLogger.i("Emux32", "[FASE 2/5] Trovati ${obbList.size} file OBB da collegare:")
-                for (obb in obbList) {
-                    EmuxLogger.i("Emux32", "   -> File OBB sorgente: ${obb.name} (${obb.length()} byte)")
+                EmuxLogger.i("Emux32", "[FASE 2/5] Trovati ${activeObbFiles.size} file OBB operativi:")
+                for (obb in activeObbFiles) {
+                    EmuxLogger.i("Emux32", "   -> OBB attivo: ${obb.name} (${obb.length()} byte)")
                 }
 
                 // Percorsi target multipli per massima compatibilità con Scoped Storage
                 val targetDirs = listOf(
                     File(Environment.getExternalStorageDirectory(), "Android/obb/$pkg"),
+                    File(baseStorage, "obb/$pkg"),
                     File(getExternalFilesDir(null)?.parentFile?.parentFile, "obb/$pkg"),
                     primaryObbDir
                 )
 
                 for (targetDir in targetDirs) {
-                    try {
-                        if (!targetDir.exists()) {
-                            targetDir.mkdirs()
-                        }
-                    } catch (_: Exception) {}
-
+                    try { if (!targetDir.exists()) targetDir.mkdirs() } catch (_: Exception) {}
                     if (targetDir.exists() && targetDir.canWrite()) {
-                        for (obbFile in obbList) {
+                        for (obbFile in activeObbFiles) {
                             val targetObb = File(targetDir, obbFile.name)
                             if (!targetObb.exists() || targetObb.length() != obbFile.length()) {
                                 try {
-                                    // Tentativo symlink a costo zero
                                     android.system.Os.symlink(obbFile.absolutePath, targetObb.absolutePath)
                                     EmuxLogger.i("Emux32", "[FASE 2/5] Symlink OBB creato con successo: ${targetObb.absolutePath}")
                                 } catch (e: Exception) {
-                                    // Fallback copia fisica se symlink non supportato dal filesystem FAT/exFAT
                                     try {
                                         FileInputStream(obbFile).use { input ->
                                             FileOutputStream(targetObb).use { output ->
@@ -392,7 +412,6 @@ class MainActivity : ComponentActivity() {
             }
 
             // Linking cartelle Dati / Cache di gioco (es. unitycache per Blood & Glory)
-            val baseStorage = resolveEmuxDirectory()
             val candidateSourceDataDirs = listOfNotNull(
                 rom.dataDir,
                 File(baseStorage, "obb/$pkg"),
@@ -401,14 +420,6 @@ class MainActivity : ComponentActivity() {
                 File(baseStorage, "data/com.glu.gladiator"),
                 File(Environment.getExternalStorageDirectory(), "Android/data/$pkg")
             ).distinctBy { it.absolutePath }
-            val guestDataDir = File(filesDir, "guest_data/$pkg")
-            val guestCacheDir = File(guestDataDir, "cache")
-            val guestGluDir = File(guestDataDir, "sdcard/glu")
-            val guestGluGladiatorDir = File(guestDataDir, "sdcard/glu/gladiator")
-            if (!guestDataDir.exists()) guestDataDir.mkdirs()
-            if (!guestCacheDir.exists()) guestCacheDir.mkdirs()
-            if (!guestGluDir.exists()) guestGluDir.mkdirs()
-            if (!guestGluGladiatorDir.exists()) guestGluGladiatorDir.mkdirs()
 
             for (srcDir in candidateSourceDataDirs) {
                 if (srcDir.exists() && srcDir.isDirectory) {
@@ -647,6 +658,113 @@ class MainActivity : ComponentActivity() {
                 Toast.makeText(this@MainActivity, "Errore avvio gioco: ${e.localizedMessage}", Toast.LENGTH_LONG).show()
             }
         }
+    }
+
+    /**
+     * Decomprime archivi ZIP/Cache terze parti (es: 01319-cache-BLOOD-GLORY-powervr.zip, 10752-ADVENTURE-CARD-GAME-V1-11-0-cahce1.zip)
+     * e posiziona automaticamente i file OBB e la cartella dati Glu/Unity.
+     */
+    private fun unpackCacheArchiveIfNeeded(
+        zipFile: File,
+        pkg: String,
+        primaryObbDir: File,
+        guestDataDir: File,
+        baseStorage: File
+    ): List<File> {
+        val extractedObbs = mutableListOf<File>()
+        val safeName = zipFile.name.replace("[^a-zA-Z0-9]".toRegex(), "_")
+        val markerFile = File(primaryObbDir, ".extracted_${safeName}_${zipFile.length()}")
+        if (markerFile.exists()) {
+            EmuxLogger.i("Emux32", "[FASE 2/5] Cache '${zipFile.name}' già estratta in precedenza. Skip decompressione.")
+            primaryObbDir.listFiles { f -> f.isFile && f.name.lowercase().endsWith(".obb") }?.forEach {
+                extractedObbs.add(it)
+            }
+            return extractedObbs
+        }
+
+        EmuxLogger.i("Emux32", "[FASE 2/5] Avvio decompressione archivio cache '${zipFile.name}' (${zipFile.length()} byte)...")
+        try {
+            java.util.zip.ZipFile(zipFile).use { zf ->
+                val entries = zf.entries()
+                val buffer = ByteArray(65536)
+                while (entries.hasMoreElements()) {
+                    val entry = entries.nextElement()
+                    val ename = entry.name.replace('\\', '/')
+                    if (entry.isDirectory) continue
+
+                    val lowerName = ename.lowercase()
+                    if (lowerName.endsWith(".obb")) {
+                        // File OBB standard
+                        val fileName = File(ename).name
+                        val targetObb = File(primaryObbDir, fileName)
+                        targetObb.parentFile?.mkdirs()
+                        zf.getInputStream(entry).use { input ->
+                            FileOutputStream(targetObb).use { output ->
+                                var bytesRead: Int
+                                while (input.read(buffer).also { bytesRead = it } != -1) {
+                                    output.write(buffer, 0, bytesRead)
+                                }
+                            }
+                        }
+                        extractedObbs.add(targetObb)
+                        EmuxLogger.i("Emux32", "   -> Estratto file OBB: ${targetObb.name} (${targetObb.length()} byte)")
+                    } else if (lowerName.contains("glu/") || lowerName.contains("gladiator")) {
+                        // Struttura Glu Mobile legacy (Blood & Glory 2011)
+                        val relGlu = if (lowerName.contains("glu/")) ename.substring(lowerName.indexOf("glu/")) else "glu/gladiator/${File(ename).name}"
+                        val targetGlu1 = File(guestDataDir, "sdcard/$relGlu")
+                        val targetGlu2 = File(guestDataDir, relGlu)
+                        val targetGlu3 = File(baseStorage, "data/$pkg/$relGlu")
+                        targetGlu1.parentFile?.mkdirs()
+                        targetGlu2.parentFile?.mkdirs()
+                        targetGlu3.parentFile?.mkdirs()
+                        zf.getInputStream(entry).use { input ->
+                            FileOutputStream(targetGlu1).use { output ->
+                                var bytesRead: Int
+                                while (input.read(buffer).also { bytesRead = it } != -1) {
+                                    output.write(buffer, 0, bytesRead)
+                                }
+                            }
+                        }
+                        try { targetGlu1.copyTo(targetGlu2, overwrite = true) } catch (_: Throwable) {}
+                        try { targetGlu1.copyTo(targetGlu3, overwrite = true) } catch (_: Throwable) {}
+                    } else if (lowerName.contains("android/data/")) {
+                        val relData = ename.substring(lowerName.indexOf("android/data/") + 13)
+                        val afterPkg = if (relData.contains("/")) relData.substring(relData.indexOf('/') + 1) else relData
+                        val targetData = File(guestDataDir, afterPkg)
+                        targetData.parentFile?.mkdirs()
+                        zf.getInputStream(entry).use { input ->
+                            FileOutputStream(targetData).use { output ->
+                                var bytesRead: Int
+                                while (input.read(buffer).also { bytesRead = it } != -1) {
+                                    output.write(buffer, 0, bytesRead)
+                                }
+                            }
+                        }
+                    } else {
+                        // Altri asset e file di configurazione
+                        val targetData = File(guestDataDir, ename)
+                        targetData.parentFile?.mkdirs()
+                        zf.getInputStream(entry).use { input ->
+                            FileOutputStream(targetData).use { output ->
+                                var bytesRead: Int
+                                while (input.read(buffer).also { bytesRead = it } != -1) {
+                                    output.write(buffer, 0, bytesRead)
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            markerFile.createNewFile()
+            EmuxLogger.i("Emux32", "[FASE 2/5] Decompressione cache '${zipFile.name}' completata con successo.")
+        } catch (e: Throwable) {
+            EmuxLogger.e("Emux32", "[FASE 2/5] Errore durante la decompressione di ${zipFile.name}: ${e.message}", e)
+        }
+
+        primaryObbDir.listFiles { f -> f.isFile && f.name.lowercase().endsWith(".obb") }?.forEach {
+            if (!extractedObbs.contains(it)) extractedObbs.add(it)
+        }
+        return extractedObbs
     }
 
     override fun onDestroy() {

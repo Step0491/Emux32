@@ -49,15 +49,23 @@ fun scanEmuxStorage(context: Context, apkDir: File, obbDir: File): List<EmuxRom>
     val upscaledCoversDir = File(apkDir, ".upscaled_covers")
     if (!upscaledCoversDir.exists()) upscaledCoversDir.mkdirs()
 
-    // Raccoglie tutti i file .obb e cartelle dati disponibili cercando ricorsivamente in:
-    // 1. obbDir configurata dall'emulatore (es. /storage/emulated/0/Emulators/Emux32/obb)
-    // 2. dataDir configurata dall'emulatore (es. /storage/emulated/0/Emulators/Emux32/data)
-    // 3. /storage/emulated/0/Android/obb e /storage/emulated/0/Android/data (standard Android)
+    // Raccoglie tutti i file .obb, archivi .zip e cartelle dati cercando in:
+    // 1. obbDir configurata dall'emulatore (es. Emux32/obb)
+    // 2. dataDir configurata dall'emulatore (es. Emux32/data)
+    // 3. apkDir (spesso gli utenti posizionano lo ZIP della cache nella stessa cartella)
+    // 4. /storage/emulated/0/Download (cartella download utente)
+    // 5. /storage/emulated/0/Android/obb e /storage/emulated/0/Android/data (standard Android)
     val allDiscoveredObbs = mutableListOf<File>()
     val allDiscoveredDirs = mutableListOf<File>()
+
+    val isArchiveFile = { file: File ->
+        val l = file.name.lowercase()
+        l.endsWith(".obb") || l.endsWith(".zip") || l.endsWith(".cache")
+    }
+
     try {
         if (obbDir.exists()) {
-            obbDir.walkTopDown().filter { it.isFile && it.name.lowercase().endsWith(".obb") }.forEach {
+            obbDir.walkTopDown().filter { it.isFile && isArchiveFile(it) }.forEach {
                 allDiscoveredObbs.add(it)
             }
             obbDir.listFiles { file -> file.isDirectory }?.forEach {
@@ -66,16 +74,27 @@ fun scanEmuxStorage(context: Context, apkDir: File, obbDir: File): List<EmuxRom>
         }
         val dataDir = File(obbDir.parentFile, "data")
         if (dataDir.exists()) {
-            dataDir.walkTopDown().filter { it.isFile && it.name.lowercase().endsWith(".obb") }.forEach {
+            dataDir.walkTopDown().filter { it.isFile && isArchiveFile(it) }.forEach {
                 allDiscoveredObbs.add(it)
             }
             dataDir.listFiles { file -> file.isDirectory }?.forEach {
                 allDiscoveredDirs.add(it)
             }
         }
+        if (apkDir.exists()) {
+            apkDir.listFiles { file -> file.isFile && isArchiveFile(file) }?.forEach {
+                allDiscoveredObbs.add(it)
+            }
+        }
+        val downloadDir = File("/storage/emulated/0/Download")
+        if (downloadDir.exists() && downloadDir.canRead()) {
+            downloadDir.listFiles { file -> file.isFile && isArchiveFile(file) }?.forEach {
+                allDiscoveredObbs.add(it)
+            }
+        }
         val systemObbDir = File("/storage/emulated/0/Android/obb")
         if (systemObbDir.exists() && systemObbDir.canRead()) {
-            systemObbDir.walkTopDown().maxDepth(3).filter { it.isFile && it.name.lowercase().endsWith(".obb") }.forEach {
+            systemObbDir.walkTopDown().maxDepth(3).filter { it.isFile && isArchiveFile(it) }.forEach {
                 allDiscoveredObbs.add(it)
             }
             systemObbDir.listFiles { file -> file.isDirectory }?.forEach {
@@ -102,8 +121,17 @@ fun scanEmuxStorage(context: Context, apkDir: File, obbDir: File): List<EmuxRom>
         val cleanPkg = pkgName?.lowercase()?.trim()
         val cleanBase = baseName.lowercase().replace("[^a-z0-9]".toRegex(), "")
 
-        // Ricerca file OBB corrispondenti
+        // Ricerca file OBB / Cache corrispondenti
         val matchedObbList = mutableListOf<File>()
+
+        val isBloodGlory = (cleanBase.contains("blood") && cleanBase.contains("glory")) ||
+                           (cleanBase.contains("gladiator")) ||
+                           (cleanPkg != null && cleanPkg.contains("gladiator"))
+
+        val isCardWars = cleanBase.contains("cardwars") ||
+                         (cleanBase.contains("card") && cleanBase.contains("wars")) ||
+                         (cleanBase.contains("adventure") && cleanBase.contains("card")) ||
+                         (cleanPkg != null && cleanPkg.contains("cardwars"))
 
         for (candidate in allDiscoveredObbs) {
             val fileName = candidate.name.lowercase()
@@ -143,18 +171,44 @@ fun scanEmuxStorage(context: Context, apkDir: File, obbDir: File): List<EmuxRom>
                 }
             }
 
-            // 5. Corrispondenza specifica per titoli noti (es: Blood & Glory -> gladiator)
+            // 5. Corrispondenza specifica per titoli noti ed archivi cache terze parti (es: 01319, 10752, cahce1, powervr)
             if (!matched) {
-                if (cleanBase.contains("blood") || cleanBase.contains("glory")) {
-                    if (parentName.contains("gladiator") || fileName.contains("gladiator")) {
-                        matched = true
-                    }
+                if (isBloodGlory) {
+                    if (fileName.contains("blood") && fileName.contains("glory")) matched = true
+                    if (fileName.contains("gladiator") || parentName.contains("gladiator")) matched = true
+                    if (fileName.contains("01319") || fileName.contains("powervr")) matched = true
+                    if (fileName.contains("glu")) matched = true
                 }
-                if (cleanBase.contains("cardwars") || cleanBase.contains("card_wars")) {
-                    if (parentName.contains("cardwars") || fileName.contains("cardwars")) {
-                        matched = true
-                    }
+                if (isCardWars) {
+                    if (fileName.contains("cardwars") || parentName.contains("cardwars")) matched = true
+                    if (fileName.contains("adventure") && (fileName.contains("card") || fileName.contains("cahce") || fileName.contains("cache"))) matched = true
+                    if (fileName.contains("10752") || fileName.contains("turner")) matched = true
                 }
+            }
+
+            // 6. Ispezione euristica interna allo ZIP se presente
+            if (!matched && fileName.endsWith(".zip")) {
+                try {
+                    java.util.zip.ZipFile(candidate).use { zf ->
+                        val entries = zf.entries()
+                        var count = 0
+                        while (entries.hasMoreElements() && count++ < 50) {
+                            val entryName = entries.nextElement().name.lowercase()
+                            if (cleanPkg != null && entryName.contains(cleanPkg)) {
+                                matched = true
+                                break
+                            }
+                            if (isBloodGlory && (entryName.contains("gladiator") || entryName.contains("glu"))) {
+                                matched = true
+                                break
+                            }
+                            if (isCardWars && (entryName.contains("cardwars") || entryName.contains("turner"))) {
+                                matched = true
+                                break
+                            }
+                        }
+                    }
+                } catch (_: Throwable) {}
             }
 
             if (matched && !matchedObbList.contains(candidate)) {

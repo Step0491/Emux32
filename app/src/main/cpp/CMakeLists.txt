@@ -31,6 +31,7 @@ add_library(
     core/guest_signal.cpp
     core/vfs_zip.cpp
     core/guest_proc_fs.cpp
+    core/pvrtc_decompress.cpp
     unicorn/unicorn_impl.cpp
     elf_loader.cpp
     linker_hook.cpp
