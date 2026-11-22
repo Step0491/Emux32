@@ -6,6 +6,7 @@ import android.net.Uri
 import android.os.Build
 import android.provider.Settings
 import androidx.core.content.FileProvider
+import com.emux.translator.BuildConfig
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import org.json.JSONArray
@@ -86,7 +87,19 @@ object AppUpdater {
         }
     }
 
+    fun getCurrentBuildTag(): String = BuildConfig.BUILD_TAG
+
+    fun getCurrentBuildTime(): String = BuildConfig.BUILD_TIME
+
     fun isSameAsLastInstalled(context: Context, release: ReleaseInfo): Boolean {
+        val currentTag = BuildConfig.BUILD_TAG
+        if (currentTag.isNotBlank() &&
+            (release.title.contains(currentTag, ignoreCase = true) ||
+                release.apkName.contains(currentTag, ignoreCase = true) ||
+                release.tagName.equals(currentTag, ignoreCase = true))
+        ) {
+            return true
+        }
         val prefs = context.getSharedPreferences("emux_prefs", Context.MODE_PRIVATE)
         val lastSig = prefs.getString(PREF_LAST_RELEASE_SIG, null)
         return lastSig != null && lastSig == release.signature

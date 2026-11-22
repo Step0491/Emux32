@@ -1,7 +1,18 @@
+import java.time.ZoneId
+import java.time.ZonedDateTime
+import java.time.format.DateTimeFormatter
+
 plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
 }
+
+val buildZone = ZoneId.of("Europe/Rome")
+val buildNow = ZonedDateTime.now(buildZone)
+val emuxBuildTag = (project.findProperty("emuxBuildTag") as String?)
+    ?: "Emux32_d${buildNow.format(DateTimeFormatter.ofPattern("dd-MM"))}_t${buildNow.format(DateTimeFormatter.ofPattern("HH-mm"))}"
+val emuxBuildTime = (project.findProperty("emuxBuildTime") as String?)
+    ?: buildNow.format(DateTimeFormatter.ofPattern("dd/MM/yyyy HH:mm"))
 
 android {
     namespace = "com.emux.translator"
@@ -13,7 +24,10 @@ android {
         minSdk = 28
         targetSdk = 34
         versionCode = 1
-        versionName = "1.0.0"
+        versionName = emuxBuildTag
+
+        buildConfigField("String", "BUILD_TAG", "\"$emuxBuildTag\"")
+        buildConfigField("String", "BUILD_TIME", "\"$emuxBuildTime\"")
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         vectorDrawables {
@@ -61,6 +75,7 @@ android {
 
     buildFeatures {
         compose = true
+        buildConfig = true
     }
 
     composeOptions {

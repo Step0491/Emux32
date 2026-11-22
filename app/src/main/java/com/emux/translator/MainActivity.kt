@@ -907,6 +907,31 @@ fun UpdateCheckDialog(
         },
         text = {
             Column(modifier = Modifier.fillMaxWidth()) {
+                Surface(
+                    color = Color(0xFF121212),
+                    shape = RoundedCornerShape(8.dp),
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Column(modifier = Modifier.padding(10.dp)) {
+                        Text(
+                            text = "Versione attuale installata:",
+                            color = Color.Gray,
+                            fontSize = 11.sp
+                        )
+                        Text(
+                            text = AppUpdater.getCurrentBuildTag(),
+                            color = Color(0xFF38BDF8),
+                            fontWeight = FontWeight.Bold,
+                            fontSize = 13.sp
+                        )
+                        Text(
+                            text = "Data/Ora build: ${AppUpdater.getCurrentBuildTime()}",
+                            color = Color.LightGray,
+                            fontSize = 12.sp
+                        )
+                    }
+                }
+                Spacer(modifier = Modifier.height(12.dp))
                 when {
                     isChecking -> {
                         Row(

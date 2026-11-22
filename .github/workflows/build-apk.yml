@@ -33,22 +33,23 @@ jobs:
     - name: Ensure gradlew is executable
       run: chmod +x gradlew
 
+    - name: Generate Dynamic Build Name
+      run: |
+        BUILD_TAG="Emux32_d$(TZ='Europe/Rome' date +'%d-%m_t%H-%M')"
+        BUILD_TIME="$(TZ='Europe/Rome' date +'%d/%m/%Y %H:%M')"
+        echo "BUILD_NAME=${BUILD_TAG}" >> $GITHUB_ENV
+        echo "BUILD_TIME=${BUILD_TIME}" >> $GITHUB_ENV
+        echo "APK_NAME=${BUILD_TAG}.apk" >> $GITHUB_ENV
+        echo "Generated Build Name: ${BUILD_TAG} (${BUILD_TIME})"
+
     - name: Build Debug APK
       run: |
         set -o pipefail
-        ./gradlew assembleDebug --stacktrace --no-daemon 2>&1 | tee gradle_output.log || {
+        ./gradlew assembleDebug -PemuxBuildTag="${{ env.BUILD_NAME }}" -PemuxBuildTime="${{ env.BUILD_TIME }}" --stacktrace --no-daemon 2>&1 | tee gradle_output.log || {
           echo "==================== BUILD FAILURE DETECTED ===================="
           tail -n 120 gradle_output.log
           exit 1
         }
-
-    - name: Generate Dynamic Build Name
-      if: success()
-      run: |
-        BUILD_TAG="Emux32_d$(TZ='Europe/Rome' date +'%d-%m_t%H-%M')"
-        echo "BUILD_NAME=${BUILD_TAG}" >> $GITHUB_ENV
-        echo "APK_NAME=${BUILD_TAG}.apk" >> $GITHUB_ENV
-        echo "Generated Build Name: ${BUILD_TAG}"
 
     - name: Prepare Named APK
       if: success()
