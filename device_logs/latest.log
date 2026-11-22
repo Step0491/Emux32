@@ -3,34 +3,10 @@ EMUX32 DEVICE LOG BUNDLE
 Build Tag : Emux32_d22-11_t17-43
 Build Time: 22/11/2026 17:43
 Device    : realme RMX5085 (SDK 36)
-Uploaded  : 2026-11-22 17:58:58
+Uploaded  : 2026-11-22 18:00:12
 ====================================================
 
 ---------- [PREVIOUS SESSION LOG (emux_execution_prev.log)] ----------
-[17:56:21.117][INFO][Emux32] Emux32 avviato su Android SDK 36. Cartella storage: /storage/emulated/0/Emulators/Emux32
-[17:56:21.241][INFO][Emux32] Unicorn ARM32 DBT Engine pre-inizializzato con successo (512 MB guest RAM).
---------- beginning of main
-11-22 17:56:21.144 I/NativeEngine(29879): Libreria nativa emux_engine caricata con successo.
-11-22 17:56:21.145 I/EmuxLinkerHook(29879): SyscallDispatcher: Percorso storage configurato a '/storage/emulated/0/Emulators/Emux32'
-11-22 17:56:21.145 I/EmuxDbtEngine(29879): Inizializzazione Unicorn Engine per architettura ARMv7-A...
-11-22 17:56:21.145 I/EmuxGuestMemory(29879): Arena GuestMemory 4 GB inizializzata: HostBase=0x7340000000, HostPageSize=4096 byte (GuestPage=4096 byte)
-11-22 17:56:21.146 I/UnicornCore(29879): UnicornCore: Dynarmic Fastmem agganciato all'arena base 0x7340000000
-11-22 17:56:21.239 I/UnicornCore(29879): UnicornCore: Dynarmic ARM32 JIT compiler istanziato con successo (BlockLinking, Fastmem, RSB: ON)!
-11-22 17:56:21.239 I/UnicornCore(29879): Unicorn Engine ARM istanziato con successo (0xb40000753a23c080)
-11-22 17:56:21.240 I/GuestSignalManager(29879): GuestSignalManager: Restorer trampoline rt_sigreturn installata a 0x70000010
-11-22 17:56:21.241 I/EmuxLinkerHook(29879): GuestRuntimeEnvironment inizializzato: JavaVM32=0x7d000000, JNIEnv32=0x7d000200 (256 slot ABI), TLS=0x7d020000, Heap=0x58000000
-11-22 17:56:21.241 I/UnicornCore(29879): uc_hook_add: Registrato hook tipo 1 (id=1, begin=0x1, end=0x0)
-11-22 17:56:21.241 I/EmuxDbtEngine(29879): Unicorn Engine inizializzato con successo (hook id=1).
-11-22 17:56:21.241 I/Emux32  (29879): Unicorn ARM32 DBT Engine pre-inizializzato con successo (512 MB guest RAM).
-[17:56:21.469][INFO][Emux32] Scansione libreria giochi in: /storage/emulated/0/Emulators/Emux32
-11-22 17:56:21.469 I/EmuxLinkerHook(29879): SyscallDispatcher: Percorso storage configurato a '/storage/emulated/0/Emulators/Emux32'
-11-22 17:56:21.469 I/Emux32  (29879): Scansione libreria giochi in: /storage/emulated/0/Emulators/Emux32
-[17:56:22.005][INFO][Emux32] Scansione completata: trovati 3 titoli supportati.
-11-22 17:56:22.005 I/Emux32  (29879): Scansione completata: trovati 3 titoli supportati.
-[17:57:53.009][INFO][Emux32] Aggiornamento scaricato: Emux32_d22-11_t17-43.apk (63054926 byte)
-11-22 17:57:53.008 I/Emux32  (29879): Aggiornamento scaricato: Emux32_d22-11_t17-43.apk (63054926 byte)
-
----------- [CURRENT SESSION LOG (emux_execution.log)] ----------
 [17:58:03.611][INFO][Emux32] Emux32 avviato su Android SDK 36. Cartella storage: /storage/emulated/0/Emulators/Emux32
 [17:58:03.698][INFO][Emux32] Unicorn ARM32 DBT Engine pre-inizializzato con successo (512 MB guest RAM).
 --------- beginning of main
@@ -352,4 +328,370 @@ ESITO: 5/6 TEST SUPERATI CON SUCCESSO SU HARDWARE HOST AARCH64!
 11-22 17:58:39.573 I/EmuxDbtEngine( 7903): ANativeWindow scollegata.
 [17:58:39.929][INFO][Emux32] Scansione completata: trovati 3 titoli supportati.
 11-22 17:58:39.929 I/Emux32  ( 7903): Scansione completata: trovati 3 titoli supportati.
+[17:59:00.887][INFO][Emux32] Log inviati con successo su GitHub (branch: logs, path: device_logs/latest.log)
+11-22 17:59:00.887 I/Emux32  ( 7903): Log inviati con successo su GitHub (branch: logs, path: device_logs/latest.log)
+[17:59:44.356][INFO][Emux32] Click su titolo: '01319-BLOOD-GLORY-v.1.1.6' (com.glu.gladiator)
+11-22 17:59:44.356 I/Emux32  ( 7903): Click su titolo: '01319-BLOOD-GLORY-v.1.1.6' (com.glu.gladiator)
+11-22 17:59:44.389 I/EmuxDbtEngine( 7903): DbtEngine Performance Governor: Target 60 FPS, FHD: ON, Throttle Guard: ON
+11-22 17:59:44.399 I/Emux32  ( 7903): ========== AVVIO GIOCO: 01319-BLOOD-GLORY-v.1.1.6 ==========
+[17:59:44.403][INFO][Emux32] ========== AVVIO GIOCO: 01319-BLOOD-GLORY-v.1.1.6 ==========
+[17:59:44.406][INFO][Emux32] [FASE 1/5] Validazione file APK...
+[17:59:44.409][INFO][Emux32] [FASE 1/5] APK valido: 01319-BLOOD-GLORY-v.1.1.6.apk (37225599 byte, path: /storage/emulated/0/Emulators/Emux32/apk/01319-BLOOD-GLORY-v.1.1.6.apk)
+[17:59:44.412][INFO][Emux32] [FASE 1/5] Package Name target: com.glu.gladiator
+[17:59:44.414][INFO][Emux32] [FASE 2/5] Verifica file OBB e archivi cache associati...
+11-22 17:59:44.402 I/EmuxDbtEngine( 7903): ANativeWindow registrata per il Worker Thread DBT (Full HD 1080p).
+11-22 17:59:44.406 I/Emux32  ( 7903): [FASE 1/5] Validazione file APK...
+[17:59:44.436][INFO][Emux32] [FASE 2/5] Rilevato archivio compresso cache: 01319-cache-BLOOD-GLORY-powervr.zip (104574413 byte)
+11-22 17:59:44.409 I/Emux32  ( 7903): [FASE 1/5] APK valido: 01319-BLOOD-GLORY-v.1.1.6.apk (37225599 byte, path: /storage/emulated/0/Emulators/Emux32/apk/01319-BLOOD-GLORY-v.1.1.6.apk)
+11-22 17:59:44.412 I/Emux32  ( 7903): [FASE 1/5] Package Name target: com.glu.gladiator
+11-22 17:59:44.414 I/Emux32  ( 7903): [FASE 2/5] Verifica file OBB e archivi cache associati...
+[17:59:44.442][INFO][Emux32] [FASE 2/5] Cache '01319-cache-BLOOD-GLORY-powervr.zip' già estratta in precedenza. Skip decompressione.
+11-22 17:59:44.433 I/Emux32  ( 7903): [FASE 2/5] Rilevato archivio compresso cache: 01319-cache-BLOOD-GLORY-powervr.zip (104574413 byte)
+[17:59:44.445][INFO][Emux32] [FASE 2/5] Nessun file OBB aggiuntivo richiesto o presente per questo titolo.
+11-22 17:59:44.441 I/Emux32  ( 7903): [FASE 2/5] Cache '01319-cache-BLOOD-GLORY-powervr.zip' già estratta in precedenza. Skip decompressione.
+[17:59:44.447][INFO][Emux32] [FASE 2/5] Cartella dati/cache rilevata in: /storage/emulated/0/Emulators/Emux32/obb/com.glu.gladiator (1 elementi)
+11-22 17:59:44.444 I/Emux32  ( 7903): [FASE 2/5] Nessun file OBB aggiuntivo richiesto o presente per questo titolo.
+[17:59:44.455][INFO][Emux32] [FASE 2/5] Cartella dati/cache rilevata in: /storage/emulated/0/Emulators/Emux32/data/com.glu.gladiator (1 elementi)
+11-22 17:59:44.447 I/Emux32  ( 7903): [FASE 2/5] Cartella dati/cache rilevata in: /storage/emulated/0/Emulators/Emux32/obb/com.glu.gladiator (1 elementi)
+11-22 17:59:44.452 I/Emux32  ( 7903): [FASE 2/5] Cartella dati/cache rilevata in: /storage/emulated/0/Emulators/Emux32/data/com.glu.gladiator (1 elementi)
+[17:59:44.460][INFO][Emux32] [FASE 3/5] Analisi APK ed estrazione librerie native ARM32 (armeabi-v7a / armeabi)...
+11-22 17:59:44.460 I/Emux32  ( 7903): [FASE 3/5] Analisi APK ed estrazione librerie native ARM32 (armeabi-v7a / armeabi)...
+[17:59:44.472][INFO][Emux32]    -> Estratta libreria ARM32 (lib/armeabi-v7a/libgwallet.so): libgwallet.so (306028 byte)
+11-22 17:59:44.472 I/Emux32  ( 7903):    -> Estratta libreria ARM32 (lib/armeabi-v7a/libgwallet.so): libgwallet.so (306028 byte)
+11-22 17:59:44.479 I/Emux32  ( 7903):    -> Estratta libreria ARM32 (lib/armeabi-v7a/libIAP.so): libIAP.so (9324 byte)
+[17:59:44.514][INFO][Emux32]    -> Estratta libreria ARM32 (lib/armeabi-v7a/libIAP.so): libIAP.so (9324 byte)
+[17:59:44.524][INFO][Emux32]    -> Estratta libreria ARM32 (lib/armeabi-v7a/libiapamazon.so): libiapamazon.so (17640 byte)
+11-22 17:59:44.524 I/Emux32  ( 7903):    -> Estratta libreria ARM32 (lib/armeabi-v7a/libiapamazon.so): libiapamazon.so (17640 byte)
+[17:59:44.527][INFO][Emux32]    -> Estratta libreria ARM32 (lib/armeabi-v7a/libmono.so): libmono.so (98120 byte)
+[17:59:44.531][INFO][Emux32]    -> Estratta libreria ARM32 (lib/armeabi-v7a/libmzwinject.so): libmzwinject.so (33968 byte)
+11-22 17:59:44.527 I/Emux32  ( 7903):    -> Estratta libreria ARM32 (lib/armeabi-v7a/libmono.so): libmono.so (98120 byte)
+11-22 17:59:44.531 I/Emux32  ( 7903):    -> Estratta libreria ARM32 (lib/armeabi-v7a/libmzwinject.so): libmzwinject.so (33968 byte)
+[17:59:44.589][INFO][Emux32]    -> Estratta libreria ARM32 (lib/armeabi-v7a/libngserv.so): libngserv.so (5620205 byte)
+11-22 17:59:44.589 I/Emux32  ( 7903):    -> Estratta libreria ARM32 (lib/armeabi-v7a/libngserv.so): libngserv.so (5620205 byte)
+[17:59:44.594][INFO][Emux32]    -> Estratta libreria ARM32 (lib/armeabi-v7a/libunity.so): libunity.so (56240 byte)
+11-22 17:59:44.594 I/Emux32  ( 7903):    -> Estratta libreria ARM32 (lib/armeabi-v7a/libunity.so): libunity.so (56240 byte)
+[17:59:44.696][INFO][Emux32]    -> Estratti 34 asset di gioco in cache/assets e files/assets/com.glu.gladiator
+11-22 17:59:44.696 I/Emux32  ( 7903):    -> Estratti 34 asset di gioco in cache/assets e files/assets/com.glu.gladiator
+[17:59:44.699][INFO][Emux32] [FASE 3/5] Libreria principale selezionata per l'esecuzione: libunity.so (56240 byte)
+11-22 17:59:44.697 I/Emux32  ( 7903): [FASE 3/5] Libreria principale selezionata per l'esecuzione: libunity.so (56240 byte)
+[17:59:44.702][INFO][Emux32] [FASE 4/5] Esecuzione Architectural Self-Test DBT ARM32 -> AArch64...
+11-22 17:59:44.701 I/Emux32  ( 7903): [FASE 4/5] Esecuzione Architectural Self-Test DBT ARM32 -> AArch64...
+11-22 17:59:44.703 I/UnicornCore( 7903): UnicornCore: Dynarmic Fastmem agganciato all'arena base 0x7340000000
+11-22 17:59:44.766 I/UnicornCore( 7903): UnicornCore: Dynarmic ARM32 JIT compiler istanziato con successo (BlockLinking, Fastmem, RSB: ON)!
+[17:59:44.770][INFO][Emux32] === EMUX32 DBT ARCHITECTURAL VERIFICATION ===
+  [PASS] Test 1: ARM32 ALU Hardware Execution (42 + 58 = 100)
+  [FAIL] Test 2: Memory Translation (r3=0)
+  [PASS] Test 3: Thumb-2 State Transition & Execution (25 + 75 = 100)
+  [PASS] Test 4: Syscall/Interrupt Thunker Interception (SVC #0)
+  [PASS] Test 5: Dynamic Trap Neutralization (0x3F3504F3 -> 0)
+  [PASS] Test 6: NEON 128-bit Vector Floating-Point [11.5, 22.5, 33.5, 44.5]
+ESITO: 5/6 TEST SUPERATI CON SUCCESSO SU HARDWARE HOST AARCH64!
+
+11-22 17:59:44.766 I/UnicornCore( 7903): Unicorn Engine ARM istanziato con successo (0xb4000074c0507d00)
+[17:59:44.773][INFO][Emux32] [FASE 4/5] Configurazione e avvio Unicorn ARM32 DBT Engine...
+11-22 17:59:44.767 W/UnicornCore( 7903): Dynarmic: ExceptionRaised a PC=0x3ffffb26 (tipo=12)
+11-22 17:59:44.767 W/GuestSignalManager( 7903): GuestSignalManager: Nessun custom handler attivo per segnale 11 (default)
+11-22 17:59:44.767 I/UnicornCore( 7903): uc_hook_add: Registrato hook tipo 1 (id=1, begin=0x1, end=0x0)
+11-22 17:59:44.767 W/EmuxLinkerHook( 7903): [GuestLogCrashDiagnostic] Trap Dump -> R0=0x00000064 R1=0x0000003a R2=0x00000064 R3=0x00000000
+11-22 17:59:44.767 W/EmuxLinkerHook( 7903): [GuestLogCrashDiagnostic] Trap Dump -> R4=0x40002000 R5=0x00000000 R6=0x00000000 R7=0x00000000 R8=0x00000000 R9=0x00000000 R10=0x00000000 R11=0x00000000 R12=0x00000000
+11-22 17:59:44.767 W/EmuxLinkerHook( 7903): [GuestLogCrashDiagnostic] Trap Dump -> SP=0x7e1ff000 LR=0x40000064 CPSR=0x00000030
+11-22 17:59:44.767 W/EmuxLinkerHook( 7903): [GuestLogCrashDiagnostic] Stack Dump [SP..SP+64]: 00000000 00000000 00000000 00000000 | 00000000 00000000 00000000 00000000
+11-22 17:59:44.767 W/EmuxLinkerHook( 7903): [GuestLogCrashDiagnostic] Code [40000024      ]: e5903010 e12fff1e 00280008 0019001a
+11-22 17:59:44.767 W/EmuxLinkerHook( 7903): [GuestLogCrashDiagnostic] Code [40000034      ]: 00000006 00000034 00000034 304b2019
+11-22 17:59:44.767 W/EmuxLinkerHook( 7903): [GuestLogCrashDiagnostic] Code [40000044      ]: 00004770 00000100 00000004 00000004
+11-22 17:59:44.767 W/EmuxLinkerHook( 7903): [GuestLogCrashDiagnostic] Code [40000054      ]: 00000003 00000134 00000134 ef000000
+11-22 17:59:44.767 W/EmuxLinkerHook( 7903): [GuestLogCrashDiagnostic] Code [40000064 <= LR]: e12fff1e 00000013 00000004 00000001
+11-22 17:59:44.768 I/EmuxLinkerHook( 7903): DisarmTrap [MemoryScan]: Trovato signum 0x3f3504f3 a 0x41371f74 in '/data/user/0/com.emux.translator/cache/libunity.so'! Neutralizzazione...
+11-22 17:59:44.768 I/EmuxLinkerHook( 7903): DisarmTrap [MemoryScan]: Trovato signum 0x3f3504f3 a 0x413728f4 in '/data/user/0/com.emux.translator/cache/libunity.so'! Neutralizzazione...
+11-22 17:59:44.768 I/EmuxLinkerHook( 7903): DisarmTrap [MemoryScan]: Trovato signum 0x3f3504f3 a 0x41562814 in '/data/user/0/com.emux.translator/cache/libunity.so'! Neutralizzazione...
+11-22 17:59:44.768 I/EmuxLinkerHook( 7903): DisarmTrap [MemoryScan]: Trovato signum 0x3f3504f3 a 0x41562824 in '/data/user/0/com.emux.translator/cache/libunity.so'! Neutralizzazione...
+11-22 17:59:44.768 I/EmuxLinkerHook( 7903): DisarmTrap [MemoryScan]: Trovato signum 0x3f3504f3 a 0x4156283c in '/data/user/0/com.emux.translator/cache/libunity.so'! Neutralizzazione...
+11-22 17:59:44.768 I/EmuxLinkerHook( 7903): DisarmTrap [MemoryScan]: Trovato signum 0x3f3504f3 a 0x41562840 in '/data/user/0/com.emux.translator/cache/libunity.so'! Neutralizzazione...
+11-22 17:59:44.768 I/EmuxLinkerHook( 7903): DisarmTrap [MemoryScan]: Trovato signum 0x3f3504f3 a 0x41562844 in '/data/user/0/com.emux.translator/cache/libunity.so'! Neutralizzazione...
+11-22 17:59:44.768 I/EmuxLinkerHook( 7903): DisarmTrap [MemoryScan]: Trovato signum 0x3f3504f3 a 0x4156284c in '/data/user/0/com.emux.translator/cache/libunity.so'! Neutralizzazione...
+11-22 17:59:44.768 I/EmuxLinkerHook( 7903): DisarmTrap [MemoryScan]: Trovato signum 0x3f3504f3 a 0x41562858 in '/data/user/0/com.emux.translator/cache/libunity.so'! Neutralizzazione...
+11-22 17:59:44.768 I/EmuxLinkerHook( 7903): DisarmTrap [MemoryScan]: Trovato signum 0x3f3504f3 a 0x41562864 in '/data/user/0/com.emux.translator/cache/libunity.so'! Neutralizzazione...
+11-22 17:59:44.768 I/EmuxLinkerHook( 7903): DisarmTrap [MemoryScan]: Trovato signum 0x3f3504f3 a 0x41562868 in '/data/user/0/com.emux.translator/cache/libunity.so'! Neutralizzazione...
+11-22 17:59:44.768 I/EmuxLinkerHook( 7903): DisarmTrap [MemoryScan]: Trovato signum 0x3f3504f3 a 0x41562874 in '/data/user/0/com.emux.translator/cache/libunity.so'! Neutralizzazione...
+11-22 17:59:44.768 I/EmuxLinkerHook( 7903): DisarmTrap [MemoryScan]: Trovato signum 0x3f3504f3 a 0x41562878 in '/data/user/0/com.emux.translator/cache/libunity.so'! Neutralizzazione...
+11-22 17:59:44.768 I/EmuxLinkerHook( 7903): DisarmTrap [MemoryScan]: Trovato signum 0x3f3504f3 a 0x41562884 in '/data/user/0/com.emux.translator/cache/libunity.so'! Neutralizzazione...
+11-22 17:59:44.768 I/EmuxLinkerHook( 7903): DisarmTrap [MemoryScan]: Trovato signum 0x3f3504f3 a 0x415629bc in '/data/user/0/com.emux.translator/cache/libunity.so'! Neutralizzazione...
+11-22 17:59:44.768 I/EmuxLinkerHook( 7903): DisarmTrap [MemoryScan]: Trovato signum 0x3f3504f3 a 0x415629cc in '/data/user/0/com.emux.translator/cache/libunity.so'! Neutralizzazione...
+11-22 17:59:44.768 I/EmuxLinkerHook( 7903): DisarmTrap [MemoryScan]: Trovato signum 0x3f3504f3 a 0x415629e4 in '/data/user/0/com.emux.translator/cache/libunity.so'! Neutralizzazione...
+11-22 17:59:44.768 I/EmuxLinkerHook( 7903): DisarmTrap [MemoryScan]: Trovato signum 0x3f3504f3 a 0x415629e8 in '/data/user/0/com.emux.translator/cache/libunity.so'! Neutralizzazione...
+11-22 17:59:44.768 I/EmuxLinkerHook( 7903): DisarmTrap [MemoryScan]: Trovato signum 0x3f3504f3 a 0x415629ec in '/data/user/0/com.emux.translator/cache/libunity.so'! Neutralizzazione...
+11-22 17:59:44.768 I/EmuxLinkerHook( 7903): DisarmTrap [MemoryScan]: Trovato signum 0x3f3504f3 a 0x415629f4 in '/data/user/0/com.emux.translator/cache/libunity.so'! Neutralizzazione...
+11-22 17:59:44.768 I/EmuxLinkerHook( 7903): DisarmTrap [MemoryScan]: Trovato signum 0x3f3504f3 a 0x41562a00 in '/data/user/0/com.emux.translator/cache/libunity.so'! Neutralizzazione...
+11-22 17:59:44.768 I/EmuxLinkerHook( 7903): DisarmTrap [MemoryScan]: Trovato signum 0x3f3504f3 a 0x41562a0c in '/data/user/0/com.emux.translator/cache/libunity.so'! Neutralizzazione...
+11-22 17:59:44.768 I/EmuxLinkerHook( 7903): DisarmTrap [MemoryScan]: Trovato signum 0x3f3504f3 a 0x41562a10 in '/data/user/0/com.emux.translator/cache/libunity.so'! Neutralizzazione...
+11-22 17:59:44.768 I/EmuxLinkerHook( 7903): DisarmTrap [MemoryScan]: Trovato signum 0x3f3504f3 a 0x41562a1c in '/data/user/0/com.emux.translator/cache/libunity.so'! Neutralizzazione...
+11-22 17:59:44.768 I/EmuxLinkerHook( 7903): DisarmTrap [MemoryScan]: Trovato signum 0x3f3504f3 a 0x41562a20 in '/data/user/0/com.emux.translator/cache/libunity.so'! Neutralizzazione...
+11-22 17:59:44.768 I/EmuxLinkerHook( 7903): DisarmTrap [MemoryScan]: Trovato signum 0x3f3504f3 a 0x41562a2c in '/data/user/0/com.emux.translator/cache/libunity.so'! Neutralizzazione...
+11-22 17:59:44.768 I/EmuxLinkerHook( 7903): DisarmTrap [MemoryScan]: Trovato signum 0x3f3504f3 a 0x41562a94 in '/data/user/0/com.emux.translator/cache/libunity.so'! Neutralizzazione...
+11-22 17:59:44.768 I/EmuxLinkerHook( 7903): DisarmTrap [MemoryScan]: Trovato signum 0x3f3504f3 a 0x41562aa4 in '/data/user/0/com.emux.translator/cache/libunity.so'! Neutralizzazione...
+11-22 17:59:44.768 I/EmuxLinkerHook( 7903): DisarmTrap [MemoryScan]: Trovato signum 0x3f3504f3 a 0x41562abc in '/data/user/0/com.emux.translator/cache/libunity.so'! Neutralizzazione...
+11-22 17:59:44.768 I/EmuxLinkerHook( 7903): DisarmTrap [MemoryScan]: Trovato signum 0x3f3504f3 a 0x41562ac0 in '/data/user/0/com.emux.translator/cache/libunity.so'! Neutralizzazione...
+11-22 17:59:44.768 I/EmuxLinkerHook( 7903): DisarmTrap [MemoryScan]: Trovato signum 0x3f3504f3 a 0x41562ac4 in '/data/user/0/com.emux.translator/cache/libunity.so'! Neutralizzazione...
+11-22 17:59:44.768 I/EmuxLinkerHook( 7903): DisarmTrap [MemoryScan]: Trovato signum 0x3f3504f3 a 0x41562acc in '/data/user/0/com.emux.translator/cache/libunity.so'! Neutralizzazione...
+11-22 17:59:44.768 I/EmuxLinkerHook( 7903): DisarmTrap [MemoryScan]: Trovato signum 0x3f3504f3 a 0x41562ad8 in '/data/user/0/com.emux.translator/cache/libunity.so'! Neutralizzazione...
+11-22 17:59:44.768 I/EmuxLinkerHook( 7903): DisarmTrap [MemoryScan]: Trovato signum 0x3f3504f3 a 0x41562ae4 in '/data/user/0/com.emux.translator/cache/libunity.so'! Neutralizzazione...
+11-22 17:59:44.768 I/EmuxLinkerHook( 7903): DisarmTrap [MemoryScan]: Trovato signum 0x3f3504f3 a 0x41562ae8 in '/data/user/0/com.emux.translator/cache/libunity.so'! Neutralizzazione...
+11-22 17:59:44.768 I/EmuxLinkerHook( 7903): DisarmTrap [MemoryScan]: Trovato signum 0x3f3504f3 a 0x41562af4 in '/data/user/0/com.emux.translator/cache/libunity.so'! Neutralizzazione...
+11-22 17:59:44.768 I/EmuxLinkerHook( 7903): DisarmTrap [MemoryScan]: Trovato signum 0x3f3504f3 a 0x41562af8 in '/data/user/0/com.emux.translator/cache/libunity.so'! Neutralizzazione...
+11-22 17:59:44.768 I/EmuxLinkerHook( 7903): DisarmTrap [MemoryScan]: Trovato signum 0x3f3504f3 a 0x41562b04 in '/data/user/0/com.emux.translator/cache/libunity.so'! Neutralizzazione...
+11-22 17:59:44.768 I/EmuxLinkerHook( 7903): DisarmTrap [Reg R4]: Neutralizzato flag puntato da registro a 0x40002000 (era 0x3f3504f3)
+11-22 17:59:44.768 I/UnicornCore( 7903): Unicorn Engine rilasciato
+11-22 17:59:44.768 I/Emux32  ( 7903): === EMUX32 DBT ARCHITECTURAL VERIFICATION ===
+11-22 17:59:44.768 I/Emux32  ( 7903):   [PASS] Test 1: ARM32 ALU Hardware Execution (42 + 58 = 100)
+11-22 17:59:44.768 I/Emux32  ( 7903):   [FAIL] Test 2: Memory Translation (r3=0)
+11-22 17:59:44.768 I/Emux32  ( 7903):   [PASS] Test 3: Thumb-2 State Transition & Execution (25 + 75 = 100)
+11-22 17:59:44.768 I/Emux32  ( 7903):   [PASS] Test 4: Syscall/Interrupt Thunker Interception (SVC #0)
+11-22 17:59:44.768 I/Emux32  ( 7903):   [PASS] Test 5: Dynamic Trap Neutralization (0x3F3504F3 -> 0)
+11-22 17:59:44.768 I/Emux32  ( 7903):   [PASS] Test 6: NEON 128-bit Vector Floating-Point [11.5, 22.5, 33.5, 44.5]
+11-22 17:59:44.768 I/Emux32  ( 7903): ESITO: 5/6 TEST SUPERATI CON SUCCESSO SU HARDWARE HOST AARCH64!
+11-22 17:59:44.771 I/Emux32  ( 7903): [FASE 4/5] Configurazione e avvio Unicorn ARM32 DBT Engine...
+11-22 17:59:44.774 I/EmuxLinkerHook( 7903): SyscallDispatcher: Percorso storage configurato a '/storage/emulated/0/Emulators/Emux32'
+11-22 17:59:44.774 I/EmuxDbtEngine( 7903): ANativeWindow registrata per il Worker Thread DBT (Full HD 1080p).
+11-22 17:59:44.774 I/EmuxDbtEngine( 7903): Inizializzazione Unicorn Engine per architettura ARMv7-A...
+11-22 17:59:44.774 I/UnicornCore( 7903): UnicornCore: Dynarmic Fastmem agganciato all'arena base 0x7340000000
+11-22 17:59:44.813 I/UnicornCore( 7903): UnicornCore: Dynarmic ARM32 JIT compiler istanziato con successo (BlockLinking, Fastmem, RSB: ON)!
+11-22 17:59:44.813 I/UnicornCore( 7903): Unicorn Engine ARM istanziato con successo (0xb4000074c0507d00)
+11-22 17:59:44.813 I/GuestSignalManager( 7903): GuestSignalManager: Restorer trampoline rt_sigreturn installata a 0x70000010
+11-22 17:59:44.814 I/EmuxLinkerHook( 7903): GuestRuntimeEnvironment inizializzato: JavaVM32=0x7d000000, JNIEnv32=0x7d000200 (256 slot ABI), TLS=0x7d020000, Heap=0x58000000
+11-22 17:59:44.814 I/UnicornCore( 7903): uc_hook_add: Registrato hook tipo 1 (id=1, begin=0x1, end=0x0)
+11-22 17:59:44.814 I/EmuxDbtEngine( 7903): Unicorn Engine inizializzato con successo (hook id=1).
+11-22 17:59:44.815 I/UnicornCore( 7903): Unicorn Engine rilasciato
+11-22 17:59:44.815 I/EmuxLinkerHook( 7903): GameContext configurato: pkg='com.glu.gladiator', apk='/storage/emulated/0/Emulators/Emux32/apk/01319-BLOOD-GLORY-v.1.1.6.apk', obbDir='/data/user/0/com.emux.translator/files/obb/com.glu.gladiator', libDir='/data/user/0/com.emux.translator/cache'
+11-22 17:59:44.959 I/EmuxLinkerHook( 7903): ZipArchiveVfs: Montaggio completato (Totale file indicizzati: 134)
+[17:59:44.977][INFO][Emux32] [FASE 4/5] DexClassLoader host inizializzato per 01319-BLOOD-GLORY-v.1.1.6.apk (Bridge Java/ART attivo)
+11-22 17:59:44.976 I/EmuxLinkerHook( 7903): GuestRuntimeEnvironment: DexClassLoader host ART collegato con successo (JavaVM=0xb400007580475500)
+[17:59:44.979][INFO][Emux32] [FASE 4/5] Motore DBT configurato: 60 FPS Lock, Buffer FHD 1080p, Throttle Guard attivo.
+11-22 17:59:44.977 I/Emux32  ( 7903): [FASE 4/5] DexClassLoader host inizializzato per 01319-BLOOD-GLORY-v.1.1.6.apk (Bridge Java/ART attivo)
+[17:59:44.982][INFO][Emux32] [FASE 5/5] Caricamento ELF binario: libmono.so (98120 byte)...
+11-22 17:59:44.978 I/EmuxDbtEngine( 7903): DbtEngine Performance Governor: Target 60 FPS, FHD: ON, Throttle Guard: ON
+[17:59:44.985][INFO][Emux32] [FASE 5/5] Caricamento ELF binario: libunity.so (56240 byte)...
+11-22 17:59:44.978 I/Emux32  ( 7903): [FASE 4/5] Motore DBT configurato: 60 FPS Lock, Buffer FHD 1080p, Throttle Guard attivo.
+[17:59:44.988][INFO][Emux32] [FASE 5/5] Caricamento ELF binario: libgwallet.so (306028 byte)...
+11-22 17:59:44.981 I/Emux32  ( 7903): [FASE 5/5] Caricamento ELF binario: libmono.so (98120 byte)...
+[17:59:44.991][INFO][Emux32] [FASE 5/5] Caricamento ELF binario: libIAP.so (9324 byte)...
+11-22 17:59:44.984 I/EmuxElfLoader( 7903): PT_DYNAMIC: Trovato 'JNI_OnLoad' a 0x0000a3a4
+11-22 17:59:44.984 I/EmuxElfLoader( 7903): Caricamento ELF completato: /data/user/0/com.emux.translator/cache/libmono.so (Entry: 0x41b823a4, Bias: 0x41b78000, DT_INIT: 0x0, DT_INIT_ARRAY: 0x0/0B, Simboli: 239)
+[17:59:44.995][INFO][Emux32] [FASE 5/5] Caricamento ELF binario: libiapamazon.so (17640 byte)...
+11-22 17:59:44.984 I/EmuxElfLoader( 7903): Mappatura contigua Unicorn ELF [/data/user/0/com.emux.translator/cache/libmono.so]: Base=0x41b78000, Size=0x22000 (139264 byte)
+[17:59:44.999][INFO][Emux32] [FASE 5/5] Caricamento ELF binario: libmzwinject.so (33968 byte)...
+11-22 17:59:44.984 I/EmuxElfLoader( 7903): Segmenti ELF mappati con successo in Unicorn Engine per [/data/user/0/com.emux.translator/cache/libmono.so].
+[17:59:45.002][INFO][Emux32] [FASE 5/5] Caricamento ELF binario: libngserv.so (5620205 byte)...
+11-22 17:59:44.984 I/EmuxElfLoader( 7903): applyRelocations (via PT_DYNAMIC) per [/data/user/0/com.emux.translator/cache/libmono.so]: 73 rilocazioni applicate.
+11-22 17:59:44.984 I/EmuxDbtEngine( 7903): Libreria ELF caricata e rilocata: /data/user/0/com.emux.translator/cache/libmono.so (Entry: 0x41b823a4)
+11-22 17:59:44.984 I/Emux32  ( 7903): [FASE 5/5] Caricamento ELF binario: libunity.so (56240 byte)...
+11-22 17:59:44.986 I/EmuxElfLoader( 7903): PT_DYNAMIC: Trovato 'JNI_OnLoad' a 0x0000166c
+11-22 17:59:44.986 I/EmuxElfLoader( 7903): Caricamento ELF completato: /data/user/0/com.emux.translator/cache/libunity.so (Entry: 0x41d9b66c, Bias: 0x41d9a000, DT_INIT: 0x0, DT_INIT_ARRAY: 0x0/0B, Simboli: 67)
+[17:59:45.012][INFO][Emux32] [FASE 5/5] Tutte le librerie ELF caricate e rilocate. Avvio uc_emu_start su thread isolato Dispatchers.IO...
+11-22 17:59:44.986 I/EmuxElfLoader( 7903): Mappatura contigua Unicorn ELF [/data/user/0/com.emux.translator/cache/libunity.so]: Base=0x41d9a000, Size=0x17000 (94208 byte)
+11-22 17:59:44.986 I/EmuxElfLoader( 7903): Segmenti ELF mappati con successo in Unicorn Engine per [/data/user/0/com.emux.translator/cache/libunity.so].
+11-22 17:59:44.986 I/EmuxElfLoader( 7903): applyRelocations (via PT_DYNAMIC) per [/data/user/0/com.emux.translator/cache/libunity.so]: 73 rilocazioni applicate.
+11-22 17:59:44.986 I/EmuxDbtEngine( 7903): Libreria ELF caricata e rilocata: /data/user/0/com.emux.translator/cache/libunity.so (Entry: 0x41d9b66c)
+11-22 17:59:44.986 I/Emux32  ( 7903): [FASE 5/5] Caricamento ELF binario: libgwallet.so (306028 byte)...
+11-22 17:59:44.989 I/EmuxElfLoader( 7903): PT_DYNAMIC: Trovato 'JNI_OnLoad' a 0x0003c13d
+11-22 17:59:44.989 I/EmuxElfLoader( 7903): Caricamento ELF completato: /data/user/0/com.emux.translator/cache/libgwallet.so (Entry: 0x41fed13d, Bias: 0x41fb1000, DT_INIT: 0x0, DT_INIT_ARRAY: 0x49000/16B, Simboli: 1489)
+11-22 17:59:44.989 I/EmuxElfLoader( 7903): Mappatura contigua Unicorn ELF [/data/user/0/com.emux.translator/cache/libgwallet.so]: Base=0x41fb1000, Size=0x4b000 (307200 byte)
+11-22 17:59:44.990 I/EmuxElfLoader( 7903): Segmenti ELF mappati con successo in Unicorn Engine per [/data/user/0/com.emux.translator/cache/libgwallet.so].
+11-22 17:59:44.990 I/EmuxElfLoader( 7903): applyRelocations (via PT_DYNAMIC) per [/data/user/0/com.emux.translator/cache/libgwallet.so]: 674 rilocazioni applicate.
+11-22 17:59:44.990 I/EmuxDbtEngine( 7903): Libreria ELF caricata e rilocata: /data/user/0/com.emux.translator/cache/libgwallet.so (Entry: 0x41fed13d)
+11-22 17:59:44.990 I/Emux32  ( 7903): [FASE 5/5] Caricamento ELF binario: libIAP.so (9324 byte)...
+11-22 17:59:44.992 I/EmuxElfLoader( 7903): PT_DYNAMIC: Trovato 'JNI_OnLoad' a 0x00000f68
+11-22 17:59:44.992 I/EmuxElfLoader( 7903): Caricamento ELF completato: /data/user/0/com.emux.translator/cache/libIAP.so (Entry: 0x421fcf68, Bias: 0x421fc000, DT_INIT: 0x0, DT_INIT_ARRAY: 0x0/0B, Simboli: 41)
+11-22 17:59:44.992 I/EmuxElfLoader( 7903): Mappatura contigua Unicorn ELF [/data/user/0/com.emux.translator/cache/libIAP.so]: Base=0x421fc000, Size=0x3000 (12288 byte)
+11-22 17:59:44.992 I/EmuxElfLoader( 7903): Segmenti ELF mappati con successo in Unicorn Engine per [/data/user/0/com.emux.translator/cache/libIAP.so].
+11-22 17:59:44.992 I/EmuxElfLoader( 7903): applyRelocations (via PT_DYNAMIC) per [/data/user/0/com.emux.translator/cache/libIAP.so]: 8 rilocazioni applicate.
+11-22 17:59:44.992 I/EmuxDbtEngine( 7903): Libreria ELF caricata e rilocata: /data/user/0/com.emux.translator/cache/libIAP.so (Entry: 0x421fcf68)
+11-22 17:59:44.992 I/Emux32  ( 7903): [FASE 5/5] Caricamento ELF binario: libiapamazon.so (17640 byte)...
+11-22 17:59:44.997 I/EmuxElfLoader( 7903): PT_DYNAMIC: Trovato 'JNI_OnLoad' a 0x000021e0
+11-22 17:59:44.997 I/EmuxElfLoader( 7903): Caricamento ELF completato: /data/user/0/com.emux.translator/cache/libiapamazon.so (Entry: 0x424011e0, Bias: 0x423ff000, DT_INIT: 0x0, DT_INIT_ARRAY: 0x0/0B, Simboli: 56)
+11-22 17:59:44.997 I/EmuxElfLoader( 7903): Mappatura contigua Unicorn ELF [/data/user/0/com.emux.translator/cache/libiapamazon.so]: Base=0x423ff000, Size=0xb000 (45056 byte)
+11-22 17:59:44.997 I/EmuxElfLoader( 7903): Segmenti ELF mappati con successo in Unicorn Engine per [/data/user/0/com.emux.translator/cache/libiapamazon.so].
+11-22 17:59:44.997 I/EmuxElfLoader( 7903): applyRelocations (via PT_DYNAMIC) per [/data/user/0/com.emux.translator/cache/libiapamazon.so]: 32 rilocazioni applicate.
+11-22 17:59:44.997 I/EmuxDbtEngine( 7903): Libreria ELF caricata e rilocata: /data/user/0/com.emux.translator/cache/libiapamazon.so (Entry: 0x424011e0)
+11-22 17:59:44.997 I/Emux32  ( 7903): [FASE 5/5] Caricamento ELF binario: libmzwinject.so (33968 byte)...
+11-22 17:59:45.000 I/EmuxElfLoader( 7903): Caricamento ELF completato: /data/user/0/com.emux.translator/cache/libmzwinject.so (Entry: 0x4260a000, Bias: 0x4260a000, DT_INIT: 0x0, DT_INIT_ARRAY: 0x8d7c/4B, Simboli: 208)
+11-22 17:59:45.000 I/EmuxElfLoader( 7903): Mappatura contigua Unicorn ELF [/data/user/0/com.emux.translator/cache/libmzwinject.so]: Base=0x4260a000, Size=0xa000 (40960 byte)
+11-22 17:59:45.000 I/EmuxElfLoader( 7903): Segmenti ELF mappati con successo in Unicorn Engine per [/data/user/0/com.emux.translator/cache/libmzwinject.so].
+11-22 17:59:45.000 I/EmuxElfLoader( 7903): applyRelocations (via PT_DYNAMIC) per [/data/user/0/com.emux.translator/cache/libmzwinject.so]: 108 rilocazioni applicate.
+11-22 17:59:45.000 I/EmuxDbtEngine( 7903): Libreria ELF caricata e rilocata: /data/user/0/com.emux.translator/cache/libmzwinject.so (Entry: 0x4260a000)
+11-22 17:59:45.000 I/Emux32  ( 7903): [FASE 5/5] Caricamento ELF binario: libngserv.so (5620205 byte)...
+11-22 17:59:45.006 I/EmuxElfLoader( 7903): PT_DYNAMIC: Trovato 'JNI_OnLoad' a 0x00086bb1
+11-22 17:59:45.009 I/EmuxElfLoader( 7903): Caricamento ELF completato: /data/user/0/com.emux.translator/cache/libngserv.so (Entry: 0x4289abb1, Bias: 0x42814000, DT_INIT: 0x0, DT_INIT_ARRAY: 0xa9468/84B, Simboli: 3413)
+11-22 17:59:45.009 I/EmuxElfLoader( 7903): Mappatura contigua Unicorn ELF [/data/user/0/com.emux.translator/cache/libngserv.so]: Base=0x42814000, Size=0xad000 (708608 byte)
+11-22 17:59:45.009 I/EmuxElfLoader( 7903): Segmenti ELF mappati con successo in Unicorn Engine per [/data/user/0/com.emux.translator/cache/libngserv.so].
+11-22 17:59:45.011 I/EmuxElfLoader( 7903): applyRelocations (via PT_DYNAMIC) per [/data/user/0/com.emux.translator/cache/libngserv.so]: 1730 rilocazioni applicate.
+11-22 17:59:45.011 I/EmuxDbtEngine( 7903): Libreria ELF caricata e rilocata: /data/user/0/com.emux.translator/cache/libngserv.so (Entry: 0x4289abb1)
+11-22 17:59:45.011 I/Emux32  ( 7903): [FASE 5/5] Tutte le librerie ELF caricate e rilocate. Avvio uc_emu_start su thread isolato Dispatchers.IO...
+11-22 17:59:45.013 I/EmuxDbtEngine( 7903): Stack Guest (2MB) configurato: SP=0x7e1ff000
+11-22 17:59:45.013 I/EmuxDbtEngine( 7903): EGL inizializzato sul Worker Thread: versione 1.5
+11-22 17:59:45.020 I/EmuxDbtEngine( 7903): initEgl [WorkerThread]: Contesto EGL inizializzato su ANativeWindow (1920x1080) e rilasciato per cooperative handover.
+11-22 17:59:45.020 I/EmuxElfLoader( 7903): executeInitFunctions per [/data/user/0/com.emux.translator/cache/libmono.so]: eseguiti 0 costruttori statici C++ (DT_INIT / DT_INIT_ARRAY).
+11-22 17:59:45.020 I/EmuxElfLoader( 7903): executeInitFunctions per [/data/user/0/com.emux.translator/cache/libunity.so]: eseguiti 0 costruttori statici C++ (DT_INIT / DT_INIT_ARRAY).
+11-22 17:59:45.022 I/EmuxElfLoader( 7903): executeInitFunctions per [/data/user/0/com.emux.translator/cache/libgwallet.so]: eseguiti 2 costruttori statici C++ (DT_INIT / DT_INIT_ARRAY).
+11-22 17:59:45.022 I/EmuxElfLoader( 7903): executeInitFunctions per [/data/user/0/com.emux.translator/cache/libIAP.so]: eseguiti 0 costruttori statici C++ (DT_INIT / DT_INIT_ARRAY).
+11-22 17:59:45.022 I/EmuxElfLoader( 7903): executeInitFunctions per [/data/user/0/com.emux.translator/cache/libiapamazon.so]: eseguiti 0 costruttori statici C++ (DT_INIT / DT_INIT_ARRAY).
+11-22 17:59:45.022 I/EmuxElfLoader( 7903): executeInitFunctions per [/data/user/0/com.emux.translator/cache/libmzwinject.so]: eseguiti 0 costruttori statici C++ (DT_INIT / DT_INIT_ARRAY).
+11-22 17:59:45.024 I/EmuxElfLoader( 7903): executeInitFunctions per [/data/user/0/com.emux.translator/cache/libngserv.so]: eseguiti 19 costruttori statici C++ (DT_INIT / DT_INIT_ARRAY).
+11-22 17:59:45.024 I/EmuxDbtEngine( 7903): Avvio JNI_OnLoad per '/data/user/0/com.emux.translator/cache/libmono.so': PC=0x41b823a4, SP=0x7e1ff000, JavaVM=0x7d000000...
+11-22 17:59:45.025 W/UnicornCore( 7903): Dynarmic: ExceptionRaised a PC=0x7c1766d8 (tipo=12)
+11-22 17:59:45.025 W/GuestSignalManager( 7903): GuestSignalManager: Nessun custom handler attivo per segnale 11 (default)
+11-22 17:59:45.025 I/EmuxDbtEngine( 7903): JNI_OnLoad '/data/user/0/com.emux.translator/cache/libmono.so' completato (Versione ritornata: 0x00000000, Metodi registrati finora: 0).
+11-22 17:59:45.025 I/EmuxDbtEngine( 7903): Avvio JNI_OnLoad per '/data/user/0/com.emux.translator/cache/libunity.so': PC=0x41d9b66c, SP=0x7e1ff000, JavaVM=0x7d000000...
+11-22 17:59:45.025 W/UnicornCore( 7903): Dynarmic: ExceptionRaised a PC=0x7c1766d8 (tipo=12)
+11-22 17:59:45.025 W/GuestSignalManager( 7903): GuestSignalManager: Nessun custom handler attivo per segnale 11 (default)
+11-22 17:59:45.025 I/EmuxDbtEngine( 7903): JNI_OnLoad '/data/user/0/com.emux.translator/cache/libunity.so' completato (Versione ritornata: 0x00000000, Metodi registrati finora: 0).
+11-22 17:59:45.025 I/EmuxDbtEngine( 7903): Avvio JNI_OnLoad per '/data/user/0/com.emux.translator/cache/libgwallet.so': PC=0x41fed13d, SP=0x7e1ff000, JavaVM=0x7d000000...
+11-22 17:59:45.025 W/UnicornCore( 7903): Dynarmic: ExceptionRaised a PC=0x7d001040 (tipo=0)
+11-22 17:59:45.025 W/GuestSignalManager( 7903): GuestSignalManager: Nessun custom handler attivo per segnale 4 (default)
+11-22 17:59:45.025 I/EmuxDbtEngine( 7903): JNI_OnLoad '/data/user/0/com.emux.translator/cache/libgwallet.so' completato (Versione ritornata: 0x00000000, Metodi registrati finora: 0).
+11-22 17:59:45.025 I/EmuxDbtEngine( 7903): Avvio JNI_OnLoad per '/data/user/0/com.emux.translator/cache/libIAP.so': PC=0x421fcf68, SP=0x7e1ff000, JavaVM=0x7d000000...
+11-22 17:59:45.025 I/EmuxLinkerHook( 7903): [GuestLog][IAPNative] [JNI_OnLoad] Creating java link vm = 7d000000
+11-22 17:59:45.026 I/EmuxDbtEngine( 7903): JNI_OnLoad '/data/user/0/com.emux.translator/cache/libIAP.so' completato (Versione ritornata: 0x00000000, Metodi registrati finora: 0).
+11-22 17:59:45.026 I/EmuxDbtEngine( 7903): Avvio JNI_OnLoad per '/data/user/0/com.emux.translator/cache/libiapamazon.so': PC=0x424011e0, SP=0x7e1ff000, JavaVM=0x7d000000...
+11-22 17:59:45.026 I/EmuxLinkerHook( 7903): [GuestLog][IAPNative] [JNI_OnLoad] Creating java link vm = 0x7d000000
+11-22 17:59:45.026 I/EmuxDbtEngine( 7903): JNI_OnLoad '/data/user/0/com.emux.translator/cache/libiapamazon.so' completato (Versione ritornata: 0x00000000, Metodi registrati finora: 0).
+11-22 17:59:45.026 I/EmuxDbtEngine( 7903): Avvio JNI_OnLoad per '/data/user/0/com.emux.translator/cache/libngserv.so': PC=0x4289abb1, SP=0x7e1ff000, JavaVM=0x7d000000...
+11-22 17:59:45.027 W/UnicornCore( 7903): Dynarmic: ExceptionRaised a PC=0x7d001040 (tipo=0)
+11-22 17:59:45.027 W/GuestSignalManager( 7903): GuestSignalManager: Nessun custom handler attivo per segnale 4 (default)
+11-22 17:59:45.027 I/EmuxDbtEngine( 7903): JNI_OnLoad '/data/user/0/com.emux.translator/cache/libngserv.so' completato (Versione ritornata: 0x00000000, Metodi registrati finora: 0).
+11-22 17:59:45.027 I/EmuxDbtEngine( 7903): Invocazione dinamica Resume 'Java_com_glu_platform_android_GWalletJNI_onResume' @ 0x42880711...
+11-22 17:59:45.027 I/EmuxDbtEngine( 7903): ANativeActivity rilevata: avvio ANativeActivity_onCreate @ 0x41d9b59c...
+11-22 17:59:45.028 I/EmuxDbtEngine( 7903): ANativeActivity_onCreate completata.
+11-22 17:59:45.029 I/EmuxDbtEngine( 7903): DbtEngine: Avvio LOOP DI GIOCO ATTIVO A 60 FPS (RenderMethod='EGL-PresentLoop' @ 0x00000000)...
+11-22 17:59:47.029 I/EmuxDbtEngine( 7903): DbtEngine Heartbeat: 177 frame renderizzati (velocità media: 88.5 FPS, touch in coda: 0)
+11-22 17:59:49.037 I/EmuxDbtEngine( 7903): DbtEngine Heartbeat: 294 frame renderizzati (velocità media: 58.3 FPS, touch in coda: 0)
+11-22 17:59:49.536 I/EmuxDbtEngine( 7903): DbtEngine Touch Queued: action=0, x=1285.4, y=413.6, id=0
+11-22 17:59:49.584 I/EmuxDbtEngine( 7903): DbtEngine Touch Queued: action=1, x=1285.4, y=413.6, id=0
+11-22 17:59:50.345 I/EmuxDbtEngine( 7903): DbtEngine Touch Queued: action=0, x=1560.6, y=49.3, id=0
+11-22 17:59:50.355 I/EmuxDbtEngine( 7903): DbtEngine Touch Queued: action=2, x=1549.0, y=86.2, id=0
+11-22 17:59:50.419 I/EmuxDbtEngine( 7903): DbtEngine Touch Queued: action=2, x=1514.5, y=214.5, id=0
+11-22 17:59:50.438 I/EmuxDbtEngine( 7903): DbtEngine Touch Queued: action=2, x=1513.0, y=239.0, id=0
+11-22 17:59:50.451 I/EmuxDbtEngine( 7903): DbtEngine Touch Queued: action=2, x=1512.9, y=246.5, id=0
+11-22 17:59:50.468 I/EmuxDbtEngine( 7903): DbtEngine Touch Queued: action=2, x=1512.8, y=248.4, id=0
+11-22 17:59:50.484 I/EmuxDbtEngine( 7903): DbtEngine Touch Queued: action=2, x=1512.7, y=249.0, id=0
+11-22 17:59:50.501 I/EmuxDbtEngine( 7903): DbtEngine Touch Queued: action=2, x=1512.6, y=249.2, id=0
+11-22 17:59:50.518 I/EmuxDbtEngine( 7903): DbtEngine Touch Queued: action=2, x=1512.6, y=249.3, id=0
+11-22 17:59:50.534 I/EmuxDbtEngine( 7903): DbtEngine Touch Queued: action=2, x=1512.5, y=249.1, id=0
+11-22 17:59:50.551 I/EmuxDbtEngine( 7903): DbtEngine Touch Queued: action=2, x=1512.4, y=248.6, id=0
+11-22 17:59:50.568 I/EmuxDbtEngine( 7903): DbtEngine Touch Queued: action=2, x=1512.3, y=248.0, id=0
+11-22 17:59:50.584 I/EmuxDbtEngine( 7903): DbtEngine Touch Queued: action=2, x=1512.2, y=247.2, id=0
+11-22 17:59:50.600 I/EmuxDbtEngine( 7903): DbtEngine Touch Queued: action=2, x=1512.2, y=246.3, id=0
+11-22 17:59:50.617 I/EmuxDbtEngine( 7903): DbtEngine Touch Queued: action=2, x=1512.2, y=245.6, id=0
+11-22 17:59:50.635 I/EmuxDbtEngine( 7903): DbtEngine Touch Queued: action=2, x=1512.2, y=244.8, id=0
+11-22 17:59:50.651 I/EmuxDbtEngine( 7903): DbtEngine Touch Queued: action=2, x=1512.2, y=244.2, id=0
+11-22 17:59:50.668 I/EmuxDbtEngine( 7903): DbtEngine Touch Queued: action=2, x=1512.2, y=243.5, id=0
+11-22 17:59:50.684 I/EmuxDbtEngine( 7903): DbtEngine Touch Queued: action=2, x=1512.2, y=242.8, id=0
+11-22 17:59:50.700 I/EmuxDbtEngine( 7903): DbtEngine Touch Queued: action=2, x=1512.2, y=242.2, id=0
+11-22 17:59:50.717 I/EmuxDbtEngine( 7903): DbtEngine Touch Queued: action=2, x=1512.2, y=241.5, id=0
+11-22 17:59:50.734 I/EmuxDbtEngine( 7903): DbtEngine Touch Queued: action=2, x=1512.2, y=241.5, id=0
+11-22 17:59:50.751 I/EmuxDbtEngine( 7903): DbtEngine Touch Queued: action=1, x=1512.2, y=241.5, id=0
+11-22 17:59:51.051 I/EmuxDbtEngine( 7903): DbtEngine Heartbeat: 411 frame renderizzati (velocità media: 58.1 FPS, touch in coda: 0)
+11-22 17:59:53.064 I/EmuxDbtEngine( 7903): DbtEngine Heartbeat: 528 frame renderizzati (velocità media: 58.2 FPS, touch in coda: 0)
+11-22 17:59:53.348 I/EmuxDbtEngine( 7903): DbtEngine Touch Queued: action=0, x=1619.9, y=529.4, id=0
+11-22 17:59:53.423 I/EmuxDbtEngine( 7903): DbtEngine Touch Queued: action=1, x=1619.9, y=529.4, id=0
+11-22 17:59:54.071 I/EmuxDbtEngine( 7903): DbtEngine Touch Queued: action=0, x=1651.4, y=39.5, id=0
+11-22 17:59:54.091 I/EmuxDbtEngine( 7903): DbtEngine Touch Queued: action=2, x=1624.8, y=108.4, id=0
+11-22 17:59:54.117 I/EmuxDbtEngine( 7903): DbtEngine Touch Queued: action=2, x=1607.3, y=163.5, id=0
+11-22 17:59:54.139 I/EmuxDbtEngine( 7903): DbtEngine Touch Queued: action=2, x=1600.0, y=198.4, id=0
+11-22 17:59:54.152 I/EmuxDbtEngine( 7903): DbtEngine Touch Queued: action=2, x=1597.4, y=228.1, id=0
+11-22 17:59:54.153 I/EmuxDbtEngine( 7903): DbtEngine Touch Queued: action=1, x=1597.4, y=228.1, id=0
+11-22 17:59:54.642 I/EmuxDbtEngine( 7903): DbtEngine Touch Queued: action=0, x=1692.1, y=401.7, id=0
+11-22 17:59:54.669 I/EmuxDbtEngine( 7903): DbtEngine Touch Queued: action=1, x=1692.1, y=401.7, id=0
+11-22 17:59:54.783 I/EmuxDbtEngine( 7903): DbtEngine Touch Queued: action=0, x=1705.6, y=393.6, id=0
+11-22 17:59:54.876 I/EmuxDbtEngine( 7903): DbtEngine Touch Queued: action=1, x=1705.6, y=393.6, id=0
+11-22 17:59:55.075 I/EmuxDbtEngine( 7903): DbtEngine Heartbeat: 645 frame renderizzati (velocità media: 58.2 FPS, touch in coda: 0)
+11-22 17:59:55.306 I/EmuxDbtEngine( 7903): DbtEngine Touch Queued: action=0, x=1785.5, y=211.5, id=0
+11-22 17:59:55.400 I/EmuxDbtEngine( 7903): DbtEngine Touch Queued: action=1, x=1785.5, y=211.5, id=0
+11-22 17:59:55.766 I/EmuxDbtEngine( 7903): DbtEngine Touch Queued: action=0, x=1699.9, y=125.1, id=0
+11-22 17:59:55.824 I/EmuxDbtEngine( 7903): DbtEngine Touch Queued: action=1, x=1699.9, y=125.1, id=0
+11-22 17:59:57.092 I/EmuxDbtEngine( 7903): DbtEngine Heartbeat: 763 frame renderizzati (velocità media: 58.5 FPS, touch in coda: 0)
+11-22 17:59:57.704 I/EmuxDbtEngine( 7903): DbtEngine Touch Queued: action=0, x=1713.2, y=112.3, id=0
+11-22 17:59:57.764 I/EmuxDbtEngine( 7903): DbtEngine Touch Queued: action=2, x=1713.2, y=121.1, id=0
+11-22 17:59:57.780 I/EmuxDbtEngine( 7903): DbtEngine Touch Queued: action=2, x=1713.2, y=137.9, id=0
+11-22 17:59:57.797 I/EmuxDbtEngine( 7903): DbtEngine Touch Queued: action=2, x=1713.2, y=164.1, id=0
+11-22 17:59:57.813 I/EmuxDbtEngine( 7903): DbtEngine Touch Queued: action=2, x=1713.2, y=182.2, id=0
+11-22 17:59:57.831 I/EmuxDbtEngine( 7903): DbtEngine Touch Queued: action=2, x=1713.2, y=194.4, id=0
+11-22 17:59:57.840 I/EmuxDbtEngine( 7903): DbtEngine Touch Queued: action=2, x=1713.2, y=196.7, id=0
+11-22 17:59:57.841 I/EmuxDbtEngine( 7903): DbtEngine Touch Queued: action=1, x=1713.2, y=196.7, id=0
+11-22 17:59:58.309 I/EmuxDbtEngine( 7903): DbtEngine Touch Queued: action=0, x=1347.3, y=172.5, id=0
+11-22 17:59:58.403 I/EmuxDbtEngine( 7903): DbtEngine Touch Queued: action=1, x=1347.3, y=172.5, id=0
+11-22 17:59:58.677 I/EmuxDbtEngine( 7903): DbtEngine Touch Queued: action=0, x=1358.0, y=109.1, id=0
+11-22 17:59:58.763 I/EmuxDbtEngine( 7903): DbtEngine Touch Queued: action=1, x=1358.0, y=109.1, id=0
+11-22 17:59:59.004 I/EmuxDbtEngine( 7903): DbtEngine Touch Queued: action=0, x=1672.4, y=94.8, id=0
+11-22 17:59:59.097 I/EmuxDbtEngine( 7903): DbtEngine Heartbeat: 880 frame renderizzati (velocità media: 58.4 FPS, touch in coda: 0)
+11-22 17:59:59.101 I/EmuxDbtEngine( 7903): DbtEngine Touch Queued: action=1, x=1672.4, y=94.8, id=0
+11-22 17:59:59.238 I/EmuxDbtEngine( 7903): DbtEngine Touch Queued: action=0, x=1653.7, y=238.8, id=0
+11-22 17:59:59.350 I/EmuxDbtEngine( 7903): DbtEngine Touch Queued: action=1, x=1653.7, y=238.8, id=0
+11-22 17:59:59.462 I/EmuxDbtEngine( 7903): DbtEngine Touch Queued: action=0, x=1552.4, y=389.1, id=0
+11-22 17:59:59.558 I/EmuxDbtEngine( 7903): DbtEngine Touch Queued: action=1, x=1552.4, y=389.1, id=0
+11-22 17:59:59.703 I/EmuxDbtEngine( 7903): DbtEngine Touch Queued: action=0, x=1426.6, y=560.5, id=0
+11-22 17:59:59.801 I/EmuxDbtEngine( 7903): DbtEngine Touch Queued: action=1, x=1426.6, y=560.5, id=0
+11-22 18:00:00.066 I/EmuxDbtEngine( 7903): DbtEngine Touch Queued: action=0, x=1229.9, y=390.7, id=0
+11-22 18:00:00.161 I/EmuxDbtEngine( 7903): DbtEngine Touch Queued: action=1, x=1229.9, y=390.7, id=0
+11-22 18:00:00.288 I/EmuxDbtEngine( 7903): DbtEngine Touch Queued: action=0, x=1323.4, y=87.5, id=0
+11-22 18:00:00.370 I/EmuxDbtEngine( 7903): DbtEngine Touch Queued: action=1, x=1323.4, y=87.5, id=0
+11-22 18:00:00.540 I/EmuxDbtEngine( 7903): DbtEngine Touch Queued: action=0, x=1386.1, y=17.8, id=0
+11-22 18:00:00.555 I/EmuxDbtEngine( 7903): DbtEngine Touch Queued: action=2, x=1386.1, y=47.2, id=0
+11-22 18:00:00.586 I/EmuxDbtEngine( 7903): DbtEngine Touch Queued: action=2, x=1386.2, y=95.3, id=0
+11-22 18:00:00.589 I/EmuxDbtEngine( 7903): DbtEngine Touch Queued: action=2, x=1386.8, y=130.7, id=0
+11-22 18:00:00.605 I/EmuxDbtEngine( 7903): DbtEngine Touch Queued: action=2, x=1388.1, y=149.7, id=0
+11-22 18:00:00.622 I/EmuxDbtEngine( 7903): DbtEngine Touch Queued: action=2, x=1389.3, y=163.4, id=0
+11-22 18:00:00.638 I/EmuxDbtEngine( 7903): DbtEngine Touch Queued: action=2, x=1390.2, y=172.5, id=0
+11-22 18:00:00.655 I/EmuxDbtEngine( 7903): DbtEngine Touch Queued: action=2, x=1390.8, y=178.1, id=0
+11-22 18:00:00.671 I/EmuxDbtEngine( 7903): DbtEngine Touch Queued: action=2, x=1391.1, y=180.4, id=0
+11-22 18:00:00.688 I/EmuxDbtEngine( 7903): DbtEngine Touch Queued: action=2, x=1391.3, y=181.0, id=0
+11-22 18:00:00.704 I/EmuxDbtEngine( 7903): DbtEngine Touch Queued: action=2, x=1391.6, y=181.2, id=0
+11-22 18:00:00.721 I/EmuxDbtEngine( 7903): DbtEngine Touch Queued: action=2, x=1391.9, y=181.3, id=0
+11-22 18:00:00.738 I/EmuxDbtEngine( 7903): DbtEngine Touch Queued: action=2, x=1392.1, y=181.4, id=0
+11-22 18:00:00.754 I/EmuxDbtEngine( 7903): DbtEngine Touch Queued: action=2, x=1392.1, y=180.7, id=0
+11-22 18:00:00.771 I/EmuxDbtEngine( 7903): DbtEngine Touch Queued: action=2, x=1392.1, y=174.7, id=0
+11-22 18:00:00.788 I/EmuxDbtEngine( 7903): DbtEngine Touch Queued: action=2, x=1392.1, y=154.6, id=0
+11-22 18:00:00.804 I/EmuxDbtEngine( 7903): DbtEngine Touch Queued: action=2, x=1392.6, y=127.6, id=0
+11-22 18:00:00.821 I/EmuxDbtEngine( 7903): DbtEngine Touch Queued: action=2, x=1394.8, y=105.1, id=0
+11-22 18:00:00.837 I/EmuxDbtEngine( 7903): DbtEngine Touch Queued: action=2, x=1399.7, y=90.4, id=0
+11-22 18:00:00.854 I/EmuxDbtEngine( 7903): DbtEngine Touch Queued: action=2, x=1407.8, y=78.6, id=0
+11-22 18:00:00.867 I/EmuxDbtEngine( 7903): DbtEngine Touch Queued: action=2, x=1411.5, y=74.2, id=0
+11-22 18:00:00.868 I/EmuxDbtEngine( 7903): DbtEngine Touch Queued: action=1, x=1411.5, y=74.2, id=0
+11-22 18:00:01.111 I/EmuxDbtEngine( 7903): DbtEngine Heartbeat: 998 frame renderizzati (velocità media: 58.6 FPS, touch in coda: 0)
+11-22 18:00:03.116 I/EmuxDbtEngine( 7903): DbtEngine Heartbeat: 1115 frame renderizzati (velocità media: 58.4 FPS, touch in coda: 0)
+11-22 18:00:05.127 I/EmuxDbtEngine( 7903): DbtEngine Heartbeat: 1233 frame renderizzati (velocità media: 58.7 FPS, touch in coda: 0)
+[18:00:05.741][INFO][Emux32] Scansione libreria giochi in: /storage/emulated/0/Emulators/Emux32
+11-22 18:00:05.741 I/EmuxLinkerHook( 7903): SyscallDispatcher: Percorso storage configurato a '/storage/emulated/0/Emulators/Emux32'
+11-22 18:00:05.741 I/Emux32  ( 7903): Scansione libreria giochi in: /storage/emulated/0/Emulators/Emux32
+11-22 18:00:05.746 I/EmuxDbtEngine( 7903): DbtEngine: Ciclo di gioco terminato (totale frame: 1268). Rilascio EGL sul Worker Thread.
+[18:00:05.762][INFO][Emux32] [FASE 5/5] Esecuzione guest completata regolarmente.
+11-22 18:00:05.762 I/EmuxDbtEngine( 7903): destroyEgl: Risorse grafiche EGL rilasciate.
+11-22 18:00:05.762 I/Emux32  ( 7903): [FASE 5/5] Esecuzione guest completata regolarmente.
+11-22 18:00:05.766 I/EmuxDbtEngine( 7903): ANativeWindow scollegata.
+[18:00:06.162][INFO][Emux32] Scansione completata: trovati 3 titoli supportati.
+11-22 18:00:06.162 I/Emux32  ( 7903): Scansione completata: trovati 3 titoli supportati.
+[18:00:09.788][INFO][Emux32] MainActivity distrutta. Rilascio risorse motore nativo.
+11-22 18:00:09.788 I/Emux32  ( 7903): MainActivity distrutta. Rilascio risorse motore nativo.
+11-22 18:00:09.791 I/UnicornCore( 7903): Unicorn Engine rilasciato
+
+---------- [CURRENT SESSION LOG (emux_execution.log)] ----------
+[18:00:10.109][INFO][Emux32] Emux32 avviato su Android SDK 36. Cartella storage: /storage/emulated/0/Emulators/Emux32
+11-22 18:00:10.108 I/Emux32  ( 7903): File di log pubblico configurato: /storage/emulated/0/Emulators/Emux32/log/emux_execution.log
+11-22 18:00:10.109 I/Emux32  ( 7903): Emux32 avviato su Android SDK 36. Cartella storage: /storage/emulated/0/Emulators/Emux32
+11-22 18:00:10.115 I/EmuxLinkerHook( 7903): SyscallDispatcher: Percorso storage configurato a '/storage/emulated/0/Emulators/Emux32'
+11-22 18:00:10.115 I/EmuxDbtEngine( 7903): Inizializzazione Unicorn Engine per architettura ARMv7-A...
+11-22 18:00:10.115 I/EmuxGuestMemory( 7903): Arena GuestMemory 4 GB inizializzata: HostBase=0x7340000000, HostPageSize=4096 byte (GuestPage=4096 byte)
+11-22 18:00:10.115 I/UnicornCore( 7903): UnicornCore: Dynarmic Fastmem agganciato all'arena base 0x7340000000
+[18:00:10.181][INFO][Emux32] Scansione libreria giochi in: /storage/emulated/0/Emulators/Emux32
+11-22 18:00:10.181 I/EmuxLinkerHook( 7903): SyscallDispatcher: Percorso storage configurato a '/storage/emulated/0/Emulators/Emux32'
+11-22 18:00:10.181 I/Emux32  ( 7903): Scansione libreria giochi in: /storage/emulated/0/Emulators/Emux32
+[18:00:10.216][INFO][Emux32] Unicorn ARM32 DBT Engine pre-inizializzato con successo (512 MB guest RAM).
+11-22 18:00:10.206 I/UnicornCore( 7903): UnicornCore: Dynarmic ARM32 JIT compiler istanziato con successo (BlockLinking, Fastmem, RSB: ON)!
+11-22 18:00:10.206 I/UnicornCore( 7903): Unicorn Engine ARM istanziato con successo (0xb400007548e74900)
+11-22 18:00:10.210 I/GuestSignalManager( 7903): GuestSignalManager: Restorer trampoline rt_sigreturn installata a 0x70000010
+11-22 18:00:10.211 I/EmuxLinkerHook( 7903): GuestRuntimeEnvironment inizializzato: JavaVM32=0x7d000000, JNIEnv32=0x7d000200 (256 slot ABI), TLS=0x7d020000, Heap=0x58000000
+11-22 18:00:10.211 I/UnicornCore( 7903): uc_hook_add: Registrato hook tipo 1 (id=1, begin=0x1, end=0x0)
+11-22 18:00:10.211 I/EmuxDbtEngine( 7903): Unicorn Engine inizializzato con successo (hook id=1).
+11-22 18:00:10.212 I/Emux32  ( 7903): Unicorn ARM32 DBT Engine pre-inizializzato con successo (512 MB guest RAM).
+[18:00:10.555][INFO][Emux32] Scansione completata: trovati 3 titoli supportati.
+11-22 18:00:10.555 I/Emux32  ( 7903): Scansione completata: trovati 3 titoli supportati.
 
