@@ -39,50 +39,38 @@ data class EmuxRom(
 fun scanEmuxStorage(context: Context, apkDir: File, obbDir: File): List<EmuxRom> {
     val gamesList = mutableListOf<EmuxRom>()
 
+    val emuxRoot = apkDir.parentFile ?: obbDir.parentFile
+    if (emuxRoot == null || !emuxRoot.exists()) {
+        return gamesList
+    }
+
     if (!apkDir.exists()) apkDir.mkdirs()
     if (!obbDir.exists()) obbDir.mkdirs()
 
+    // Scansione strettamente confinata alla cartella Emux32 selezionata dall'utente
     val candidateApkDirs = mutableListOf<File>()
     candidateApkDirs.add(apkDir)
-    apkDir.parentFile?.let { parent ->
-        if (parent.exists()) {
-            candidateApkDirs.add(parent)
-            val romsDir = File(parent, "roms")
-            if (romsDir.exists()) candidateApkDirs.add(romsDir)
-            val gamesDir = File(parent, "games")
-            if (gamesDir.exists()) candidateApkDirs.add(gamesDir)
-        }
-    }
-    val downloadDir = File("/storage/emulated/0/Download")
-    if (downloadDir.exists() && downloadDir.canRead()) {
-        candidateApkDirs.add(downloadDir)
-    }
+    candidateApkDirs.add(emuxRoot)
+    val romsDir = File(emuxRoot, "roms")
+    if (romsDir.exists() && romsDir.isDirectory) candidateApkDirs.add(romsDir)
+    val gamesDir = File(emuxRoot, "games")
+    if (gamesDir.exists() && gamesDir.isDirectory) candidateApkDirs.add(gamesDir)
 
     val discoveredApkFiles = mutableSetOf<File>()
     for (dir in candidateApkDirs) {
-        if (!dir.exists()) continue
-        dir.listFiles { file ->
-            file.isFile && file.name.lowercase().endsWith(".apk")
-        }?.forEach { discoveredApkFiles.add(it) }
-        if (dir != downloadDir) {
-            try {
-                dir.walkTopDown().maxDepth(2).filter { it.isFile && it.name.lowercase().endsWith(".apk") }.forEach {
-                    discoveredApkFiles.add(it)
-                }
-            } catch (_: Throwable) {}
-        }
+        if (!dir.exists() || !dir.isDirectory) continue
+        try {
+            dir.walkTopDown().maxDepth(2).filter { it.isFile && it.name.lowercase().endsWith(".apk") }.forEach {
+                discoveredApkFiles.add(it)
+            }
+        } catch (_: Throwable) {}
     }
     val apkFiles = discoveredApkFiles.toTypedArray()
 
     val upscaledCoversDir = File(apkDir, ".upscaled_covers")
     if (!upscaledCoversDir.exists()) upscaledCoversDir.mkdirs()
 
-    // Raccoglie tutti i file .obb, archivi .zip e cartelle dati cercando in:
-    // 1. obbDir configurata dall'emulatore (es. Emux32/obb)
-    // 2. dataDir configurata dall'emulatore (es. Emux32/data)
-    // 3. apkDir (spesso gli utenti posizionano lo ZIP della cache nella stessa cartella)
-    // 4. /storage/emulated/0/Download (cartella download utente)
-    // 5. /storage/emulated/0/Android/obb e /storage/emulated/0/Android/data (standard Android)
+    // Raccoglie file .obb, archivi .zip/.cache e cartelle dati ESCLUSIVAMENTE dentro la cartella Emux32 selezionata
     val allDiscoveredObbs = mutableListOf<File>()
     val allDiscoveredDirs = mutableListOf<File>()
 
@@ -100,7 +88,7 @@ fun scanEmuxStorage(context: Context, apkDir: File, obbDir: File): List<EmuxRom>
                 allDiscoveredDirs.add(it)
             }
         }
-        val dataDir = File(obbDir.parentFile, "data")
+        val dataDir = File(emuxRoot, "data")
         if (dataDir.exists()) {
             dataDir.walkTopDown().filter { it.isFile && isArchiveFile(it) }.forEach {
                 allDiscoveredObbs.add(it)
@@ -114,26 +102,8 @@ fun scanEmuxStorage(context: Context, apkDir: File, obbDir: File): List<EmuxRom>
                 allDiscoveredObbs.add(it)
             }
         }
-        val downloadDir = File("/storage/emulated/0/Download")
-        if (downloadDir.exists() && downloadDir.canRead()) {
-            downloadDir.listFiles { file -> file.isFile && isArchiveFile(file) }?.forEach {
-                allDiscoveredObbs.add(it)
-            }
-        }
-        val systemObbDir = File("/storage/emulated/0/Android/obb")
-        if (systemObbDir.exists() && systemObbDir.canRead()) {
-            systemObbDir.walkTopDown().maxDepth(3).filter { it.isFile && isArchiveFile(it) }.forEach {
-                allDiscoveredObbs.add(it)
-            }
-            systemObbDir.listFiles { file -> file.isDirectory }?.forEach {
-                allDiscoveredDirs.add(it)
-            }
-        }
-        val systemDataDir = File("/storage/emulated/0/Android/data")
-        if (systemDataDir.exists() && systemDataDir.canRead()) {
-            systemDataDir.listFiles { file -> file.isDirectory }?.forEach {
-                allDiscoveredDirs.add(it)
-            }
+        emuxRoot.listFiles { file -> file.isFile && isArchiveFile(file) }?.forEach {
+            allDiscoveredObbs.add(it)
         }
     } catch (e: Throwable) {
         e.printStackTrace()

@@ -10,6 +10,7 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.FolderOpen
+import androidx.compose.material.icons.filled.SystemUpdate
 import androidx.compose.material.icons.filled.Terminal
 import androidx.compose.material3.*
 import androidx.compose.runtime.Composable
@@ -32,7 +33,8 @@ fun EmuxGridScreen(
     currentPathLabel: String,
     onGameClick: (EmuxRom) -> Unit,
     onChangePathClick: () -> Unit,
-    onShowLogsClick: () -> Unit = {}
+    onShowLogsClick: () -> Unit = {},
+    onCheckUpdatesClick: () -> Unit = {}
 ) {
     Surface(
         modifier = Modifier.fillMaxSize(),
@@ -49,14 +51,18 @@ fun EmuxGridScreen(
                         modifier = Modifier.padding(24.dp)
                     ) {
                         Text(
-                            text = "Nessun gioco trovato",
+                            text = if (currentPathLabel.isBlank()) "Nessuna cartella selezionata" else "Nessun gioco trovato",
                             color = Color.White,
                             fontWeight = FontWeight.Bold,
                             fontSize = 18.sp
                         )
                         Spacer(modifier = Modifier.height(8.dp))
                         Text(
-                            text = "Inserisci i tuoi file .apk nella cartella:\n$currentPathLabel/apk",
+                            text = if (currentPathLabel.isBlank()) {
+                                "Seleziona una cartella di destinazione per creare o utilizzare Emux32."
+                            } else {
+                                "Inserisci i tuoi file .apk nella cartella:\n$currentPathLabel/apk"
+                            },
                             color = Color.Gray,
                             textAlign = TextAlign.Center,
                             fontSize = 14.sp
@@ -68,7 +74,16 @@ fun EmuxGridScreen(
                         ) {
                             Icon(Icons.Default.FolderOpen, contentDescription = null, modifier = Modifier.size(18.dp))
                             Spacer(modifier = Modifier.width(8.dp))
-                            Text("Cambia Percorso")
+                            Text(if (currentPathLabel.isBlank()) "Seleziona Cartella" else "Cambia Percorso")
+                        }
+                        Spacer(modifier = Modifier.height(10.dp))
+                        OutlinedButton(
+                            onClick = onCheckUpdatesClick,
+                            colors = ButtonDefaults.outlinedButtonColors(contentColor = Color(0xFF4ADE80))
+                        ) {
+                            Icon(Icons.Default.SystemUpdate, contentDescription = null, modifier = Modifier.size(18.dp))
+                            Spacer(modifier = Modifier.width(8.dp))
+                            Text("Verifica Aggiornamenti")
                         }
                     }
                 }
@@ -106,22 +121,41 @@ fun EmuxGridScreen(
                 )
             }
 
-            // Tasto galleggiante per cambiare percorso o cartella
-            FloatingActionButton(
-                onClick = onChangePathClick,
+            // Gruppo tasti galleggianti in basso a destra: Verifica Aggiornamenti + Cambia Percorso
+            Row(
                 modifier = Modifier
                     .align(Alignment.BottomEnd)
                     .padding(16.dp),
-                shape = CircleShape,
-                containerColor = Color(0xFF262626),
-                contentColor = Color(0xFF38BDF8),
-                elevation = FloatingActionButtonDefaults.elevation(6.dp)
+                horizontalArrangement = Arrangement.spacedBy(12.dp),
+                verticalAlignment = Alignment.CenterVertically
             ) {
-                Icon(
-                    imageVector = Icons.Default.FolderOpen,
-                    contentDescription = "Cambia Percorso Emux",
-                    modifier = Modifier.size(24.dp)
-                )
+                FloatingActionButton(
+                    onClick = onCheckUpdatesClick,
+                    shape = CircleShape,
+                    containerColor = Color(0xFF1E293B),
+                    contentColor = Color(0xFF4ADE80),
+                    elevation = FloatingActionButtonDefaults.elevation(6.dp)
+                ) {
+                    Icon(
+                        imageVector = Icons.Default.SystemUpdate,
+                        contentDescription = "Verifica Aggiornamenti",
+                        modifier = Modifier.size(24.dp)
+                    )
+                }
+
+                FloatingActionButton(
+                    onClick = onChangePathClick,
+                    shape = CircleShape,
+                    containerColor = Color(0xFF262626),
+                    contentColor = Color(0xFF38BDF8),
+                    elevation = FloatingActionButtonDefaults.elevation(6.dp)
+                ) {
+                    Icon(
+                        imageVector = Icons.Default.FolderOpen,
+                        contentDescription = "Cambia Percorso Emux",
+                        modifier = Modifier.size(24.dp)
+                    )
+                }
             }
         }
     }

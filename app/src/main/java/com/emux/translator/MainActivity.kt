@@ -19,6 +19,7 @@ import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontWeight
@@ -33,7 +34,9 @@ import com.emux.translator.ui.game.GamePlayerScreen
 import com.emux.translator.ui.grid.EmuxGridScreen
 import com.emux.translator.ui.log.SystemLogViewerDialog
 import com.emux.translator.ui.theme.EmuxTranslatorTheme
+import com.emux.translator.util.AppUpdater
 import com.emux.translator.util.EmuxLogger
+import com.emux.translator.util.ReleaseInfo
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -78,18 +81,22 @@ class MainActivity : ComponentActivity() {
         requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
 
         val emuxDir = resolveEmuxDirectory()
-        ensureDirectoryTreeSafe(emuxDir)
-
-        // Inizializza file di log persistente: sia interno che in Emux32/log/emux_execution.log
-        EmuxLogger.initLogFiles(cacheDir, emuxDir)
+        if (emuxDir != null) {
+            ensureDirectoryTreeSafe(emuxDir)
+            EmuxLogger.initLogFiles(cacheDir, emuxDir)
+        } else {
+            EmuxLogger.initLogFiles(cacheDir, null)
+        }
         EmuxLogger.startLogcatCapture(lifecycleScope)
-        EmuxLogger.i("Emux32", "Emux32 avviato su Android SDK ${Build.VERSION.SDK_INT}. Cartella storage: ${emuxDir.absolutePath}")
+        EmuxLogger.i("Emux32", "Emux32 avviato su Android SDK ${Build.VERSION.SDK_INT}. Cartella storage: ${emuxDir?.absolutePath ?: "(non ancora selezionata)"}")
 
         // GESTIONE DELLA CONCORRENZA (DIRETTIVA 1): Inizializzazione asincrona isolata su Dispatchers.IO.
         // Mai bloccare o eseguire chiamate JNI pesanti all'interno di onCreate() sul Main Thread.
         lifecycleScope.launch(Dispatchers.IO) {
             try {
-                NativeEngine.nativeSetStoragePath(emuxDir.absolutePath)
+                if (emuxDir != null) {
+                    NativeEngine.nativeSetStoragePath(emuxDir.absolutePath)
+                }
                 val initialized = NativeEngine.nativeInitEngine(512)
                 if (initialized) {
                     EmuxLogger.i("Emux32", "Unicorn ARM32 DBT Engine pre-inizializzato con successo (512 MB guest RAM).")
@@ -107,13 +114,22 @@ class MainActivity : ComponentActivity() {
                 var activeGame by remember { mutableStateOf<EmuxRom?>(null) }
                 var showSetupDialog by remember { mutableStateOf(false) }
                 var showLogDialog by remember { mutableStateOf(false) }
-                var currentEmuxDir by remember { mutableStateOf(resolveEmuxDirectory()) }
+                var showUpdateDialog by remember { mutableStateOf(false) }
+                var currentEmuxDir by remember { mutableStateOf<File?>(resolveEmuxDirectory()) }
 
                 val scope = rememberCoroutineScope()
 
                 val refreshGames: () -> Unit = {
                     scope.launch(Dispatchers.IO) {
                         val base = resolveEmuxDirectory()
+                        if (base == null) {
+                            withContext(Dispatchers.Main) {
+                                games = emptyList()
+                                currentEmuxDir = null
+                            }
+                            return@launch
+                        }
+
                         val apkDir = File(base, "apk")
                         val obbDir = File(base, "obb")
 
@@ -133,8 +149,8 @@ class MainActivity : ComponentActivity() {
 
                 LaunchedEffect(Unit) {
                     requestPermissionsIfNeeded()
-                    val setupDone = prefs.getBoolean("emux_setup_completed", false)
-                    if (!setupDone) {
+                    val configuredDir = resolveEmuxDirectory()
+                    if (configuredDir == null) {
                         showSetupDialog = true
                     } else {
                         refreshGames()
@@ -152,23 +168,14 @@ class MainActivity : ComponentActivity() {
 
                 if (showSetupDialog) {
                     SetupStorageDialog(
-                        defaultPath = getDefaultEmuxDirectory().absolutePath,
-                        onConfirmDefault = {
-                            val dir = getDefaultEmuxDirectory()
-                            prefs.edit()
-                                .putBoolean("emux_setup_completed", true)
-                                .putString("custom_emux_path", dir.absolutePath)
-                                .apply()
-                            NativeEngine.nativeSetStoragePath(dir.absolutePath)
-                            showSetupDialog = false
-                            refreshGames()
-                        },
-                        onChooseCustom = {
+                        onChooseFolder = {
                             onFolderSelectedCallback = { chosenDir ->
                                 prefs.edit()
                                     .putBoolean("emux_setup_completed", true)
                                     .putString("custom_emux_path", chosenDir.absolutePath)
                                     .apply()
+                                customRootPath = chosenDir.absolutePath
+                                EmuxLogger.initLogFiles(cacheDir, chosenDir)
                                 NativeEngine.nativeSetStoragePath(chosenDir.absolutePath)
                                 showSetupDialog = false
                                 refreshGames()
@@ -181,6 +188,13 @@ class MainActivity : ComponentActivity() {
                 if (showLogDialog) {
                     SystemLogViewerDialog(
                         onDismiss = { showLogDialog = false }
+                    )
+                }
+
+                if (showUpdateDialog) {
+                    UpdateCheckDialog(
+                        context = this@MainActivity,
+                        onDismiss = { showUpdateDialog = false }
                     )
                 }
 
@@ -199,7 +213,7 @@ class MainActivity : ComponentActivity() {
                 } else {
                     EmuxGridScreen(
                         games = games,
-                        currentPathLabel = currentEmuxDir.absolutePath,
+                        currentPathLabel = currentEmuxDir?.absolutePath ?: "",
                         onGameClick = { rom ->
                             activeGame = rom
                             EmuxLogger.i("Emux32", "Click su titolo: '${rom.title}' (${rom.packageName ?: "senza package"})")
@@ -211,8 +225,11 @@ class MainActivity : ComponentActivity() {
                         onChangePathClick = {
                             onFolderSelectedCallback = { chosenDir ->
                                 prefs.edit()
+                                    .putBoolean("emux_setup_completed", true)
                                     .putString("custom_emux_path", chosenDir.absolutePath)
                                     .apply()
+                                customRootPath = chosenDir.absolutePath
+                                EmuxLogger.initLogFiles(cacheDir, chosenDir)
                                 NativeEngine.nativeSetStoragePath(chosenDir.absolutePath)
                                 refreshGames()
                             }
@@ -220,6 +237,9 @@ class MainActivity : ComponentActivity() {
                         },
                         onShowLogsClick = {
                             showLogDialog = true
+                        },
+                        onCheckUpdatesClick = {
+                            showUpdateDialog = true
                         }
                     )
                 }
@@ -228,29 +248,51 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun handleCustomTreeUri(treeUri: Uri) {
-        val path = treeUri.path ?: ""
-        val resolvedDir: File = if (path.contains("primary:")) {
-            val relative = path.substringAfter("primary:")
-            val target = File(Environment.getExternalStorageDirectory(), relative)
-            if (target.name.equals("Emux32", ignoreCase = true)) target else File(target, "Emux32")
+        val rawPath = treeUri.path ?: ""
+        val target: File? = when {
+            rawPath.contains("primary:") -> {
+                val relative = rawPath.substringAfter("primary:").trimStart('/')
+                if (relative.isEmpty()) {
+                    Environment.getExternalStorageDirectory()
+                } else {
+                    File(Environment.getExternalStorageDirectory(), relative)
+                }
+            }
+            rawPath.contains("/tree/") -> {
+                val docId = rawPath.substringAfter("/tree/")
+                val colonIdx = docId.indexOf(':')
+                if (colonIdx > 0) {
+                    val volId = docId.substring(0, colonIdx)
+                    val relative = docId.substring(colonIdx + 1).trimStart('/')
+                    if (relative.isEmpty()) File("/storage/$volId") else File("/storage/$volId/$relative")
+                } else {
+                    null
+                }
+            }
+            else -> null
+        }
+
+        if (target == null) {
+            Toast.makeText(this, "Percorso selezionato non supportato. Seleziona una cartella nella memoria del dispositivo.", Toast.LENGTH_LONG).show()
+            return
+        }
+
+        val resolvedDir = if (target.name.equals("Emux32", ignoreCase = true)) {
+            target
         } else {
-            getDefaultEmuxDirectory()
+            File(target, "Emux32")
         }
 
         ensureDirectoryTreeSafe(resolvedDir)
         onFolderSelectedCallback?.invoke(resolvedDir)
     }
 
-    private fun getDefaultEmuxDirectory(): File {
-        return File(Environment.getExternalStorageDirectory(), "Emux32")
-    }
-
-    private fun resolveEmuxDirectory(): File {
+    private fun resolveEmuxDirectory(): File? {
         val saved = prefs.getString("custom_emux_path", null)
         return if (!saved.isNullOrBlank()) {
             File(saved)
         } else {
-            getDefaultEmuxDirectory()
+            null
         }
     }
 
@@ -335,6 +377,13 @@ class MainActivity : ComponentActivity() {
             // ==========================================
             EmuxLogger.i("Emux32", "[FASE 2/5] Verifica file OBB e archivi cache associati...")
             val baseStorage = resolveEmuxDirectory()
+            if (baseStorage == null) {
+                EmuxLogger.e("Emux32", "[FASE 2/5] ERRORE: Nessuna cartella Emux32 selezionata.")
+                withContext(Dispatchers.Main) {
+                    Toast.makeText(this@MainActivity, "Seleziona prima la cartella Emux32", Toast.LENGTH_LONG).show()
+                }
+                return@withContext
+            }
             val primaryObbDir = File(filesDir, "obb/$pkg")
             if (!primaryObbDir.exists()) primaryObbDir.mkdirs()
 
@@ -411,14 +460,13 @@ class MainActivity : ComponentActivity() {
                 }
             }
 
-            // Linking cartelle Dati / Cache di gioco (es. unitycache per Blood & Glory)
+            // Linking cartelle Dati / Cache di gioco (strettamente dalla cartella Emux32 selezionata)
             val candidateSourceDataDirs = listOfNotNull(
                 rom.dataDir,
                 File(baseStorage, "obb/$pkg"),
                 File(baseStorage, "data/$pkg"),
                 File(baseStorage, "obb/com.glu.gladiator"),
-                File(baseStorage, "data/com.glu.gladiator"),
-                File(Environment.getExternalStorageDirectory(), "Android/data/$pkg")
+                File(baseStorage, "data/com.glu.gladiator")
             ).distinctBy { it.absolutePath }
 
             for (srcDir in candidateSourceDataDirs) {
@@ -570,7 +618,7 @@ class MainActivity : ComponentActivity() {
             EmuxLogger.i("Emux32", testReport)
 
             EmuxLogger.i("Emux32", "[FASE 4/5] Configurazione e avvio Unicorn ARM32 DBT Engine...")
-            NativeEngine.nativeSetStoragePath(resolveEmuxDirectory().absolutePath)
+            NativeEngine.nativeSetStoragePath(baseStorage.absolutePath)
             val engineReady = NativeEngine.nativeInitEngine(512)
             if (!engineReady) {
                 EmuxLogger.e("Emux32", "[FASE 4/5] Inizializzazione motore nativo fallita!")
@@ -776,9 +824,7 @@ class MainActivity : ComponentActivity() {
 
 @Composable
 fun SetupStorageDialog(
-    defaultPath: String,
-    onConfirmDefault: () -> Unit,
-    onChooseCustom: () -> Unit
+    onChooseFolder: () -> Unit
 ) {
     AlertDialog(
         onDismissRequest = { },
@@ -787,30 +833,17 @@ fun SetupStorageDialog(
         titleContentColor = Color.White,
         textContentColor = Color.LightGray,
         title = {
-            Text("Configurazione Cartella Emux32", fontWeight = FontWeight.Bold)
+            Text("Seleziona Cartella Emux32", fontWeight = FontWeight.Bold)
         },
         text = {
             Column {
                 Text(
-                    text = "Vuoi configurare la cartella Emux32 e le sottocartelle (apk e obb) nel percorso predefinito:\n",
+                    text = "Scegli una cartella nel tuo dispositivo in cui creare o utilizzare la directory Emux32 (con le sottocartelle apk, obb, data e log).",
                     fontSize = 14.sp
                 )
-                Surface(
-                    color = Color(0xFF121212),
-                    shape = RoundedCornerShape(8.dp),
-                    modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp)
-                ) {
-                    Text(
-                        text = defaultPath,
-                        color = Color(0xFF38BDF8),
-                        fontSize = 12.sp,
-                        fontWeight = FontWeight.SemiBold,
-                        modifier = Modifier.padding(10.dp)
-                    )
-                }
-                Spacer(modifier = Modifier.height(6.dp))
+                Spacer(modifier = Modifier.height(8.dp))
                 Text(
-                    text = "Nota: se la cartella esiste già, non verrà eliminato né sovrascritto alcun file.",
+                    text = "Emux32 non crea cartelle predefinite e leggerà i file di gioco esclusivamente dalla cartella selezionata.",
                     fontSize = 12.sp,
                     color = Color.Gray
                 )
@@ -818,18 +851,203 @@ fun SetupStorageDialog(
         },
         confirmButton = {
             Button(
-                onClick = onConfirmDefault,
+                onClick = onChooseFolder,
                 colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF38BDF8), contentColor = Color.Black)
             ) {
-                Text("Crea / Usa Qui", fontWeight = FontWeight.Bold)
+                Text("Seleziona Cartella", fontWeight = FontWeight.Bold)
+            }
+        }
+    )
+}
+
+@Composable
+fun UpdateCheckDialog(
+    context: Context,
+    onDismiss: () -> Unit
+) {
+    var isChecking by remember { mutableStateOf(true) }
+    var isDownloading by remember { mutableStateOf(false) }
+    var downloadProgress by remember { mutableStateOf(0f) }
+    var downloadedMb by remember { mutableStateOf(0f) }
+    var totalMb by remember { mutableStateOf(0f) }
+    var releaseInfo by remember { mutableStateOf<ReleaseInfo?>(null) }
+    var errorMessage by remember { mutableStateOf<String?>(null) }
+    var isAlreadyLatest by remember { mutableStateOf(false) }
+
+    val scope = rememberCoroutineScope()
+
+    val runCheck: () -> Unit = {
+        isChecking = true
+        errorMessage = null
+        releaseInfo = null
+        scope.launch {
+            val res = AppUpdater.fetchLatestRelease()
+            isChecking = false
+            res.onSuccess { info ->
+                releaseInfo = info
+                isAlreadyLatest = AppUpdater.isSameAsLastInstalled(context, info)
+            }.onFailure { err ->
+                errorMessage = err.message ?: "Errore durante il controllo aggiornamenti."
+            }
+        }
+    }
+
+    LaunchedEffect(Unit) {
+        runCheck()
+    }
+
+    AlertDialog(
+        onDismissRequest = { if (!isDownloading) onDismiss() },
+        shape = RoundedCornerShape(18.dp),
+        containerColor = Color(0xFF1E1E1E),
+        titleContentColor = Color.White,
+        textContentColor = Color.LightGray,
+        title = {
+            Text("Aggiornamenti Emux32", fontWeight = FontWeight.Bold)
+        },
+        text = {
+            Column(modifier = Modifier.fillMaxWidth()) {
+                when {
+                    isChecking -> {
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(12.dp)
+                        ) {
+                            CircularProgressIndicator(
+                                modifier = Modifier.size(22.dp),
+                                color = Color(0xFF38BDF8),
+                                strokeWidth = 2.5.dp
+                            )
+                            Text("Verifica ultima build su GitHub...", fontSize = 14.sp)
+                        }
+                    }
+                    isDownloading -> {
+                        Text(
+                            text = "Download in corso: ${releaseInfo?.apkName ?: "APK"}",
+                            fontSize = 14.sp,
+                            color = Color.White
+                        )
+                        Spacer(modifier = Modifier.height(10.dp))
+                        LinearProgressIndicator(
+                            progress = { downloadProgress.coerceIn(0f, 1f) },
+                            modifier = Modifier.fillMaxWidth(),
+                            color = Color(0xFF4ADE80),
+                            trackColor = Color(0xFF334155)
+                        )
+                        Spacer(modifier = Modifier.height(6.dp))
+                        val pct = (downloadProgress * 100f).toInt().coerceIn(0, 100)
+                        val sizeText = if (totalMb > 0f) {
+                            String.format("%.1f / %.1f MB (%d%%)", downloadedMb, totalMb, pct)
+                        } else {
+                            String.format("%.1f MB", downloadedMb)
+                        }
+                        Text(text = sizeText, fontSize = 12.sp, color = Color.Gray)
+                    }
+                    errorMessage != null -> {
+                        Text(
+                            text = "Errore: $errorMessage",
+                            color = Color(0xFFF87171),
+                            fontSize = 14.sp
+                        )
+                    }
+                    releaseInfo != null -> {
+                        val info = releaseInfo!!
+                        Text(
+                            text = if (isAlreadyLatest) {
+                                "Hai già scaricato l'ultima build disponibile:"
+                            } else {
+                                "Nuova build disponibile su GitHub:"
+                            },
+                            fontSize = 14.sp
+                        )
+                        Spacer(modifier = Modifier.height(8.dp))
+                        Surface(
+                            color = Color(0xFF121212),
+                            shape = RoundedCornerShape(8.dp),
+                            modifier = Modifier.fillMaxWidth()
+                        ) {
+                            Column(modifier = Modifier.padding(10.dp)) {
+                                Text(
+                                    text = info.title,
+                                    color = Color(0xFF4ADE80),
+                                    fontWeight = FontWeight.Bold,
+                                    fontSize = 13.sp
+                                )
+                                Text(
+                                    text = "File: ${info.apkName}",
+                                    color = Color.LightGray,
+                                    fontSize = 12.sp
+                                )
+                                if (info.sizeBytes > 0L) {
+                                    Text(
+                                        text = String.format("Dimensione: %.1f MB", info.sizeBytes / (1024f * 1024f)),
+                                        color = Color.Gray,
+                                        fontSize = 12.sp
+                                    )
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        confirmButton = {
+            if (!isChecking && !isDownloading && releaseInfo != null) {
+                Button(
+                    onClick = {
+                        if (!AppUpdater.canRequestPackageInstalls(context)) {
+                            Toast.makeText(
+                                context,
+                                "Consenti l'installazione da questa sorgente e riprova.",
+                                Toast.LENGTH_LONG
+                            ).show()
+                            context.startActivity(AppUpdater.buildInstallPermissionIntent(context))
+                            return@Button
+                        }
+                        val info = releaseInfo!!
+                        isDownloading = true
+                        downloadProgress = 0f
+                        errorMessage = null
+                        scope.launch {
+                            val downloadRes = AppUpdater.downloadApk(context, info) { dl, total ->
+                                downloadedMb = dl / (1024f * 1024f)
+                                totalMb = if (total > 0L) total / (1024f * 1024f) else 0f
+                                downloadProgress = if (total > 0L) dl.toFloat() / total.toFloat() else 0f
+                            }
+                            isDownloading = false
+                            downloadRes.onSuccess { apkFile ->
+                                try {
+                                    AppUpdater.launchApkInstaller(context, apkFile)
+                                    onDismiss()
+                                } catch (e: Throwable) {
+                                    errorMessage = "Impossibile avviare l'installer: ${e.message}"
+                                }
+                            }.onFailure { err ->
+                                errorMessage = err.message ?: "Download fallito."
+                            }
+                        }
+                    },
+                    colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF4ADE80), contentColor = Color.Black)
+                ) {
+                    Text("Scarica e Installa", fontWeight = FontWeight.Bold)
+                }
+            } else if (!isChecking && !isDownloading && errorMessage != null) {
+                Button(
+                    onClick = runCheck,
+                    colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF38BDF8), contentColor = Color.Black)
+                ) {
+                    Text("Riprova", fontWeight = FontWeight.Bold)
+                }
             }
         },
         dismissButton = {
-            OutlinedButton(
-                onClick = onChooseCustom,
-                colors = ButtonDefaults.outlinedButtonColors(contentColor = Color.White)
-            ) {
-                Text("Altro Percorso")
+            if (!isDownloading) {
+                OutlinedButton(
+                    onClick = onDismiss,
+                    colors = ButtonDefaults.outlinedButtonColors(contentColor = Color.White)
+                ) {
+                    Text("Chiudi")
+                }
             }
         }
     )
