@@ -8,9 +8,11 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.CloudUpload
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.ContentCopy
 import androidx.compose.material.icons.filled.Delete
+import androidx.compose.material.icons.filled.Key
 import androidx.compose.material.icons.filled.Terminal
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
@@ -25,6 +27,7 @@ import androidx.compose.ui.unit.sp
 import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
 import com.emux.translator.util.EmuxLogger
+import com.emux.translator.util.GitHubLogUploader
 import kotlinx.coroutines.launch
 
 @Composable
@@ -35,6 +38,92 @@ fun SystemLogViewerDialog(
     val logList by EmuxLogger.logs.collectAsState()
     val listState = rememberLazyListState()
     val coroutineScope = rememberCoroutineScope()
+
+    var isUploading by remember { mutableStateOf(false) }
+    var showTokenDialog by remember { mutableStateOf(false) }
+    var pendingUploadAfterToken by remember { mutableStateOf(false) }
+    var tokenInput by remember { mutableStateOf(GitHubLogUploader.getSavedToken(context)) }
+
+    val triggerUpload: (String) -> Unit = { pat ->
+        isUploading = true
+        coroutineScope.launch {
+            val res = GitHubLogUploader.uploadLatestLogs(context, pat)
+            isUploading = false
+            res.onSuccess {
+                android.widget.Toast.makeText(
+                    context,
+                    "Log inviati su GitHub (branch logs)!",
+                    android.widget.Toast.LENGTH_LONG
+                ).show()
+            }.onFailure { err ->
+                android.widget.Toast.makeText(
+                    context,
+                    err.message ?: "Errore invio log.",
+                    android.widget.Toast.LENGTH_LONG
+                ).show()
+            }
+        }
+    }
+
+    if (showTokenDialog) {
+        AlertDialog(
+            onDismissRequest = {
+                showTokenDialog = false
+                pendingUploadAfterToken = false
+            },
+            containerColor = Color(0xFF1E293B),
+            titleContentColor = Color.White,
+            textContentColor = Color.LightGray,
+            title = {
+                Text("Token GitHub (branch logs)", fontWeight = FontWeight.Bold, fontSize = 16.sp)
+            },
+            text = {
+                Column {
+                    Text(
+                        text = "Inserisci il tuo GitHub Personal Access Token (permesso Contents: Read & Write su Step0491/Emux32). Viene salvato solo sul telefono.",
+                        fontSize = 12.sp
+                    )
+                    Spacer(modifier = Modifier.height(10.dp))
+                    OutlinedTextField(
+                        value = tokenInput,
+                        onValueChange = { tokenInput = it },
+                        singleLine = true,
+                        label = { Text("GitHub PAT") },
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                }
+            },
+            confirmButton = {
+                Button(
+                    onClick = {
+                        val trimmed = tokenInput.trim()
+                        if (trimmed.isNotEmpty()) {
+                            GitHubLogUploader.saveToken(context, trimmed)
+                            showTokenDialog = false
+                            if (pendingUploadAfterToken) {
+                                pendingUploadAfterToken = false
+                                triggerUpload(trimmed)
+                            }
+                        }
+                    },
+                    colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF4ADE80), contentColor = Color.Black)
+                ) {
+                    Text("Salva", fontWeight = FontWeight.Bold)
+                }
+            },
+            dismissButton = {
+                OutlinedButton(
+                    onClick = {
+                        showTokenDialog = false
+                        pendingUploadAfterToken = false
+                    },
+                    colors = ButtonDefaults.outlinedButtonColors(contentColor = Color.White)
+                ) {
+                    Text("Annulla")
+                }
+            }
+        )
+    }
 
     // Auto-scroll automatico verso la riga più recente
     LaunchedEffect(logList.size) {
@@ -91,12 +180,27 @@ fun SystemLogViewerDialog(
                         }
                     }
 
-                    IconButton(onClick = onDismiss) {
-                        Icon(
-                            imageVector = Icons.Default.Close,
-                            contentDescription = "Chiudi",
-                            tint = Color.White
-                        )
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        IconButton(
+                            onClick = {
+                                tokenInput = GitHubLogUploader.getSavedToken(context)
+                                pendingUploadAfterToken = false
+                                showTokenDialog = true
+                            }
+                        ) {
+                            Icon(
+                                imageVector = Icons.Default.Key,
+                                contentDescription = "Configura Token GitHub",
+                                tint = Color(0xFF94A3B8)
+                            )
+                        }
+                        IconButton(onClick = onDismiss) {
+                            Icon(
+                                imageVector = Icons.Default.Close,
+                                contentDescription = "Chiudi",
+                                tint = Color.White
+                            )
+                        }
                     }
                 }
 
@@ -156,8 +260,40 @@ fun SystemLogViewerDialog(
                 // Pulsanti Azioni
                 Row(
                     modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.spacedBy(10.dp)
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
                 ) {
+                    Button(
+                        onClick = {
+                            val saved = GitHubLogUploader.getSavedToken(context)
+                            if (saved.isBlank()) {
+                                tokenInput = ""
+                                pendingUploadAfterToken = true
+                                showTokenDialog = true
+                            } else {
+                                triggerUpload(saved)
+                            }
+                        },
+                        enabled = !isUploading,
+                        modifier = Modifier.weight(1.2f),
+                        colors = ButtonDefaults.buttonColors(
+                            containerColor = Color(0xFF16A34A),
+                            contentColor = Color.White
+                        ),
+                        shape = RoundedCornerShape(8.dp)
+                    ) {
+                        if (isUploading) {
+                            CircularProgressIndicator(
+                                modifier = Modifier.size(16.dp),
+                                color = Color.White,
+                                strokeWidth = 2.dp
+                            )
+                        } else {
+                            Icon(Icons.Default.CloudUpload, contentDescription = null, modifier = Modifier.size(16.dp))
+                        }
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Text(if (isUploading) "Invio..." else "Invia Log", fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
+                    }
+
                     Button(
                         onClick = {
                             EmuxLogger.copyToClipboard(context)
@@ -172,21 +308,21 @@ fun SystemLogViewerDialog(
                     ) {
                         Icon(Icons.Default.ContentCopy, contentDescription = null, modifier = Modifier.size(16.dp))
                         Spacer(modifier = Modifier.width(6.dp))
-                        Text("Copia Log", fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
+                        Text("Copia", fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
                     }
 
                     OutlinedButton(
                         onClick = {
                             EmuxLogger.clear()
                         },
-                        modifier = Modifier.weight(1f),
+                        modifier = Modifier.weight(0.9f),
                         colors = ButtonDefaults.outlinedButtonColors(
                             contentColor = Color(0xFFEF4444)
                         ),
                         shape = RoundedCornerShape(8.dp)
                     ) {
                         Icon(Icons.Default.Delete, contentDescription = null, modifier = Modifier.size(16.dp))
-                        Spacer(modifier = Modifier.width(6.dp))
+                        Spacer(modifier = Modifier.width(4.dp))
                         Text("Pulisci", fontSize = 13.sp)
                     }
                 }
