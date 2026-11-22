@@ -1930,7 +1930,7 @@ void GuestRuntimeEnvironment::handleJniCall(uint32_t slotIndex, uc_engine* uc) {
                     std::string propKey = jstringMap_.count(keyArg) ? jstringMap_[keyArg] : readGuestCString(uc, keyArg, 128);
                     std::string propVal;
                     if (propKey == "java.library.path" || propKey == "java.io.tmpdir") {
-                        propVal = libDir_;
+                        propVal = nativeLibDir_;
                     } else if (propKey == "os.arch") {
                         propVal = "armv7l";
                     } else if (propKey == "os.name") {
@@ -1948,7 +1948,7 @@ void GuestRuntimeEnvironment::handleJniCall(uint32_t slotIndex, uc_engine* uc) {
                     } else if (propKey == "line.separator") {
                         propVal = "\n";
                     } else {
-                        propVal = libDir_;
+                        propVal = nativeLibDir_;
                     }
                     LOGI("JNI System.getProperty('%s') -> '%s'", propKey.c_str(), propVal.c_str());
                     setReturnU32(createGuestJString(uc, propVal));

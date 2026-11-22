@@ -4,6 +4,7 @@
 #include "unicorn/arm.h"
 #include <android/log.h>
 #include <cerrno>
+#include <cstring>
 #include <vector>
 
 #define TAG "EmuxThreadScheduler"
