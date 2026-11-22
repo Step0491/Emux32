@@ -317,6 +317,7 @@ struct UnicornInstance {
 
 #if defined(EMUX_ENABLE_DYNARMIC)
     uint32_t target_until{0};
+    uint64_t dynarmic_ticks_budget{50000000ULL};
     std::unique_ptr<DynarmicUserCallbacks> dynarmic_cb;
     std::shared_ptr<DynarmicCp15> dynarmic_cp15;
     std::unique_ptr<Dynarmic::A32::Jit> dynarmic_jit;
@@ -1219,10 +1220,11 @@ public:
 
     std::optional<std::uint32_t> MemoryReadCode(Dynarmic::A32::VAddr vaddr) override {
         // Intercetta ritorni da funzioni guest (LR=0xDEADxxxx) o raggiungimento del target di esecuzione:
-        // restituisce l'istruzione ARM32 BKPT #0 (0xe1200070) per provocare un'interruzione pulita sia in ARM che Thumb
+        // arresta il JIT senza restituire opcode ARM32 (che in Thumb corromperebbero R0 e salterebbero a 0xDEAE00A2)
         if ((vaddr & 0xFFFF0000U) == 0xDEAD0000U || (vaddr & ~1U) == 0xDEADBEEEU || vaddr == 0 ||
             (inst_->target_until != 0 && (vaddr & ~1U) == (inst_->target_until & ~1U))) {
-            return 0xe1200070U; // ARM32 BKPT #0
+            inst_->dynarmic_jit->HaltExecution(Dynarmic::HaltReason::UserDefined1);
+            return std::nullopt;
         }
 
         if ((vaddr & 0xFFFFF000U) == 0xFFFF0000U) {
@@ -1314,10 +1316,15 @@ public:
 
     void AddTicks(std::uint64_t ticks) override {
         ticks_ += ticks;
+        if (inst_->dynarmic_ticks_budget > ticks) {
+            inst_->dynarmic_ticks_budget -= ticks;
+        } else {
+            inst_->dynarmic_ticks_budget = 0;
+        }
     }
 
     std::uint64_t GetTicksRemaining() override {
-        return 1000000000ULL;
+        return inst_->dynarmic_ticks_budget;
     }
 
 private:
@@ -1334,7 +1341,7 @@ void UnicornInstance::initDynarmic() {
         conf.callbacks = dynarmic_cb.get();
         conf.coprocessors[15] = dynarmic_cp15;
         conf.arch_version = Dynarmic::A32::ArchVersion::v7;
-        conf.enable_cycle_counting = false;
+        conf.enable_cycle_counting = true;
         conf.unsafe_optimizations = false;
         conf.global_monitor = getSharedExclusiveMonitor().get();
         conf.processor_id = processor_id;
@@ -1370,6 +1377,8 @@ uc_err UnicornInstance::runDynarmic(uint64_t begin, uint64_t until, size_t count
     if (begin & 1ULL) {
         cpsr |= FLAG_T;
         regs[15] = static_cast<uint32_t>(begin & ~1ULL);
+    } else if (cpsr & FLAG_T) {
+        regs[15] = static_cast<uint32_t>(begin & ~1ULL);
     } else {
         cpsr &= ~FLAG_T;
         regs[15] = static_cast<uint32_t>(begin & ~3ULL);
@@ -1398,6 +1407,7 @@ uc_err UnicornInstance::runDynarmic(uint64_t begin, uint64_t until, size_t count
 
     target_until = static_cast<uint32_t>(until);
     uint32_t targetUntil = target_until;
+    dynarmic_ticks_budget = (count > 0) ? static_cast<uint64_t>(count) : 50000000ULL;
 
     while (is_running.load(std::memory_order_relaxed) &&
            !stop_requested.load(std::memory_order_relaxed)) {
@@ -1408,6 +1418,11 @@ uc_err UnicornInstance::runDynarmic(uint64_t begin, uint64_t until, size_t count
         }
         if ((curPc & ~1U) == 0xDEADBEEEU || curPc == 0xDEADBEEFU || (curPc & 0xFFFF0000U) == 0xDEAD0000U || curPc == 0) {
             break;
+        }
+
+        if (dynarmic_ticks_budget == 0) {
+            if (count > 0) break;
+            dynarmic_ticks_budget = 50000000ULL;
         }
 
         Dynarmic::HaltReason hr = dynarmic_jit->Run();

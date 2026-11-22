@@ -484,7 +484,6 @@ bool DbtEngine::startEmulation() {
         if (fnAddr == 0) return 0;
         uint32_t sp = guestStackPointer_;
         uint32_t cpsr = (fnAddr & 1U) ? 0x00000030U : 0x00000010U;
-        uint32_t startPc = fnAddr & ~1U;
         uc_reg_write(uc_, UC_ARM_REG_R0, &r0);
         uc_reg_write(uc_, UC_ARM_REG_R1, &r1);
         uc_reg_write(uc_, UC_ARM_REG_R2, &r2);
@@ -492,7 +491,7 @@ bool DbtEngine::startEmulation() {
         uc_reg_write(uc_, UC_ARM_REG_SP, &sp);
         uc_reg_write(uc_, UC_ARM_REG_LR, &lr);
         uc_reg_write(uc_, UC_ARM_REG_CPSR, &cpsr);
-        uc_err startErr = uc_emu_start(uc_, startPc, lr, 0, maxInsns);
+        uc_err startErr = uc_emu_start(uc_, fnAddr, lr, 0, maxInsns);
         if (startErr != UC_ERR_OK) {
             uint32_t curPc = 0;
             uc_reg_read(uc_, UC_ARM_REG_PC, &curPc);
@@ -514,7 +513,8 @@ bool DbtEngine::startEmulation() {
                 break;
             }
         }
-        if (jniOnLoadAddr == 0 && lib->entry_point != 0 && lib->path.find("libmono") == std::string::npos) {
+        if (jniOnLoadAddr == 0 && lib->entry_point != 0 && lib->entry_point != lib->load_bias &&
+            lib->path.find("libmono") == std::string::npos) {
             bool isNativeActivity = false;
             for (const auto& sym : lib->symbols) {
                 if (sym.name == "ANativeActivity_onCreate") {
@@ -615,6 +615,7 @@ bool DbtEngine::startEmulation() {
         for (const auto& sym : lib->symbols) {
             if (sym.vaddr == 0) continue;
             std::string sName = sym.name;
+            if (sName.rfind("Java_", 0) != 0) continue; // Invoca solo export JNI standard, mai simboli C++ mangled (_Z...)
             std::string lower = sName;
             std::transform(lower.begin(), lower.end(), lower.begin(), ::tolower);
 
