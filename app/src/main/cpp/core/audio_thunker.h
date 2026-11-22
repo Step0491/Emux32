@@ -1,5 +1,7 @@
 #pragma once
 
+#include "guest_layout.h"
+
 #include <cstdint>
 #include <cstddef>
 #include <string>
@@ -140,27 +142,27 @@ private:
     bool initHostAudioStream(uint32_t sampleRate, uint32_t channels);
     void closeHostAudioStream();
 
-    // Mapping e costanti OpenSL ES Guest Memory
-    static constexpr uint32_t kIidBaseAddr          = 0x7D001000U;
-    static constexpr uint32_t kIidVarBaseAddr       = 0x7D001400U;
-    static constexpr uint32_t kVtableObjEngine      = 0x7D003000U;
-    static constexpr uint32_t kVtableEngine         = 0x7D003200U;
-    static constexpr uint32_t kVtableObjOutputMix   = 0x7D003400U;
-    static constexpr uint32_t kVtableObjPlayer      = 0x7D003600U;
-    static constexpr uint32_t kVtablePlay           = 0x7D003800U;
-    static constexpr uint32_t kVtableBufferQueue    = 0x7D003A00U;
-    static constexpr uint32_t kVtableVolume         = 0x7D003C00U;
-    static constexpr uint32_t kVtableSeek           = 0x7D003D00U;
-    static constexpr uint32_t kMethodTrampolineBase = 0x7D003E00U;
+    // Mapping e costanti OpenSL ES Guest Memory (isolate da guest_layout.h, zero collisioni con JNI/ANativeActivity)
+    static constexpr uint32_t kIidBaseAddr          = guest_layout::kAudioIidBaseAddr;
+    static constexpr uint32_t kIidVarBaseAddr       = guest_layout::kAudioIidVarBaseAddr;
+    static constexpr uint32_t kVtableObjEngine      = guest_layout::kAudioVtableObjEngine;
+    static constexpr uint32_t kVtableEngine         = guest_layout::kAudioVtableEngine;
+    static constexpr uint32_t kVtableObjOutputMix   = guest_layout::kAudioVtableObjOutputMix;
+    static constexpr uint32_t kVtableObjPlayer      = guest_layout::kAudioVtableObjPlayer;
+    static constexpr uint32_t kVtablePlay           = guest_layout::kAudioVtablePlay;
+    static constexpr uint32_t kVtableBufferQueue    = guest_layout::kAudioVtableBufferQueue;
+    static constexpr uint32_t kVtableVolume         = guest_layout::kAudioVtableVolume;
+    static constexpr uint32_t kVtableSeek           = guest_layout::kAudioVtableSeek;
+    static constexpr uint32_t kMethodTrampolineBase = guest_layout::kAudioMethodTrampBase;
 
-    static constexpr uint32_t kInstObjEngine        = 0x7D004000U;
-    static constexpr uint32_t kInstEngine           = 0x7D004010U;
-    static constexpr uint32_t kInstObjOutputMix     = 0x7D004020U;
-    static constexpr uint32_t kInstObjPlayer        = 0x7D004030U;
-    static constexpr uint32_t kInstPlay             = 0x7D004040U;
-    static constexpr uint32_t kInstBufferQueue      = 0x7D004050U;
-    static constexpr uint32_t kInstVolume           = 0x7D004060U;
-    static constexpr uint32_t kInstSeek             = 0x7D004070U;
+    static constexpr uint32_t kInstObjEngine        = guest_layout::kAudioInstObjEngine;
+    static constexpr uint32_t kInstEngine           = guest_layout::kAudioInstEngine;
+    static constexpr uint32_t kInstObjOutputMix     = guest_layout::kAudioInstObjOutputMix;
+    static constexpr uint32_t kInstObjPlayer        = guest_layout::kAudioInstObjPlayer;
+    static constexpr uint32_t kInstPlay             = guest_layout::kAudioInstPlay;
+    static constexpr uint32_t kInstBufferQueue      = guest_layout::kAudioInstBufferQueue;
+    static constexpr uint32_t kInstVolume           = guest_layout::kAudioInstVolume;
+    static constexpr uint32_t kInstSeek             = guest_layout::kAudioInstSeek;
 
     static constexpr uint32_t kAudioStackBase       = 0x79E00000U;
     static constexpr uint32_t kAudioStackSize       = 0x00100000U; // 1MB

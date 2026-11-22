@@ -3,6 +3,7 @@
 #include "core/guest_thread.h"
 #include "core/gles_virtualizer.h"
 #include "core/guest_memory.h"
+#include "core/guest_layout.h"
 
 #include <android/log.h>
 #include <android/native_window.h>
@@ -654,8 +655,8 @@ bool DbtEngine::startEmulation() {
     }
 
     uint32_t nativeActivityRedrawAddr = 0;
-    uint32_t activityPtr = 0x7d003000U;
-    uint32_t winHandle = 0x7d002800U;
+    uint32_t activityPtr = guest_layout::kNativeActivityAddr;
+    uint32_t winHandle = guest_layout::kNativeWindowAddr;
 
     bool hasJniLifecycle = false;
     for (const auto& m : nativeMethods) {
@@ -670,7 +671,7 @@ bool DbtEngine::startEmulation() {
 
     if (nativeActivityOnCreateAddr != 0 && !hasJniLifecycle) {
         LOGI("ANativeActivity rilevata: avvio ANativeActivity_onCreate @ 0x%08x...", nativeActivityOnCreateAddr);
-        uint32_t callbacksPtr = 0x7d003200U;
+        uint32_t callbacksPtr = guest_layout::kNativeActivityCbAddr;
         uint32_t internalPathStr = env.createGuestCString(uc_, env.getFilesDir());
         uint32_t externalPathStr = env.createGuestCString(uc_, env.getObbDir().empty() ? env.getFilesDir() : env.getObbDir());
         uint32_t obbPathStr = env.createGuestCString(uc_, env.getObbDir());
@@ -682,7 +683,7 @@ bool DbtEngine::startEmulation() {
 
         uint32_t sdkVer = 27;
         uint32_t nullInst = 0;
-        uint32_t mockAssetMgr = 0x7d005000U;
+        uint32_t mockAssetMgr = guest_layout::kAssetManagerHandle;
         uc_mem_write(uc_, activityPtr + 0, &callbacksPtr, 4);
         uc_mem_write(uc_, activityPtr + 4, &javaVMPtr, 4);
         uc_mem_write(uc_, activityPtr + 8, &jniEnvPtr, 4);

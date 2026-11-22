@@ -57,9 +57,33 @@ static std::mutex sFileMutex;
 static std::unordered_map<uint32_t, z_stream*> sZlibStreamMap;
 static uint32_t sNextZlibHandle = 0x60000001;
 
+struct GuestSemaphore {
+    std::mutex mtx;
+    std::condition_variable cv;
+    int32_t count{0};
+};
+
 static std::mutex sSyncTableMutex;
 static std::unordered_map<uint32_t, std::shared_ptr<std::recursive_mutex>> sHostPthreadMutexes;
 static std::unordered_map<uint32_t, std::shared_ptr<std::condition_variable_any>> sHostPthreadConds;
+static std::unordered_map<uint32_t, std::shared_ptr<GuestSemaphore>> sHostSemaphores;
+
+static std::shared_ptr<GuestSemaphore> getOrCreateGuestSem(uint32_t addr, bool resetCount = false, int32_t initVal = 0) {
+    if (addr == 0) return nullptr;
+    std::lock_guard<std::mutex> lock(sSyncTableMutex);
+    auto it = sHostSemaphores.find(addr);
+    if (it != sHostSemaphores.end()) {
+        if (resetCount) {
+            std::lock_guard<std::mutex> sl(it->second->mtx);
+            it->second->count = initVal;
+        }
+        return it->second;
+    }
+    auto s = std::make_shared<GuestSemaphore>();
+    s->count = initVal;
+    sHostSemaphores[addr] = s;
+    return s;
+}
 
 static std::shared_ptr<std::recursive_mutex> getOrCreateGuestMutex(uint32_t addr) {
     if (addr == 0) return nullptr;
@@ -3855,6 +3879,119 @@ void GuestRuntimeEnvironment::handleTrampolineCall(uint32_t trampolineId, uc_eng
             c->wait(*m);
         }
         uc_reg_write(uc, UC_ARM_REG_R0, &ret);
+        return;
+    }
+    if (name == "sem_init") {
+        uint32_t semAddr = 0, pshared = 0, value = 0;
+        uc_reg_read(uc, UC_ARM_REG_R0, &semAddr);
+        uc_reg_read(uc, UC_ARM_REG_R1, &pshared);
+        uc_reg_read(uc, UC_ARM_REG_R2, &value);
+        getOrCreateGuestSem(semAddr, true, static_cast<int32_t>(value));
+        uint32_t zero = 0;
+        uc_reg_write(uc, UC_ARM_REG_R0, &zero);
+        return;
+    }
+    if (name == "sem_destroy") {
+        uint32_t semAddr = 0;
+        uc_reg_read(uc, UC_ARM_REG_R0, &semAddr);
+        if (semAddr != 0) {
+            std::lock_guard<std::mutex> lock(sSyncTableMutex);
+            sHostSemaphores.erase(semAddr);
+        }
+        uint32_t zero = 0;
+        uc_reg_write(uc, UC_ARM_REG_R0, &zero);
+        return;
+    }
+    if (name == "sem_post") {
+        uint32_t semAddr = 0;
+        uc_reg_read(uc, UC_ARM_REG_R0, &semAddr);
+        auto sem = getOrCreateGuestSem(semAddr);
+        if (sem) {
+            {
+                std::lock_guard<std::mutex> sl(sem->mtx);
+                sem->count++;
+            }
+            sem->cv.notify_one();
+        }
+        uint32_t zero = 0;
+        uc_reg_write(uc, UC_ARM_REG_R0, &zero);
+        return;
+    }
+    if (name == "sem_wait") {
+        uint32_t semAddr = 0;
+        uc_reg_read(uc, UC_ARM_REG_R0, &semAddr);
+        auto sem = getOrCreateGuestSem(semAddr);
+        if (sem) {
+            std::unique_lock<std::mutex> sl(sem->mtx);
+            sem->cv.wait(sl, [&]() { return sem->count > 0; });
+            sem->count--;
+        }
+        uint32_t zero = 0;
+        uc_reg_write(uc, UC_ARM_REG_R0, &zero);
+        return;
+    }
+    if (name == "sem_trywait") {
+        uint32_t semAddr = 0;
+        uc_reg_read(uc, UC_ARM_REG_R0, &semAddr);
+        auto sem = getOrCreateGuestSem(semAddr);
+        uint32_t ret = 0xFFFFFFFFU;
+        if (sem) {
+            std::lock_guard<std::mutex> sl(sem->mtx);
+            if (sem->count > 0) {
+                sem->count--;
+                ret = 0;
+            } else {
+                int32_t err = EAGAIN;
+                uc_mem_write(uc, guestJniBase_ + 0x2000U, &err, 4);
+                uc_mem_write(uc, guestTlsBase_ + 0x100U, &err, 4);
+            }
+        }
+        uc_reg_write(uc, UC_ARM_REG_R0, &ret);
+        return;
+    }
+    if (name == "sem_timedwait") {
+        uint32_t semAddr = 0, tsAddr = 0;
+        uc_reg_read(uc, UC_ARM_REG_R0, &semAddr);
+        uc_reg_read(uc, UC_ARM_REG_R1, &tsAddr);
+        auto sem = getOrCreateGuestSem(semAddr);
+        uint32_t ret = 0;
+        if (sem && tsAddr != 0) {
+            struct { int32_t tv_sec; int32_t tv_nsec; } ts32{};
+            uc_mem_read(uc, tsAddr, &ts32, sizeof(ts32));
+            struct timespec now{};
+            clock_gettime(CLOCK_REALTIME, &now);
+            int64_t diffNs = (static_cast<int64_t>(ts32.tv_sec) - now.tv_sec) * 1000000000LL + (ts32.tv_nsec - now.tv_nsec);
+            std::unique_lock<std::mutex> sl(sem->mtx);
+            if (sem->count > 0) {
+                sem->count--;
+            } else if (diffNs <= 0 || !sem->cv.wait_for(sl, std::chrono::nanoseconds(diffNs), [&]() { return sem->count > 0; })) {
+                int32_t err = ETIMEDOUT;
+                uc_mem_write(uc, guestJniBase_ + 0x2000U, &err, 4);
+                uc_mem_write(uc, guestTlsBase_ + 0x100U, &err, 4);
+                ret = 0xFFFFFFFFU;
+            } else {
+                sem->count--;
+            }
+        } else if (sem) {
+            std::unique_lock<std::mutex> sl(sem->mtx);
+            sem->cv.wait(sl, [&]() { return sem->count > 0; });
+            sem->count--;
+        }
+        uc_reg_write(uc, UC_ARM_REG_R0, &ret);
+        return;
+    }
+    if (name == "sem_getvalue") {
+        uint32_t semAddr = 0, valPtr = 0;
+        uc_reg_read(uc, UC_ARM_REG_R0, &semAddr);
+        uc_reg_read(uc, UC_ARM_REG_R1, &valPtr);
+        auto sem = getOrCreateGuestSem(semAddr);
+        if (sem && valPtr != 0) {
+            std::lock_guard<std::mutex> sl(sem->mtx);
+            int32_t c = sem->count;
+            uc_mem_write(uc, valPtr, &c, 4);
+        }
+        uint32_t zero = 0;
+        uc_reg_write(uc, UC_ARM_REG_R0, &zero);
         return;
     }
     if (name == "pthread_once") {
