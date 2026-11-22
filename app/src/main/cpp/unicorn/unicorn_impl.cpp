@@ -1297,7 +1297,32 @@ public:
             return;
         }
 
-        LOGW("Dynarmic: ExceptionRaised a PC=0x%08x (tipo=%d)", pc, static_cast<int>(exception));
+        if (exception == Dynarmic::A32::Exception::UndefinedInstruction &&
+            (((pc >= 0x7D000100U && pc < 0x7D001800U) || (pc >= 0x70000000U && pc < 0x70100000U)) && (pc & 7U) == 0U)) {
+            uint32_t stubInsn = 0;
+            if (inst_->readMem(pc, &stubInsn, 4) == UC_ERR_OK && (stubInsn & 0xFF000000U) == 0xEF000000U) {
+                inst_->dispatchIntr(stubInsn & 0x00FFFFFFU);
+                uint32_t lr = inst_->dynarmic_jit->Regs()[14];
+                uint32_t cpsrNow = inst_->dynarmic_jit->Cpsr();
+                if (lr & 1U) {
+                    cpsrNow |= FLAG_T;
+                } else {
+                    cpsrNow &= ~FLAG_T;
+                }
+                inst_->dynarmic_jit->SetCpsr(cpsrNow);
+                inst_->dynarmic_jit->Regs()[15] = lr & ((lr & 1U) ? ~1U : ~3U);
+                if (inst_->stop_requested.load(std::memory_order_relaxed)) {
+                    inst_->dynarmic_jit->HaltExecution(Dynarmic::HaltReason::UserDefined1);
+                }
+                return;
+            }
+        }
+
+        uint32_t faultInsn = 0;
+        inst_->readMem(pc, &faultInsn, 4);
+        LOGW("Dynarmic: ExceptionRaised a PC=0x%08x (tipo=%d, LR=0x%08x, CPSR=0x%08x, insn=0x%08x)",
+             pc, static_cast<int>(exception), inst_->dynarmic_jit->Regs()[14],
+             inst_->dynarmic_jit->Cpsr(), faultInsn);
         int sig = emux::GUEST_SIGSEGV;
         int code = 1;
         if (exception == Dynarmic::A32::Exception::Breakpoint) {
@@ -1376,8 +1401,6 @@ uc_err UnicornInstance::runDynarmic(uint64_t begin, uint64_t until, size_t count
     itstate = 0;
     if (begin & 1ULL) {
         cpsr |= FLAG_T;
-        regs[15] = static_cast<uint32_t>(begin & ~1ULL);
-    } else if (cpsr & FLAG_T) {
         regs[15] = static_cast<uint32_t>(begin & ~1ULL);
     } else {
         cpsr &= ~FLAG_T;
