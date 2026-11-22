@@ -654,8 +654,8 @@ bool DbtEngine::startEmulation() {
     }
 
     uint32_t nativeActivityRedrawAddr = 0;
-    uint32_t activityPtr = 0x7d002900U;
-    uint32_t winHandle = env.getJNIEnvPointer() + 0x2800U;
+    uint32_t activityPtr = 0x7d003000U;
+    uint32_t winHandle = 0x7d002800U;
 
     bool hasJniLifecycle = false;
     for (const auto& m : nativeMethods) {
@@ -670,7 +670,7 @@ bool DbtEngine::startEmulation() {
 
     if (nativeActivityOnCreateAddr != 0 && !hasJniLifecycle) {
         LOGI("ANativeActivity rilevata: avvio ANativeActivity_onCreate @ 0x%08x...", nativeActivityOnCreateAddr);
-        uint32_t callbacksPtr = 0x7d002880U;
+        uint32_t callbacksPtr = 0x7d003200U;
         uint32_t internalPathStr = env.createGuestCString(uc_, env.getFilesDir());
         uint32_t externalPathStr = env.createGuestCString(uc_, env.getObbDir().empty() ? env.getFilesDir() : env.getObbDir());
         uint32_t obbPathStr = env.createGuestCString(uc_, env.getObbDir());
@@ -682,7 +682,7 @@ bool DbtEngine::startEmulation() {
 
         uint32_t sdkVer = 27;
         uint32_t nullInst = 0;
-        uint32_t mockAssetMgr = env.getJNIEnvPointer() + 0x2800U;
+        uint32_t mockAssetMgr = 0x7d005000U;
         uc_mem_write(uc_, activityPtr + 0, &callbacksPtr, 4);
         uc_mem_write(uc_, activityPtr + 4, &javaVMPtr, 4);
         uc_mem_write(uc_, activityPtr + 8, &jniEnvPtr, 4);

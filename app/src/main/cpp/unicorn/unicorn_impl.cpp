@@ -327,7 +327,13 @@ struct UnicornInstance {
 #endif
     void dispatchIntr(uint32_t svcComment);
 
+    static std::atomic<int>& activeInstanceCount() {
+        static std::atomic<int> sCount{0};
+        return sCount;
+    }
+
     UnicornInstance(uc_arch a, uc_mode m) : arch(a), mode(m), flat_mem(emux::GuestMemory::getSharedInstance()) {
+        activeInstanceCount().fetch_add(1, std::memory_order_acq_rel);
         regs[13] = 0x7E1FF000;
         cpsr = 0x00000010;
         flat_mem.initialize();
@@ -348,7 +354,9 @@ struct UnicornInstance {
 #endif
         std::lock_guard<std::mutex> lock(mem_mutex);
         tb_cache.clear();
-        flat_mem.destroy();
+        if (activeInstanceCount().fetch_sub(1, std::memory_order_acq_rel) == 1) {
+            flat_mem.destroy();
+        }
         for (auto& reg : regions) {
             if (reg.owned && reg.host_ptr) {
                 munmap(reg.host_ptr, reg.size);
@@ -1374,7 +1382,10 @@ void UnicornInstance::initDynarmic() {
         // Ottimizzazioni JIT ad alte prestazioni per ARM32 -> AArch64 Gaming
         conf.optimizations = Dynarmic::all_safe_optimizations;
         conf.fastmem_exclusive_access = true;
-        conf.code_cache_size = 128 * 1024 * 1024; // 128 MB code cache per thread
+        // 32 MB per il thread principale, 8 MB per worker thread secondari per evitare OOM su giochi multi-thread
+        conf.code_cache_size = (activeInstanceCount().load(std::memory_order_relaxed) <= 1)
+            ? (32 * 1024 * 1024)
+            : (8 * 1024 * 1024);
         conf.always_little_endian = true;         // Android ARM32 è strettamente little-endian
         conf.wall_clock_cntpct = true;            // Usa clock reale per evitare overhead timer emulati
         conf.hook_hint_instructions = true;       // Intercetta yield/wfe per rilasciare la CPU in spinlock

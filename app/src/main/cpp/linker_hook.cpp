@@ -2926,14 +2926,17 @@ void GuestRuntimeEnvironment::handleTrampolineCall(uint32_t trampolineId, uc_eng
         return;
     }
 
-    auto it = trampolineToSymbolMap_.find(trampolineId - 0x2000U);
-    if (it == trampolineToSymbolMap_.end()) {
-        uint32_t zero = 0;
-        uc_reg_write(uc, UC_ARM_REG_R0, &zero);
-        return;
+    std::string name;
+    {
+        std::lock_guard<std::recursive_mutex> lock(runtimeMutex_);
+        auto it = trampolineToSymbolMap_.find(trampolineId - 0x2000U);
+        if (it == trampolineToSymbolMap_.end()) {
+            uint32_t zero = 0;
+            uc_reg_write(uc, UC_ARM_REG_R0, &zero);
+            return;
+        }
+        name = it->second;
     }
-
-    const std::string& name = it->second;
 
     // 1. Android Logcat
     if (name == "__android_log_print" || name == "__android_log_vprint") {
@@ -3147,7 +3150,7 @@ void GuestRuntimeEnvironment::handleTrampolineCall(uint32_t trampolineId, uc_eng
         return;
     }
 
-    // 4. Operazioni di Memoria, Stringhe e Formattazione (AEABI & Libc)
+    // 4. Operazioni di Memoria, Stringhe e Formattazione (AEABI & Libc - Zero-Copy Fastmem)
     if (name == "memcpy" || name == "memmove" || name == "__aeabi_memcpy" || name == "__aeabi_memcpy4" ||
         name == "__aeabi_memcpy8" || name == "__aeabi_memmove" || name == "__aeabi_memmove4" || name == "__aeabi_memmove8") {
         uint32_t dst = 0, src = 0, count = 0;
@@ -3155,9 +3158,14 @@ void GuestRuntimeEnvironment::handleTrampolineCall(uint32_t trampolineId, uc_eng
         uc_reg_read(uc, UC_ARM_REG_R1, &src);
         uc_reg_read(uc, UC_ARM_REG_R2, &count);
         if (count > 0 && dst != 0 && src != 0 && count < 0x08000000U) {
-            std::vector<uint8_t> tmp(count);
-            if (uc_mem_read(uc, src, tmp.data(), count) == UC_ERR_OK) {
-                uc_mem_write(uc, dst, tmp.data(), count);
+            auto& gm = GuestMemory::getSharedInstance();
+            if (gm.isReady() && gm.isMappedRange(dst, count) && gm.isMappedRange(src, count)) {
+                std::memmove(gm.g2h(dst), gm.g2h(src), count);
+            } else {
+                std::vector<uint8_t> tmp(count);
+                if (uc_mem_read(uc, src, tmp.data(), count) == UC_ERR_OK) {
+                    uc_mem_write(uc, dst, tmp.data(), count);
+                }
             }
         }
         uc_reg_write(uc, UC_ARM_REG_R0, &dst);
@@ -3180,8 +3188,13 @@ void GuestRuntimeEnvironment::handleTrampolineCall(uint32_t trampolineId, uc_eng
             val = static_cast<uint8_t>(a2);
         }
         if (count > 0 && dst != 0 && count < 0x08000000U) {
-            std::vector<uint8_t> tmp(count, val);
-            uc_mem_write(uc, dst, tmp.data(), count);
+            auto& gm = GuestMemory::getSharedInstance();
+            if (gm.isReady() && gm.isMappedRange(dst, count)) {
+                std::memset(gm.g2h(dst), val, count);
+            } else {
+                std::vector<uint8_t> tmp(count, val);
+                uc_mem_write(uc, dst, tmp.data(), count);
+            }
         }
         uc_reg_write(uc, UC_ARM_REG_R0, &dst);
         return;
@@ -3193,10 +3206,15 @@ void GuestRuntimeEnvironment::handleTrampolineCall(uint32_t trampolineId, uc_eng
         uc_reg_read(uc, UC_ARM_REG_R2, &count);
         int res = 0;
         if (count > 0 && s1 != 0 && s2 != 0 && count < 0x04000000U) {
-            std::vector<uint8_t> b1(count), b2(count);
-            uc_mem_read(uc, s1, b1.data(), count);
-            uc_mem_read(uc, s2, b2.data(), count);
-            res = std::memcmp(b1.data(), b2.data(), count);
+            auto& gm = GuestMemory::getSharedInstance();
+            if (gm.isReady() && gm.isMappedRange(s1, count) && gm.isMappedRange(s2, count)) {
+                res = std::memcmp(gm.g2h(s1), gm.g2h(s2), count);
+            } else {
+                std::vector<uint8_t> b1(count), b2(count);
+                uc_mem_read(uc, s1, b1.data(), count);
+                uc_mem_read(uc, s2, b2.data(), count);
+                res = std::memcmp(b1.data(), b2.data(), count);
+            }
         }
         uint32_t ret = static_cast<uint32_t>(res);
         uc_reg_write(uc, UC_ARM_REG_R0, &ret);
@@ -3209,10 +3227,17 @@ void GuestRuntimeEnvironment::handleTrampolineCall(uint32_t trampolineId, uc_eng
         uc_reg_read(uc, UC_ARM_REG_R2, &n);
         uint32_t found = 0;
         if (sAddr != 0 && n > 0 && n < 0x01000000U) {
-            std::vector<uint8_t> buf(n);
-            if (uc_mem_read(uc, sAddr, buf.data(), n) == UC_ERR_OK) {
-                const void* p = std::memchr(buf.data(), static_cast<int>(cVal & 0xFFU), n);
-                if (p) found = sAddr + static_cast<uint32_t>(static_cast<const uint8_t*>(p) - buf.data());
+            auto& gm = GuestMemory::getSharedInstance();
+            if (gm.isReady() && gm.isMappedRange(sAddr, n)) {
+                const uint8_t* base = gm.g2h(sAddr);
+                const void* p = std::memchr(base, static_cast<int>(cVal & 0xFFU), n);
+                if (p) found = sAddr + static_cast<uint32_t>(static_cast<const uint8_t*>(p) - base);
+            } else {
+                std::vector<uint8_t> buf(n);
+                if (uc_mem_read(uc, sAddr, buf.data(), n) == UC_ERR_OK) {
+                    const void* p = std::memchr(buf.data(), static_cast<int>(cVal & 0xFFU), n);
+                    if (p) found = sAddr + static_cast<uint32_t>(static_cast<const uint8_t*>(p) - buf.data());
+                }
             }
         }
         uc_reg_write(uc, UC_ARM_REG_R0, &found);
