@@ -977,15 +977,21 @@ fun UpdateCheckDialog(
                     }
                     releaseInfo != null -> {
                         val info = releaseInfo!!
-                        Text(
-                            text = if (isAlreadyLatest) {
-                                "Hai già scaricato l'ultima build disponibile:"
-                            } else {
-                                "Nuova build disponibile su GitHub:"
-                            },
-                            fontSize = 14.sp
-                        )
-                        Spacer(modifier = Modifier.height(8.dp))
+                        if (isAlreadyLatest) {
+                            Text(
+                                text = "Latest version already installed",
+                                color = Color(0xFF4ADE80),
+                                fontWeight = FontWeight.Bold,
+                                fontSize = 15.sp
+                            )
+                            Spacer(modifier = Modifier.height(6.dp))
+                        } else {
+                            Text(
+                                text = "Nuova build disponibile su GitHub:",
+                                fontSize = 14.sp
+                            )
+                            Spacer(modifier = Modifier.height(8.dp))
+                        }
                         Surface(
                             color = Color(0xFF121212),
                             shape = RoundedCornerShape(8.dp),
@@ -1017,7 +1023,7 @@ fun UpdateCheckDialog(
             }
         },
         confirmButton = {
-            if (!isChecking && !isDownloading && releaseInfo != null) {
+            if (!isChecking && !isDownloading && releaseInfo != null && !isAlreadyLatest) {
                 Button(
                     onClick = {
                         if (!AppUpdater.canRequestPackageInstalls(context)) {
