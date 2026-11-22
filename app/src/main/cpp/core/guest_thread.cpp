@@ -32,8 +32,14 @@ void GuestThreadScheduler::initialize(uc_engine* mainUc) {
     auto mainThread = std::make_shared<GuestThread>();
     mainThread->tid = 1;
     mainThread->uc = mainUc;
+    mainThread->tlsAddr = 0x7D020000U;
+    mainThread->stackBase = 0x7E000000U;
+    mainThread->stackSize = 0x00200000U;
+    mainThread->stackTop = 0x7E1FF000U;
     mainThread->isRunning.store(true);
     threads_[1] = mainThread;
+    nextTlsKey_.store(8);
+    tlsKeyDestructors_.clear();
     LOGI("GuestThreadScheduler inizializzato (MainThread TID=1)");
 }
 
@@ -331,6 +337,16 @@ int32_t GuestThreadScheduler::setTlsSpecific(uint32_t key, uint32_t val) {
     auto it = threads_.find(tid);
     if (it != threads_.end()) {
         it->second->tlsKeyValues[key] = val;
+        // Sincronizza anche nell'array TLS Bionic in memoria guest ([TPIDRURO + key * 4])
+        // per supportare letture inline dirette da CP15 c13 senza passare per pthread_getspecific
+        uint32_t tlsBase = it->second->tlsAddr ? it->second->tlsAddr : 0x7D020000U;
+        if (key < 256U) {
+            auto& gm = GuestMemory::getSharedInstance();
+            uint32_t slotAddr = tlsBase + (key * 4U);
+            if (gm.isReady() && gm.isMappedRange(slotAddr, 4)) {
+                std::memcpy(gm.g2h(slotAddr), &val, 4);
+            }
+        }
     }
     return 0;
 }
@@ -343,6 +359,16 @@ uint32_t GuestThreadScheduler::getTlsSpecific(uint32_t key) {
         auto kit = it->second->tlsKeyValues.find(key);
         if (kit != it->second->tlsKeyValues.end()) {
             return kit->second;
+        }
+        uint32_t tlsBase = it->second->tlsAddr ? it->second->tlsAddr : 0x7D020000U;
+        if (key < 256U) {
+            auto& gm = GuestMemory::getSharedInstance();
+            uint32_t slotAddr = tlsBase + (key * 4U);
+            if (gm.isReady() && gm.isMappedRange(slotAddr, 4)) {
+                uint32_t val = 0;
+                std::memcpy(&val, gm.g2h(slotAddr), 4);
+                return val;
+            }
         }
     }
     return 0;

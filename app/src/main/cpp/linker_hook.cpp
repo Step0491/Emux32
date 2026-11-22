@@ -177,7 +177,7 @@ static inline uint32_t allocGuestHeap(uc_engine* uc, uint32_t size, uint32_t ali
 }
 
 static inline void freeGuestHeap(uint32_t ptr, uc_engine* uc) {
-    if (ptr < 0x60000000U) return;
+    if (ptr < GuestMemory::kHeapBase || ptr >= GuestMemory::kHeapLimit) return;
     std::lock_guard<std::mutex> lock(sHeapMutex);
     uint32_t hdrAddr = ptr - sizeof(GuestHeapHeader);
     GuestHeapHeader hdr{};
@@ -1445,12 +1445,12 @@ jobject GuestRuntimeEnvironment::resolveHostObject(uint32_t guestHandle, JNIEnv*
 
     auto oit = hostObjectMap_.find(guestHandle);
     if (oit != hostObjectMap_.end()) {
-        return oit->second;
+        return oit->second ? hostEnv->NewLocalRef(oit->second) : nullptr;
     }
 
     auto cit = hostClassMap_.find(guestHandle);
     if (cit != hostClassMap_.end()) {
-        return cit->second;
+        return cit->second ? hostEnv->NewLocalRef(cit->second) : nullptr;
     }
 
     auto sit = jstringMap_.find(guestHandle);
@@ -1668,7 +1668,7 @@ void GuestRuntimeEnvironment::handleJniCall(uint32_t slotIndex, uc_engine* uc) {
             uint32_t handle = nextMockHandle_++;
             classHandleMap_[handle] = clsName;
 
-            if (hostJavaVm_ && hostClassLoader_ && loadClassMethod_) {
+            if (!clsName.empty() && hostJavaVm_ && hostClassLoader_ && loadClassMethod_) {
                 JNIEnv* hostEnv = nullptr;
                 if (hostJavaVm_->GetEnv(reinterpret_cast<void**>(&hostEnv), JNI_VERSION_1_6) == JNI_OK && hostEnv) {
                     std::string dotted = clsName;
@@ -1731,7 +1731,15 @@ void GuestRuntimeEnvironment::handleJniCall(uint32_t slotIndex, uc_engine* uc) {
             return;
 
         case 13: // Throw
-        case 14: // ThrowNew
+            setReturnU32(0);
+            return;
+        case 14: { // ThrowNew(env, jclass clazz, const char* msg)
+            std::string clsName = classHandleMap_.count(r1) ? classHandleMap_[r1] : "UnknownException";
+            std::string msg = readGuestCString(uc, r2, 256);
+            LOGW("JNI ThrowNew('%s', '%s') intercettata e neutralizzata", clsName.c_str(), msg.c_str());
+            setReturnU32(0);
+            return;
+        }
         case 15: // ExceptionOccurred
         case 16: // ExceptionDescribe
         case 17: // ExceptionClear
@@ -1817,7 +1825,8 @@ void GuestRuntimeEnvironment::handleJniCall(uint32_t slotIndex, uc_engine* uc) {
             uint32_t handle = nextMockHandle_++;
             methodHandleMap_[handle] = {cName, mName, mSig, slotIndex == 113};
 
-            if (hostClassMap_.count(r1) && hostJavaVm_) {
+            if (!mName.empty() && !mSig.empty() && mSig[0] == '(' &&
+                hostClassMap_.count(r1) && hostJavaVm_) {
                 JNIEnv* hostEnv = nullptr;
                 if (hostJavaVm_->GetEnv(reinterpret_cast<void**>(&hostEnv), JNI_VERSION_1_6) == JNI_OK && hostEnv) {
                     jclass realCls = hostClassMap_[r1];
@@ -1826,7 +1835,11 @@ void GuestRuntimeEnvironment::handleJniCall(uint32_t slotIndex, uc_engine* uc) {
                         : hostEnv->GetMethodID(realCls, mName.c_str(), mSig.c_str());
                     if (hostEnv->ExceptionCheck()) hostEnv->ExceptionClear();
                     if (mId) {
-                        hostMethodMap_[handle] = mId;
+                        // Registra in hostMethodMap_ solo classi standard sicure (non Activity/Singleton di gioco non istanziati sull'host)
+                        // ed escludi System.getProperty che deve restituire i percorsi/architettura guest ARM32
+                        if (cName.rfind("java/", 0) == 0 && !(cName == "java/lang/System" && mName == "getProperty")) {
+                            hostMethodMap_[handle] = mId;
+                        }
                         LOGI("JNI %s -> METODO REALE HOST TROVATO: %s::%s%s (handle=0x%x)",
                              (slotIndex == 113 ? "GetStaticMethodID" : "GetMethodID"),
                              cName.c_str(), mName.c_str(), mSig.c_str(), handle);
@@ -1905,6 +1918,58 @@ void GuestRuntimeEnvironment::handleJniCall(uint32_t slotIndex, uc_engine* uc) {
             auto mit = methodHandleMap_.find(r2);
             if (mit != methodHandleMap_.end()) {
                 const auto& info = mit->second;
+                if (info.name == "getProperty") {
+                    uint32_t keyArg = r3;
+                    if (((slotIndex - 114) % 3) == 1 && r3 != 0) {
+                        uc_mem_read(uc, r3, &keyArg, 4);
+                    } else if (((slotIndex - 114) % 3) == 2 && r3 != 0) {
+                        uint64_t rawJval = 0;
+                        uc_mem_read(uc, r3, &rawJval, 8);
+                        keyArg = static_cast<uint32_t>(rawJval & 0xFFFFFFFFU);
+                    }
+                    std::string propKey = jstringMap_.count(keyArg) ? jstringMap_[keyArg] : readGuestCString(uc, keyArg, 128);
+                    std::string propVal;
+                    if (propKey == "java.library.path" || propKey == "java.io.tmpdir") {
+                        propVal = libDir_;
+                    } else if (propKey == "os.arch") {
+                        propVal = "armv7l";
+                    } else if (propKey == "os.name") {
+                        propVal = "Linux";
+                    } else if (propKey == "java.class.path" || propKey == "java.ext.dirs") {
+                        propVal = apkPath_;
+                    } else if (propKey == "user.dir" || propKey == "user.home") {
+                        propVal = filesDir_;
+                    } else if (propKey == "java.home") {
+                        propVal = "/system";
+                    } else if (propKey == "file.separator") {
+                        propVal = "/";
+                    } else if (propKey == "path.separator") {
+                        propVal = ":";
+                    } else if (propKey == "line.separator") {
+                        propVal = "\n";
+                    } else {
+                        propVal = libDir_;
+                    }
+                    LOGI("JNI System.getProperty('%s') -> '%s'", propKey.c_str(), propVal.c_str());
+                    setReturnU32(createGuestJString(uc, propVal));
+                    return;
+                }
+                if (info.name == "getLocalSaveDirectory" || info.name == "getFacebookSaveDirectory") {
+                    setReturnU32(createGuestJString(uc, filesDir_));
+                    return;
+                }
+                if (info.name == "getDeviceID") {
+                    setReturnU32(createGuestJString(uc, "emux32_device_id"));
+                    return;
+                }
+                if (info.name == "getDeviceVersion") {
+                    setReturnU32(createGuestJString(uc, "9"));
+                    return;
+                }
+                if (info.name == "GetVersionString") {
+                    setReturnU32(createGuestJString(uc, "1.1.6"));
+                    return;
+                }
                 if (info.name == "getPackageName") {
                     setReturnU32(createGuestJString(uc, packageName_));
                     return;
@@ -2088,6 +2153,13 @@ void GuestRuntimeEnvironment::handleJniCall(uint32_t slotIndex, uc_engine* uc) {
                     }
                 }
             }
+            auto mit = methodHandleMap_.find(r2);
+            if (mit != methodHandleMap_.end()) {
+                if (mit->second.name == "IsOpenFeintSupported") {
+                    setReturnU32(0);
+                    return;
+                }
+            }
             setReturnU32(1);
             return;
         }
@@ -2183,8 +2255,8 @@ void GuestRuntimeEnvironment::handleJniCall(uint32_t slotIndex, uc_engine* uc) {
                     setReturnU32(0x1002U); // SOURCE_TOUCHSCREEN
                     return;
                 }
-                if (mName == "getWidth") { setReturnU32(1920); return; }
-                if (mName == "getHeight") { setReturnU32(1080); return; }
+                if (mName == "getWidth" || mName == "GetDeviceWidth") { setReturnU32(1920); return; }
+                if (mName == "getHeight" || mName == "GetDeviceHeight") { setReturnU32(1080); return; }
                 if (mName == "getRotation") { setReturnU32(1); return; }
                 if (mName == "getSplashMode") { setReturnU32(0); return; }
             }
@@ -2584,6 +2656,33 @@ void GuestRuntimeEnvironment::handleJniCall(uint32_t slotIndex, uc_engine* uc) {
                 uc_mem_write(uc, r1, &guestJavaVMAddr_, 4);
             }
             setReturnU32(0); // JNI_OK
+            return;
+        }
+
+        case 220: // GetStringRegion(JNIEnv* env, jstring str, jsize start, jsize len, jchar* buf)
+        case 221: { // GetStringUTFRegion(JNIEnv* env, jstring str, jsize start, jsize len, char* buf)
+            uint32_t sp = 0, dstBuf = 0;
+            uc_reg_read(uc, UC_ARM_REG_SP, &sp);
+            uc_mem_read(uc, sp, &dstBuf, 4);
+            auto it = jstringMap_.find(r1);
+            if (dstBuf != 0 && it != jstringMap_.end()) {
+                const std::string& s = it->second;
+                size_t start = static_cast<size_t>(r2);
+                size_t len = static_cast<size_t>(r3);
+                if (start <= s.size()) {
+                    size_t avail = std::min(len, s.size() - start);
+                    if (slotIndex == 221) {
+                        if (avail > 0) uc_mem_write(uc, dstBuf, s.data() + start, avail);
+                        uint8_t nul = 0;
+                        uc_mem_write(uc, dstBuf + static_cast<uint32_t>(avail), &nul, 1);
+                    } else {
+                        std::vector<uint16_t> u16(avail + 1, 0);
+                        for (size_t i = 0; i < avail; ++i) u16[i] = static_cast<uint8_t>(s[start + i]);
+                        uc_mem_write(uc, dstBuf, u16.data(), (avail + 1) * sizeof(uint16_t));
+                    }
+                }
+            }
+            setReturnU32(0);
             return;
         }
 
@@ -4042,8 +4141,11 @@ void GuestRuntimeEnvironment::handleTrampolineCall(uint32_t trampolineId, uc_eng
         uint32_t attrPtr = 0;
         uc_reg_read(uc, UC_ARM_REG_R1, &attrPtr);
         if (attrPtr != 0) {
-            uint8_t zeroAttr[64] = {0};
-            uc_mem_write(uc, attrPtr, zeroAttr, sizeof(zeroAttr));
+            uint32_t attrWords[16] = {0};
+            attrWords[1] = 0x7E000000U; // stack_base
+            attrWords[2] = 0x00200000U; // stack_size (2MB)
+            attrWords[3] = 0x00001000U; // guard_size (4KB)
+            uc_mem_write(uc, attrPtr, attrWords, sizeof(attrWords));
         }
         uint32_t zero = 0;
         uc_reg_write(uc, UC_ARM_REG_R0, &zero);

@@ -73,7 +73,7 @@ private:
     std::unordered_map<uint32_t, std::shared_ptr<GuestThread>> threads_;
     std::atomic<uint32_t> nextTid_{2};
 
-    std::atomic<uint32_t> nextTlsKey_{1};
+    std::atomic<uint32_t> nextTlsKey_{8};
     std::unordered_map<uint32_t, uint32_t> tlsKeyDestructors_;
 
     uc_engine* mainUc_{nullptr};

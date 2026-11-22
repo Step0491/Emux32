@@ -1328,9 +1328,40 @@ public:
 
         uint32_t faultInsn = 0;
         inst_->readMem(pc, &faultInsn, 4);
+        auto& jRegs = inst_->dynarmic_jit->Regs();
         LOGW("Dynarmic: ExceptionRaised a PC=0x%08x (tipo=%d, LR=0x%08x, CPSR=0x%08x, insn=0x%08x)",
-             pc, static_cast<int>(exception), inst_->dynarmic_jit->Regs()[14],
+             pc, static_cast<int>(exception), jRegs[14],
              inst_->dynarmic_jit->Cpsr(), faultInsn);
+
+        static std::atomic<int> sDetailedTrapDumps{0};
+        if (sDetailedTrapDumps.fetch_add(1, std::memory_order_relaxed) < 8) {
+            LOGW("Dynarmic TrapRegs [0..7]: R0=0x%08x R1=0x%08x R2=0x%08x R3=0x%08x R4=0x%08x R5=0x%08x R6=0x%08x R7=0x%08x",
+                 jRegs[0], jRegs[1], jRegs[2], jRegs[3], jRegs[4], jRegs[5], jRegs[6], jRegs[7]);
+            LOGW("Dynarmic TrapRegs [8..15]: R8=0x%08x R9=0x%08x R10=0x%08x R11=0x%08x R12=0x%08x SP=0x%08x LR=0x%08x PC=0x%08x",
+                 jRegs[8], jRegs[9], jRegs[10], jRegs[11], jRegs[12], jRegs[13], jRegs[14], jRegs[15]);
+            uint32_t codeWin[16] = {0};
+            uint32_t baseCode = (pc >= 32U) ? ((pc & ~3U) - 32U) : 0U;
+            inst_->readMem(baseCode, codeWin, sizeof(codeWin));
+            LOGW("Dynarmic TrapCode [0x%08x..0x%08x]: %08x %08x %08x %08x | %08x %08x %08x %08x",
+                 baseCode, baseCode + 28U, codeWin[0], codeWin[1], codeWin[2], codeWin[3],
+                 codeWin[4], codeWin[5], codeWin[6], codeWin[7]);
+            LOGW("Dynarmic TrapCode [0x%08x..0x%08x]: %08x<=PC %08x %08x %08x | %08x %08x %08x %08x",
+                 baseCode + 32U, baseCode + 60U, codeWin[8], codeWin[9], codeWin[10], codeWin[11],
+                 codeWin[12], codeWin[13], codeWin[14], codeWin[15]);
+            uint32_t stackWin[8] = {0};
+            inst_->readMem(jRegs[13], stackWin, sizeof(stackWin));
+            LOGW("Dynarmic TrapStack [SP=0x%08x]: %08x %08x %08x %08x | %08x %08x %08x %08x",
+                 jRegs[13], stackWin[0], stackWin[1], stackWin[2], stackWin[3],
+                 stackWin[4], stackWin[5], stackWin[6], stackWin[7]);
+            if (jRegs[0] >= 0x40000000U && jRegs[0] < 0x7F000000U) {
+                uint32_t r0Win[8] = {0};
+                inst_->readMem(jRegs[0] & ~3U, r0Win, sizeof(r0Win));
+                LOGW("Dynarmic TrapR0 [R0=0x%08x]: %08x %08x %08x %08x | %08x %08x %08x %08x",
+                     jRegs[0], r0Win[0], r0Win[1], r0Win[2], r0Win[3],
+                     r0Win[4], r0Win[5], r0Win[6], r0Win[7]);
+            }
+        }
+
         int sig = emux::GUEST_SIGSEGV;
         int code = 1;
         if (exception == Dynarmic::A32::Exception::Breakpoint) {
@@ -1339,11 +1370,42 @@ public:
             sig = emux::GUEST_SIGILL;
         }
         if (emux::GuestSignalManager::getInstance().deliverSignal(reinterpret_cast<uc_engine*>(inst_), sig, pc, code)) {
-            auto& jRegs = inst_->dynarmic_jit->Regs();
             for (int i = 0; i < 16; ++i) jRegs[i] = inst_->regs[i];
             inst_->dynarmic_jit->SetCpsr(inst_->cpsr);
             return;
         }
+
+        // Recovery resiliente per UDF #0xDEFE (0xE7FFDEFE, GCC __builtin_trap) quando nessun SIGILL handler è attivo:
+        // invece di abortire l'intero uc_emu_start (troncando initJni/nativeFile/nativeRender),
+        // cerca l'epilogo della funzione corrente (POP {..., pc} o BX LR) per fare unwind pulito dello stack frame.
+        if (exception == Dynarmic::A32::Exception::UndefinedInstruction &&
+            faultInsn == 0xE7FFDEFEU &&
+            !(inst_->dynarmic_jit->Cpsr() & FLAG_T) &&
+            trap_recoveries_ < 32) {
+            trap_recoveries_++;
+            uint32_t epiloguePc = 0;
+            // 1. Controlla prima l'istruzione immediatamente precedente (pc - 4) e le successive (pc + 4 .. pc + 128)
+            for (int delta = -4; delta <= 128; delta += 4) {
+                if (delta == 0) continue;
+                uint32_t candAddr = pc + static_cast<uint32_t>(delta);
+                uint32_t w = 0;
+                if (inst_->readMem(candAddr, &w, 4) == UC_ERR_OK) {
+                    // POP {..., pc} (0xE8BD8xxx), LDR pc, [sp], #imm (0xE49DFxxx), o BX LR (0xE12FFF1E)
+                    if ((w & 0xFFFF8000U) == 0xE8BD8000U ||
+                        (w & 0xFFFFF000U) == 0xE49DF000U ||
+                        w == 0xE12FFF1EU) {
+                        epiloguePc = candAddr;
+                        break;
+                    }
+                }
+            }
+            if (epiloguePc != 0) {
+                jRegs[0] = 0;
+                jRegs[15] = epiloguePc;
+                return;
+            }
+        }
+
         inst_->dynarmic_jit->HaltExecution(Dynarmic::HaltReason::UserDefined2);
     }
 
@@ -1360,9 +1422,14 @@ public:
         return inst_->dynarmic_ticks_budget;
     }
 
+    void resetTrapRecoveries() {
+        trap_recoveries_ = 0;
+    }
+
 private:
     UnicornInstance* inst_;
     std::uint64_t ticks_{0};
+    size_t trap_recoveries_{0};
 };
 
 void UnicornInstance::initDynarmic() {
@@ -1434,6 +1501,9 @@ uc_err UnicornInstance::runDynarmic(uint64_t begin, uint64_t until, size_t count
         extRegs[32 + i * 2 + 1] = static_cast<uint32_t>(vfp_d_ext[i] >> 32);
     }
 
+    if (dynarmic_cb) {
+        dynarmic_cb->resetTrapRecoveries();
+    }
     dynarmic_jit->ClearHalt(Dynarmic::HaltReason::UserDefined1 | Dynarmic::HaltReason::UserDefined2);
 
     bool wasRunning = is_running.exchange(true);
