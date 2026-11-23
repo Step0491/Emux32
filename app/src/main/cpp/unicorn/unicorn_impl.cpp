@@ -1403,6 +1403,20 @@ public:
                 jRegs[0] = 0;
                 jRegs[15] = epiloguePc;
                 return;
+            } else if (jRegs[14] != 0 && jRegs[14] != pc) {
+                // Se non c'e' un epilogo inline nella funzione trap (funzioni __builtin_trap noreturn dedicate),
+                // ritorna direttamente al chiamante via LR con R0=0
+                jRegs[0] = 0;
+                uint32_t lr = jRegs[14];
+                uint32_t cpsrNow = inst_->dynarmic_jit->Cpsr();
+                if (lr & 1U) {
+                    cpsrNow |= FLAG_T;
+                } else {
+                    cpsrNow &= ~FLAG_T;
+                }
+                inst_->dynarmic_jit->SetCpsr(cpsrNow);
+                jRegs[15] = lr & ((lr & 1U) ? ~1U : ~3U);
+                return;
             }
         }
 

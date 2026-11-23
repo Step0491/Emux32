@@ -539,8 +539,8 @@ bool DbtEngine::startEmulation() {
 
     // 5. Sequenza di avvio signature-aware per i metodi JNI registrati (Unity / NDK / libg.so)
     const auto& nativeMethods = env.getRegisteredMethods();
-    uint32_t dummyInstance = 0x1001;
-    uint32_t dummySurface = 0x1003;
+    uint32_t dummyInstance = 0x1002; // com/unity3d/player/UnityPlayer instance handle
+    uint32_t dummySurface = 0x1003;  // android/view/Surface handle
 
     // 5a. Unity/Bionic init del contesto (initJni) - DEVE ESSERE PRIMA DI nativeFile!
     for (const auto& m : nativeMethods) {
