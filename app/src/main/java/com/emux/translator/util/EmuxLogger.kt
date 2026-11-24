@@ -32,17 +32,27 @@ object EmuxLogger {
     private var prevExternalLogFile: File? = null
     private var isCapturingLogcat = false
 
+    private fun rotateIfMeaningful(curFile: File, prevFile: File) {
+        if (!curFile.exists()) return
+        val len = curFile.length()
+        // Ruota in _prev solo se la sessione precedente ha prodotto log significativi (> 512 byte),
+        // evitando che un riavvio rapido post-crash sovrascriva il log del crash precedente.
+        if (len > 512L || !prevFile.exists() || prevFile.length() == 0L) {
+            if (len > 0L) {
+                try {
+                    curFile.copyTo(prevFile, overwrite = true)
+                } catch (_: Exception) {}
+            }
+        }
+        curFile.delete()
+    }
+
     fun initLogFiles(internalCacheDir: File, externalEmuxDir: File?) {
         try {
             // 1. Log interno sempre disponibile (privato sandbox dell'app)
             val prevInternal = File(internalCacheDir, "emux_execution_prev.log")
             val curInternal = File(internalCacheDir, "emux_execution.log")
-            if (curInternal.exists() && curInternal.length() > 0L) {
-                try {
-                    curInternal.copyTo(prevInternal, overwrite = true)
-                } catch (_: Exception) {}
-                curInternal.delete()
-            }
+            rotateIfMeaningful(curInternal, prevInternal)
             curInternal.createNewFile()
             primaryLogFile = curInternal
             prevPrimaryLogFile = prevInternal
@@ -55,16 +65,29 @@ object EmuxLogger {
                 }
                 val prevExt = File(logDir, "emux_execution_prev.log")
                 val curExt = File(logDir, "emux_execution.log")
-                if (curExt.exists() && curExt.length() > 0L) {
-                    try {
-                        curExt.copyTo(prevExt, overwrite = true)
-                    } catch (_: Exception) {}
-                    curExt.delete()
-                }
+                rotateIfMeaningful(curExt, prevExt)
                 curExt.createNewFile()
                 externalLogFile = curExt
                 prevExternalLogFile = prevExt
                 Log.i(DEFAULT_TAG, "File di log pubblico configurato: ${externalLogFile?.absolutePath}")
+            }
+
+            // 3. Ripristina nel viewer UI i log della sessione precedente (utile dopo un crash)
+            val prevText = readFileSafe(prevExternalLogFile) ?: readFileSafe(prevPrimaryLogFile)
+            if (!prevText.isNullOrBlank()) {
+                synchronized(this) {
+                    val prevLines = prevText.lines().filter { it.isNotBlank() }.takeLast(1000)
+                    if (prevLines.isNotEmpty()) {
+                        logBuffer.clear()
+                        logBuffer.add("---------- [SESSIONE PRECEDENTE (pre-crash)] ----------")
+                        logBuffer.addAll(prevLines)
+                        logBuffer.add("---------- [SESSIONE CORRENTE] ----------")
+                        while (logBuffer.size > MAX_LOG_LINES) {
+                            logBuffer.removeAt(0)
+                        }
+                        _logs.value = logBuffer.toList()
+                    }
+                }
             }
         } catch (e: Exception) {
             Log.e(DEFAULT_TAG, "Impossibile inizializzare file di log: ${e.message}")
@@ -197,11 +220,12 @@ object EmuxLogger {
 
         scope.launch(Dispatchers.IO) {
             try {
-                Runtime.getRuntime().exec(arrayOf("logcat", "-c")).waitFor()
+                // Non eseguire `logcat -c`: preserva eventuali crash nativi/ART della sessione precedente.
                 val process = Runtime.getRuntime().exec(
                     arrayOf(
                         "logcat",
                         "-v", "time",
+                        "-T", "200",
                         "Emux32:V",
                         "EmuxDbtEngine:V",
                         "EmuxElfLoader:V",
@@ -211,6 +235,9 @@ object EmuxLogger {
                         "GuestSignalManager:V",
                         "NativeEngine:V",
                         "AndroidRuntime:E",
+                        "art:E",
+                        "libc:F",
+                        "DEBUG:F",
                         "*:S"
                     )
                 )
