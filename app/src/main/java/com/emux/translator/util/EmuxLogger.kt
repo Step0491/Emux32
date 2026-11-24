@@ -40,7 +40,8 @@ object EmuxLogger {
         if (len > 512L || !prevFile.exists() || prevFile.length() == 0L) {
             if (len > 0L) {
                 try {
-                    curFile.copyTo(prevFile, overwrite = true)
+                    val lastLines = curFile.readLines().takeLast(MAX_LOG_LINES)
+                    prevFile.writeText(lastLines.joinToString("\n") + "\n")
                 } catch (_: Exception) {}
             }
         }
@@ -70,24 +71,6 @@ object EmuxLogger {
                 externalLogFile = curExt
                 prevExternalLogFile = prevExt
                 Log.i(DEFAULT_TAG, "File di log pubblico configurato: ${externalLogFile?.absolutePath}")
-            }
-
-            // 3. Ripristina nel viewer UI i log della sessione precedente (utile dopo un crash)
-            val prevText = readFileSafe(prevExternalLogFile) ?: readFileSafe(prevPrimaryLogFile)
-            if (!prevText.isNullOrBlank()) {
-                synchronized(this) {
-                    val prevLines = prevText.lines().filter { it.isNotBlank() }.takeLast(1000)
-                    if (prevLines.isNotEmpty()) {
-                        logBuffer.clear()
-                        logBuffer.add("---------- [SESSIONE PRECEDENTE (pre-crash)] ----------")
-                        logBuffer.addAll(prevLines)
-                        logBuffer.add("---------- [SESSIONE CORRENTE] ----------")
-                        while (logBuffer.size > MAX_LOG_LINES) {
-                            logBuffer.removeAt(0)
-                        }
-                        _logs.value = logBuffer.toList()
-                    }
-                }
             }
         } catch (e: Exception) {
             Log.e(DEFAULT_TAG, "Impossibile inizializzare file di log: ${e.message}")
